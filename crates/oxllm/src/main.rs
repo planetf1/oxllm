@@ -275,7 +275,7 @@ async fn localhost_only(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     req: Request<Body>,
     next: Next,
-) -> Result<Response, Response> {
+) -> Response {
     let is_local = match addr.ip() {
         IpAddr::V4(v4) => v4.is_loopback(),
         // Dual-stack bindings present IPv4 connections as IPv4-mapped IPv6
@@ -284,7 +284,7 @@ async fn localhost_only(
         IpAddr::V6(v6) => v6.is_loopback() || v6.to_canonical().is_loopback(),
     };
     if is_local {
-        Ok(next.run(req).await)
+        next.run(req).await
     } else {
         warn!(target: "oxllm::security", "Blocked external attempt to access administrative route from IP: {}", addr.ip());
         let body = serde_json::json!({
@@ -301,7 +301,7 @@ async fn localhost_only(
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/json"),
         );
-        Err(response)
+        response
     }
 }
 
