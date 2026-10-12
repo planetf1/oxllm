@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Provider custom headers support**: Configurable HTTP headers on providers (`headers = { ... }` or `[providers.headers]` in `config.toml`). Enables configuring custom `User-Agent`, vendor-specific session IDs (such as OpenCode `x-opencode-session`), custom authorization tokens (e.g., Azure OpenAI `api-key`), and routing metadata (such as OpenRouter `HTTP-Referer`, `X-Title`).
+- **Client header passthrough**: Incoming client headers prefixed with `x-` (such as `x-session-id`, `x-request-id`, or client session tokens) are automatically forwarded to upstream providers unless explicitly overridden by provider configuration.
+- **Environment variable expansion in headers**: Provider header values support `${ENV_VAR}` expansion at config load time.
+- **Header validation**: Provider custom header names and values are validated during configuration loading and via `oxllm validate`.
+
 ## [0.1.12] - 2026-06-01
 
 ### Fixed

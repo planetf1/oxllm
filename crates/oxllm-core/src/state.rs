@@ -19,6 +19,7 @@ pub struct ProviderState {
     pub base_url: Url, // Parsed reqwest::Url to handle safe path joins and trailing slashes
     pub api_key: String,
     pub models: Vec<String>,
+    pub headers: HashMap<String, String>,
 
     // Protects volatile metrics without needing a write lock on the entire pool vector
     pub circuit: Arc<RwLock<CircuitState>>,
@@ -44,6 +45,7 @@ pub struct SelectedProvider {
     pub name: String,
     pub base_url: Url,
     pub api_key: String,
+    pub headers: HashMap<String, String>,
     pub is_probe: bool,
 }
 

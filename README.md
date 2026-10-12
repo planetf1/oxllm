@@ -21,6 +21,7 @@ Built to operate entirely in memory with zero local disk persistence, `oxllm` is
 * **Local Stats Dashboard**: Every provider tracks request count, success count, token volumes, and last request time via lock-free atomics. Query via `oxllm status` or `curl /status` — no external collector needed.
 * **OOM-Proof Telemetry**: Bounded OTel event channel (1024 cap) with non-blocking `try_send` drops. If `otelite` is offline, telemetry degrades gracefully and the proxy keeps running.
 * **W3C Trace Context Propagation**: Extracts and injects `traceparent` headers for continuous trace spans.
+* **Custom Headers & Client Header Passthrough**: Configure custom upstream HTTP headers per provider (`headers = { ... }` or `[providers.headers]`) for custom `User-Agent`, vendor-specific session IDs, or custom authentication schemes (e.g. Azure `api-key`), with automatic transparent passthrough for incoming client `x-*` headers.
 * **Dual-Stack IPv4/IPv6**: Configurable via `bind_family`: `"ipv4"` (default), `"ipv6"`, or `"dual"` for both.
 * **Unix-Style Environment Expansion**: Shell-style `${VAR}` replacement in TOML config values.
 * **Musl Cross-Compilation**: Pure-Rust `rustls-tls` stack avoids native OpenSSL linking on edge routers.

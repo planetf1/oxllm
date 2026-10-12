@@ -201,6 +201,7 @@ fn build_app_state(config: Config) -> Result<AppState, String> {
             base_url: url,
             api_key: p.api_key,
             models: p.models,
+            headers: p.headers,
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -1030,6 +1031,7 @@ mod integration_tests {
             base_url: Url::parse(&format!("http://{}", addr1)).unwrap(),
             api_key: "key1".to_string(),
             models: vec!["gpt-4-upstream".to_string()],
+            headers: std::collections::HashMap::new(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -1047,6 +1049,7 @@ mod integration_tests {
             base_url: Url::parse(&format!("http://{}", addr2)).unwrap(),
             api_key: "key2".to_string(),
             models: vec!["gpt-4-upstream".to_string()],
+            headers: std::collections::HashMap::new(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -1147,6 +1150,7 @@ mod integration_tests {
             base_url: Url::parse(&format!("http://{}", addr)).unwrap(),
             api_key: "key1".to_string(),
             models: vec!["gpt-4-upstream".to_string()],
+            headers: std::collections::HashMap::new(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -1251,6 +1255,7 @@ mod integration_tests {
             base_url: Url::parse("https://api.fail.example.com/v1/").unwrap(),
             api_key: "key".into(),
             models: vec!["model".into()],
+            headers: std::collections::HashMap::new(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -1268,6 +1273,7 @@ mod integration_tests {
             base_url: Url::parse("https://api.ok.example.com/v1/").unwrap(),
             api_key: "key".into(),
             models: vec!["model".into()],
+            headers: std::collections::HashMap::new(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -1322,6 +1328,7 @@ mod integration_tests {
             base_url: Url::parse(&format!("http://{}/v1/", addr)).unwrap(),
             api_key: "key".into(),
             models: vec!["model".into()],
+            headers: std::collections::HashMap::new(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -1436,6 +1443,7 @@ mod integration_tests {
             base_url: Url::parse(&format!("http://{}/v1/", p1_addr)).unwrap(),
             api_key: "key".into(),
             models: vec!["model".into()],
+            headers: std::collections::HashMap::new(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -1453,6 +1461,7 @@ mod integration_tests {
             base_url: Url::parse(&format!("http://{}/v1/", p2_addr)).unwrap(),
             api_key: "key".into(),
             models: vec!["model".into()],
+            headers: std::collections::HashMap::new(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -1554,6 +1563,7 @@ mod integration_tests {
             base_url: Url::parse(&format!("http://{}/v1/", addr)).unwrap(),
             api_key: "key".into(),
             models: vec!["model".into()],
+            headers: std::collections::HashMap::new(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -1671,6 +1681,7 @@ mod integration_tests {
             base_url: Url::parse(&format!("http://{}/v1/", addr)).unwrap(),
             api_key: "key".into(),
             models: vec!["model".into()],
+            headers: std::collections::HashMap::new(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -1762,6 +1773,7 @@ mod integration_tests {
             base_url: Url::parse(&format!("http://{}/v1/", addr)).unwrap(),
             api_key: "key".into(),
             models: vec!["real-model".into()],
+            headers: std::collections::HashMap::new(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -1843,6 +1855,7 @@ mod integration_tests {
             base_url: Url::parse(&format!("http://{}/v1/", addr)).unwrap(),
             api_key: "key".into(),
             models: vec!["model".into()],
+            headers: std::collections::HashMap::new(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -1937,6 +1950,7 @@ mod integration_tests {
             base_url: Url::parse(&format!("http://{}/v1/", addr)).unwrap(),
             api_key: "key".into(),
             models: vec!["model".into()],
+            headers: std::collections::HashMap::new(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -2031,6 +2045,7 @@ mod integration_tests {
             base_url: Url::parse(&format!("http://{}/v1/", upstream_addr)).unwrap(),
             api_key: "key".into(),
             models: vec!["model".into()],
+            headers: std::collections::HashMap::new(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -2456,5 +2471,243 @@ mod integration_tests {
             id_str
         );
         assert_eq!(id_str.len(), 22);
+    }
+
+    #[tokio::test]
+    async fn test_integration_provider_custom_headers_and_client_passthrough() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(1);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#;
+        let ok_response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req_str = String::from_utf8_lossy(&buf[..n]).to_string();
+                let _ = tx.send(req_str).await;
+                let _ = stream.write_all(ok_response.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+
+        let mut provider_headers = std::collections::HashMap::new();
+        provider_headers.insert("User-Agent".to_string(), "opencode/1.19.0".to_string());
+        provider_headers.insert("x-provider-header".to_string(), "provider-val".to_string());
+        provider_headers.insert(
+            "x-overridden-header".to_string(),
+            "provider-wins".to_string(),
+        );
+
+        let p = ProviderState {
+            name: "custom-prov".into(),
+            base_url: Url::parse(&format!("http://{}/v1/", addr)).unwrap(),
+            api_key: "secret-key".into(),
+            models: vec!["test-model".into()],
+            headers: provider_headers,
+            circuit: Arc::new(RwLock::new(CircuitState::Closed)),
+            consecutive_failures: Arc::new(RwLock::new(0)),
+            rate_limited_until: Arc::new(RwLock::new(None)),
+            last_attempt_time: Arc::new(RwLock::new(None)),
+            probe_in_flight: Arc::new(AtomicBool::new(false)),
+            manual_disabled: AtomicBool::new(false),
+            requests: AtomicU64::new(0),
+            successes: AtomicU64::new(0),
+            tokens_input: AtomicU64::new(0),
+            tokens_output: AtomicU64::new(0),
+        };
+
+        let mut vms = std::collections::HashMap::new();
+        vms.insert(
+            "custom-chat".into(),
+            vec![VirtualModelTarget {
+                provider: "custom-prov".into(),
+                model: "test-model".into(),
+            }],
+        );
+
+        let app_state = Arc::new(AppState {
+            providers: vec![p],
+            virtual_models: vms,
+            http_client: reqwest::Client::builder().build().unwrap(),
+            upstream_timeout_secs: 5,
+        });
+
+        let (_ws, wr) = tokio::sync::watch::channel(app_state.clone());
+        let (ttx, _trx) = tokio::sync::mpsc::channel(1024);
+        let rs = ReloadableState {
+            app_state: wr,
+            telemetry: TelemetryClient::new(ttx),
+            start_time: Instant::now(),
+            reloader: Reloader {
+                sender: _ws,
+                config_path: PathBuf::from("."),
+            },
+        };
+
+        let router = axum::Router::new()
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(routes::create_chat_completions),
+            )
+            .layer(middleware::from_fn(add_request_id))
+            .with_state(rs);
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(proxy_listener, router).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let res = client
+            .post(format!("http://{}/v1/chat/completions", proxy_addr))
+            .json(&serde_json::json!({
+                "model": "custom-chat",
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .header("x-client-session", "sess-12345")
+            .header("x-overridden-header", "client-attempt")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), 200);
+
+        let captured_request = rx.recv().await.expect("Must capture upstream request");
+        let lower = captured_request.to_ascii_lowercase();
+
+        // 1. Upstream received auth
+        assert!(lower.contains("authorization: bearer secret-key"));
+
+        // 2. Upstream received custom User-Agent from provider config
+        assert!(lower.contains("user-agent: opencode/1.19.0"));
+
+        // 3. Upstream received provider header
+        assert!(lower.contains("x-provider-header: provider-val"));
+
+        // 4. Upstream received client passthrough header
+        assert!(lower.contains("x-client-session: sess-12345"));
+
+        // 5. Provider config takes precedence over client for same header name
+        assert!(lower.contains("x-overridden-header: provider-wins"));
+        assert!(!lower.contains("x-overridden-header: client-attempt"));
+    }
+
+    #[tokio::test]
+    async fn test_integration_provider_custom_authorization_override() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(1);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#;
+        let ok_response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req_str = String::from_utf8_lossy(&buf[..n]).to_string();
+                let _ = tx.send(req_str).await;
+                let _ = stream.write_all(ok_response.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+
+        let mut provider_headers = std::collections::HashMap::new();
+        provider_headers.insert(
+            "Authorization".to_string(),
+            "CustomAuth custom-token-val".to_string(),
+        );
+
+        let p = ProviderState {
+            name: "custom-auth-prov".into(),
+            base_url: Url::parse(&format!("http://{}/v1/", addr)).unwrap(),
+            api_key: "default-key".into(),
+            models: vec!["test-model".into()],
+            headers: provider_headers,
+            circuit: Arc::new(RwLock::new(CircuitState::Closed)),
+            consecutive_failures: Arc::new(RwLock::new(0)),
+            rate_limited_until: Arc::new(RwLock::new(None)),
+            last_attempt_time: Arc::new(RwLock::new(None)),
+            probe_in_flight: Arc::new(AtomicBool::new(false)),
+            manual_disabled: AtomicBool::new(false),
+            requests: AtomicU64::new(0),
+            successes: AtomicU64::new(0),
+            tokens_input: AtomicU64::new(0),
+            tokens_output: AtomicU64::new(0),
+        };
+
+        let mut vms = std::collections::HashMap::new();
+        vms.insert(
+            "auth-chat".into(),
+            vec![VirtualModelTarget {
+                provider: "custom-auth-prov".into(),
+                model: "test-model".into(),
+            }],
+        );
+
+        let app_state = Arc::new(AppState {
+            providers: vec![p],
+            virtual_models: vms,
+            http_client: reqwest::Client::builder().build().unwrap(),
+            upstream_timeout_secs: 5,
+        });
+
+        let (_ws, wr) = tokio::sync::watch::channel(app_state.clone());
+        let (ttx, _trx) = tokio::sync::mpsc::channel(1024);
+        let rs = ReloadableState {
+            app_state: wr,
+            telemetry: TelemetryClient::new(ttx),
+            start_time: Instant::now(),
+            reloader: Reloader {
+                sender: _ws,
+                config_path: PathBuf::from("."),
+            },
+        };
+
+        let router = axum::Router::new()
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(routes::create_chat_completions),
+            )
+            .layer(middleware::from_fn(add_request_id))
+            .with_state(rs);
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(proxy_listener, router).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let res = client
+            .post(format!("http://{}/v1/chat/completions", proxy_addr))
+            .json(&serde_json::json!({
+                "model": "auth-chat",
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), 200);
+
+        let captured_request = rx.recv().await.expect("Must capture upstream request");
+        let lower = captured_request.to_ascii_lowercase();
+
+        // Upstream received overridden Authorization header
+        assert!(lower.contains("authorization: customauth custom-token-val"));
+        assert!(!lower.contains("authorization: bearer default-key"));
     }
 }

@@ -74,6 +74,7 @@ pub struct ProviderState {
     pub base_url: Url,
     pub api_key: String,
     pub models: Vec<String>,
+    pub headers: HashMap<String, String>,
     pub circuit: Arc<RwLock<CircuitState>>,
     pub rate_limited_until: Arc<RwLock<Option<Instant>>>,
     pub consecutive_failures: Arc<RwLock<u32>>,
@@ -147,6 +148,24 @@ complex-free = [
   { provider = "google-ai-studio", model = "gemini-2.5-flash" }
 ]
 ```
+
+#### Custom Headers & Client Header Passthrough
+Each provider can specify custom HTTP headers attached to upstream requests (`headers = { ... }` or `[providers.headers]`):
+
+```toml
+[[providers]]
+name = "custom-provider"
+enabled = true
+base_url = "https://api.example.com/v1"
+api_key = "${API_KEY}"
+models = ["model-name"]
+headers = { "User-Agent" = "custom-agent/1.0", "x-session-id" = "${SESSION_ID}" }
+```
+
+* **Provider Overrides**: Configured headers in `headers` take precedence over default headers (such as `Authorization` or `Content-Type`) and client-supplied headers.
+* **Client Header Passthrough**: Incoming client headers starting with `x-` (e.g., `x-session-id`, `x-request-id`, `x-opencode-session`) are transparently forwarded to upstream providers unless explicitly overridden by provider configuration.
+* **Environment Variable Expansion**: Header values support standard `${ENV_VAR}` expansion.
+* **Validation**: Header names and values are verified during startup and via `oxllm validate`.
 
 #### Reloading Mechanism
 To keep the binary free of intensive filesystem polling threads:

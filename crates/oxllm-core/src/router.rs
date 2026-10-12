@@ -81,6 +81,7 @@ impl RoutingStrategy for AdaptivePriorityStrategy {
                         name: provider.name.clone(),
                         base_url: provider.base_url.clone(),
                         api_key: provider.api_key.clone(),
+                        headers: provider.headers.clone(),
                         is_probe: false,
                     });
                 },
@@ -102,6 +103,7 @@ impl RoutingStrategy for AdaptivePriorityStrategy {
                                 name: provider.name.clone(),
                                 base_url: provider.base_url.clone(),
                                 api_key: provider.api_key.clone(),
+                                headers: provider.headers.clone(),
                                 is_probe: true,
                             });
                         }
@@ -122,6 +124,7 @@ impl RoutingStrategy for AdaptivePriorityStrategy {
                             name: provider.name.clone(),
                             base_url: provider.base_url.clone(),
                             api_key: provider.api_key.clone(),
+                            headers: provider.headers.clone(),
                             is_probe: true,
                         });
                     }
@@ -226,6 +229,7 @@ mod tests {
             base_url: Url::parse("https://api.example.com").unwrap(),
             api_key: "test_key".to_string(),
             models: vec!["gpt-4".to_string()],
+            headers: std::collections::HashMap::new(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),

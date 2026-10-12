@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, error, warn};
 
 use oxllm_core::router::{AdaptivePriorityStrategy, RoutingStrategy};
-use oxllm_core::state::{AppState, CircuitState, ProviderState};
+use oxllm_core::state::{AppState, CircuitState, ProviderState, SelectedProvider};
 use oxllm_core::telemetry::{TelemetryClient, TelemetryEvent};
 
 #[derive(Serialize)]
@@ -235,6 +235,56 @@ pub async fn get_status(
     })
 }
 
+/// Attaches standard headers, client forwarded headers (e.g. x-* headers), and provider custom headers.
+fn attach_request_headers(
+    mut req: reqwest::RequestBuilder,
+    selected: &SelectedProvider,
+    client_headers: &HeaderMap,
+) -> reqwest::RequestBuilder {
+    let has_custom_content_type = selected
+        .headers
+        .keys()
+        .any(|k| k.eq_ignore_ascii_case("content-type"));
+    if !has_custom_content_type {
+        req = req.header("Content-Type", "application/json");
+    }
+
+    let has_custom_auth = selected
+        .headers
+        .keys()
+        .any(|k| k.eq_ignore_ascii_case("authorization"));
+    if !has_custom_auth && !selected.api_key.is_empty() {
+        req = req.header("Authorization", format!("Bearer {}", selected.api_key));
+    }
+
+    // Propagate W3C tracing header if present
+    if let Some(traceparent) = client_headers.get("traceparent") {
+        req = req.header("traceparent", traceparent);
+    }
+
+    // Forward incoming client headers starting with 'x-' if not overridden by provider headers
+    for (header_name, header_val) in client_headers {
+        let name_str = header_name.as_str();
+        if name_str.starts_with("x-")
+            && !selected
+                .headers
+                .keys()
+                .any(|k| k.eq_ignore_ascii_case(name_str))
+        {
+            if let Ok(val_str) = header_val.to_str() {
+                req = req.header(name_str, val_str);
+            }
+        }
+    }
+
+    // Apply provider custom headers (overriding client headers or default Authorization if specified)
+    for (k, v) in &selected.headers {
+        req = req.header(k.as_str(), v.as_str());
+    }
+
+    req
+}
+
 /// POST /v1/embeddings
 pub async fn create_embeddings(
     State((app_state, telemetry)): State<(Arc<AppState>, TelemetryClient)>,
@@ -318,18 +368,12 @@ pub async fn create_embeddings(
         };
 
         // 3. Construct upstream request
-        let mut req = app_state
+        let req = app_state
             .http_client
             .post(endpoint_url.as_str())
             .body(rewritten_body)
-            .timeout(Duration::from_secs(app_state.upstream_timeout_secs))
-            .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {}", selected.api_key));
-
-        // Propagate tracing headers if present
-        if let Some(traceparent) = headers.get("traceparent") {
-            req = req.header("traceparent", traceparent);
-        }
+            .timeout(Duration::from_secs(app_state.upstream_timeout_secs));
+        let req = attach_request_headers(req, &selected, &headers);
 
         debug!(
             "Embedding request routing to {} (attempt {})",
@@ -619,17 +663,12 @@ pub async fn create_chat_completions(
             },
         };
 
-        let mut req = app_state
+        let req = app_state
             .http_client
             .post(endpoint_url.as_str())
             .body(rewritten_body)
-            .timeout(Duration::from_secs(app_state.upstream_timeout_secs))
-            .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {}", selected.api_key));
-
-        if let Some(traceparent) = headers.get("traceparent") {
-            req = req.header("traceparent", traceparent);
-        }
+            .timeout(Duration::from_secs(app_state.upstream_timeout_secs));
+        let req = attach_request_headers(req, &selected, &headers);
 
         debug!(
             "Chat request routing to {} (attempt {})",

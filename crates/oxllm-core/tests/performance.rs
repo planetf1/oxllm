@@ -16,6 +16,7 @@ async fn test_routing_loop_latency_performance() {
             base_url: Url::parse("https://api.example.com").unwrap(),
             api_key: "key".to_string(),
             models: vec!["model-a".to_string()],
+            headers: std::collections::HashMap::new(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),

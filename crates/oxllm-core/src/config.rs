@@ -1,4 +1,5 @@
 use crate::error::{OxllmError, Result};
+use reqwest::header::{HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -22,6 +23,8 @@ pub struct ProviderConfig {
     pub base_url: String,
     pub api_key: String,
     pub models: Vec<String>,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,7 +66,25 @@ impl Config {
             ));
         }
 
-        // 2. Validate that virtual models target existing, enabled providers
+        // 2. Validate custom provider headers
+        for provider in &self.providers {
+            for (name, val) in &provider.headers {
+                HeaderName::try_from(name.as_str()).map_err(|e| {
+                    OxllmError::ConfigLoad(format!(
+                        "Invalid header name '{}' in provider '{}': {}",
+                        name, provider.name, e
+                    ))
+                })?;
+                HeaderValue::try_from(val.as_str()).map_err(|e| {
+                    OxllmError::ConfigLoad(format!(
+                        "Invalid header value for '{}' in provider '{}': {}",
+                        name, provider.name, e
+                    ))
+                })?;
+            }
+        }
+
+        // 3. Validate that virtual models target existing, enabled providers
         for (vm_name, targets) in &self.virtual_models {
             if targets.is_empty() {
                 return Err(OxllmError::ConfigLoad(format!(
@@ -181,5 +202,72 @@ mod tests {
         let input = r#"api_key = "${UNCLOSED"#;
         let result = expand_env_vars(input);
         assert!(matches!(result, Err(OxllmError::ConfigLoad(_))));
+    }
+
+    #[test]
+    fn test_provider_headers_parsing_and_env_expansion() {
+        std::env::set_var("TEST_SESSION_ID", "sess-xyz-789");
+        let toml_str = r#"
+            [server]
+            host = "127.0.0.1"
+            port = 8080
+            otel_endpoint = "http://localhost:4318"
+
+            [[providers]]
+            name = "opencode-go"
+            enabled = true
+            base_url = "https://opencode.ai/zen/go/v1/"
+            api_key = "key123"
+            models = ["longcat-2.5-preview-free"]
+            headers = { "User-Agent" = "opencode/1.19.0", "x-opencode-session" = "${TEST_SESSION_ID}" }
+
+            [virtual_models]
+            "chat" = [{ provider = "opencode-go", model = "longcat-2.5-preview-free" }]
+        "#;
+
+        let expanded = expand_env_vars(toml_str).unwrap();
+        let config: Config = toml::from_str(&expanded).unwrap();
+        assert_eq!(config.providers.len(), 1);
+        assert_eq!(
+            config.providers[0].headers.get("User-Agent").unwrap(),
+            "opencode/1.19.0"
+        );
+        assert_eq!(
+            config.providers[0]
+                .headers
+                .get("x-opencode-session")
+                .unwrap(),
+            "sess-xyz-789"
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_provider_headers_invalid_name() {
+        let toml_str = r#"
+            [server]
+            host = "127.0.0.1"
+            port = 8080
+            otel_endpoint = "http://localhost:4318"
+
+            [[providers]]
+            name = "bad-headers"
+            enabled = true
+            base_url = "https://example.com/v1"
+            api_key = "key"
+            models = ["model-1"]
+            headers = { "Invalid Name Spaces" = "val" }
+
+            [virtual_models]
+            "test" = [{ provider = "bad-headers", model = "model-1" }]
+        "#;
+
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let val_res = config.validate();
+        assert!(val_res.is_err());
+        assert!(val_res
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid header name"));
     }
 }
