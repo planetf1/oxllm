@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.17] - 2026-10-28
+
 ### Fixed
 - **All 11 open RUSTSEC advisories cleared** via `cargo update`: quinn-proto
   0.11.18 (zero-length DATAGRAM/STREAM panics, unbounded connection-ID
