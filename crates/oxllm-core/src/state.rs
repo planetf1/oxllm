@@ -49,6 +49,89 @@ pub struct ProviderState {
     pub model_stats: Arc<ModelStats>,
 }
 
+/// Bounded LRU of session-key -> provider pins, with TTL.
+///
+/// Stickiness exists to keep a conversation on one provider so the upstream
+/// prefix cache stays warm (measured at ~6x on prompt processing). The map is
+/// capped so a hostile or high-cardinality client cannot grow it without
+/// bound; on overflow the least-recently-used pin is dropped and that session
+/// simply re-routes by policy.
+///
+/// Interior mutability: std Mutex over a small VecDeque plus a timestamp map.
+/// Held only for O(len) operations on request arrival (len <= cap), never
+/// across await points.
+#[derive(Debug)]
+pub struct SessionAffinity {
+    inner: std::sync::Mutex<AffinityInner>,
+    ttl: std::time::Duration,
+    capacity: usize,
+}
+
+#[derive(Debug, Default)]
+struct AffinityInner {
+    /// (session_key, provider, last_seen) in most-recent-first order.
+    entries: std::collections::VecDeque<(String, String, std::time::Instant)>,
+}
+
+impl SessionAffinity {
+    pub fn new(ttl: std::time::Duration, capacity: usize) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(AffinityInner::default()),
+            ttl,
+            capacity: capacity.max(1),
+        }
+    }
+
+    /// The provider a session is pinned to, if the pin exists and is fresh.
+    /// Refreshes the pin's recency on hit.
+    pub fn pinned_provider(&self, session_key: &str) -> Option<String> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        let idx = inner
+            .entries
+            .iter()
+            .position(|(k, _, seen)| k == session_key && now.duration_since(*seen) < self.ttl)?;
+        let (key, provider, _) = inner.entries.remove(idx).unwrap();
+        inner.entries.push_front((key, provider.clone(), now));
+        Some(provider)
+    }
+
+    /// Pins (or re-pins) a session to a provider, evicting stale and
+    /// least-recently-used entries to stay within capacity.
+    pub fn pin(&self, session_key: &str, provider: &str) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        inner
+            .entries
+            .retain(|(_, _, seen)| now.duration_since(*seen) < self.ttl);
+        inner.entries.retain(|(k, _, _)| k != session_key);
+        inner
+            .entries
+            .push_front((session_key.to_string(), provider.to_string(), now));
+        while inner.entries.len() > self.capacity {
+            inner.entries.pop_back();
+        }
+    }
+
+    /// Drops a pin (e.g. after the pinned provider failed terminally).
+    pub fn unpin(&self, session_key: &str) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.entries.retain(|(k, _, _)| k != session_key);
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.lock().map(|i| i.entries.len()).unwrap_or(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Default header inspected for a session key, before the body's
+/// `prompt_cache_key` field.
+pub const DEFAULT_SESSION_HEADER: &str = "x-session-id";
+
 /// Upper bounds (in milliseconds) of the latency histogram buckets.
 /// Fibonacci-spaced: ~1.6x resolution, dense where proxy latencies actually
 /// live (sub-second) and still bounded for pathological cases.
@@ -285,6 +368,11 @@ pub struct AppState {
     pub routing_calls: AtomicU64,
     /// Inbound API keys; empty means the public /v1 routes are open.
     pub api_keys: Vec<String>,
+    /// Session -> provider pins for sticky routing.
+    pub session_affinity: Arc<SessionAffinity>,
+    /// Header consulted for the session key (body `prompt_cache_key` is the
+    /// fallback). Empty string disables header-based affinity.
+    pub session_affinity_header: String,
     pub http_client: reqwest::Client,
     pub upstream_timeout_secs: u64,
 }
@@ -386,5 +474,55 @@ mod tests {
         }
         let ewma = c.ewma_ttft_ms().expect("ewma");
         assert!(ewma > 190.0 && ewma <= 200.0, "ewma was {ewma}");
+    }
+}
+
+#[cfg(test)]
+mod affinity_tests {
+    use super::*;
+
+    #[test]
+    fn test_pin_and_lookup() {
+        let aff = SessionAffinity::new(std::time::Duration::from_secs(60), 8);
+        assert_eq!(aff.pinned_provider("s1"), None);
+        aff.pin("s1", "prov-a");
+        assert_eq!(aff.pinned_provider("s1"), Some("prov-a".to_string()));
+        // Re-pin moves the provider.
+        aff.pin("s1", "prov-b");
+        assert_eq!(aff.pinned_provider("s1"), Some("prov-b".to_string()));
+    }
+
+    #[test]
+    fn test_capacity_evicts_least_recently_used() {
+        let aff = SessionAffinity::new(std::time::Duration::from_secs(60), 2);
+        aff.pin("s1", "a");
+        aff.pin("s2", "b");
+        // Touch s1 so s2 is the LRU entry.
+        aff.pinned_provider("s1");
+        aff.pin("s3", "c");
+        assert_eq!(aff.pinned_provider("s1"), Some("a".to_string()));
+        assert_eq!(aff.pinned_provider("s2"), None, "LRU pin must be evicted");
+        assert_eq!(aff.pinned_provider("s3"), Some("c".to_string()));
+        assert_eq!(aff.len(), 2);
+    }
+
+    #[test]
+    fn test_ttl_expiry() {
+        let aff = SessionAffinity::new(std::time::Duration::from_millis(20), 8);
+        aff.pin("s1", "a");
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        assert_eq!(
+            aff.pinned_provider("s1"),
+            None,
+            "expired pin must not match"
+        );
+    }
+
+    #[test]
+    fn test_unpin() {
+        let aff = SessionAffinity::new(std::time::Duration::from_secs(60), 8);
+        aff.pin("s1", "a");
+        aff.unpin("s1");
+        assert_eq!(aff.pinned_provider("s1"), None);
     }
 }

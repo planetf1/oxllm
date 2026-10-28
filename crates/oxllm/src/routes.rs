@@ -313,15 +313,57 @@ pub async fn get_status(
 /// `Priority` keeps configuration order untouched; `Fastest` sorts by observed
 /// EWMA TTFT in 20% bands (with periodic exploration), so the order only
 /// changes when one provider is meaningfully quicker.
+/// Extracts the routing session key for a request: the configured header
+/// first (default `x-session-id`), then the body's `prompt_cache_key` field.
+/// `None` means the request is keyless and follows policy ordering only.
+fn session_key(app_state: &AppState, headers: &HeaderMap, payload: &Value) -> Option<String> {
+    let from_header = (!app_state.session_affinity_header.is_empty())
+        .then(|| {
+            headers
+                .get(&app_state.session_affinity_header)
+                .and_then(|v| v.to_str().ok())
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+        })
+        .flatten();
+    from_header.or_else(|| {
+        payload
+            .get("prompt_cache_key")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    })
+}
+
+/// Applies sticky affinity (when a session key is present and its pin is
+/// healthy) and then the configured routing policy. Affinity wins over
+/// policy ordering; keyless requests rotate within policy as before.
 fn ordered_candidates<'a>(
     app_state: &AppState,
     route_name: &str,
+    session_key: Option<&str>,
     candidates: &[(&'a ProviderState, String)],
 ) -> Vec<(&'a ProviderState, String)> {
-    let ordered: Vec<(&'a ProviderState, String)> = candidates.to_vec();
+    let mut ordered: Vec<(&'a ProviderState, String)> = candidates.to_vec();
     if ordered.len() < 2 {
         return ordered;
     }
+
+    // Sticky routing: keep a session on its provider while it is healthy so
+    // the upstream prefix cache stays warm. Policy ordering still governs
+    // keyless traffic and sessions whose pin is unhealthy or expired.
+    if let Some(key) = session_key {
+        if let Some(pinned) = app_state.session_affinity.pinned_provider(key) {
+            if let Some(pos) = ordered.iter().position(|(p, _)| {
+                p.name == pinned && !p.manual_disabled.load(std::sync::atomic::Ordering::Relaxed)
+            }) {
+                let chosen = ordered.remove(pos);
+                ordered.insert(0, chosen);
+                return ordered;
+            }
+        }
+    }
+
     let policy = app_state.policies.get(route_name).copied();
     if policy.is_none() {
         return ordered;
@@ -409,7 +451,12 @@ pub async fn create_embeddings(
     let mut last_failed_status: u16 = 0;
 
     // Map candidate provider references for select strategy
-    let candidates = ordered_candidates(&app_state, &route_name, &candidates);
+    let candidates = ordered_candidates(
+        &app_state,
+        &route_name,
+        session_key(&app_state, &headers, &payload).as_deref(),
+        &candidates,
+    );
     let candidate_states: Vec<&ProviderState> = candidates.iter().map(|(p, _)| *p).collect();
 
     // Route-level counters: one row per virtual model, one request each,
@@ -572,6 +619,9 @@ pub async fn create_embeddings(
                     let model_counters = target_provider_state
                         .model_stats
                         .counters(&ModelStats::key(&selected.name, &target_model));
+                    if let Some(key) = session_key(&app_state, &headers, &payload).as_deref() {
+                        app_state.session_affinity.pin(key, &selected.name);
+                    }
                     for counters in [&model_counters, &route_counters] {
                         counters
                             .successes
@@ -700,6 +750,9 @@ pub async fn create_embeddings(
     route_counters
         .failures
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if let Some(key) = session_key(&app_state, &headers, &payload).as_deref() {
+        app_state.session_affinity.unpin(key);
+    }
     json_error_response(&message, "server_error", StatusCode::BAD_GATEWAY)
 }
 
@@ -761,7 +814,12 @@ pub async fn create_completions(
     let mut last_failed_provider = String::new();
     let mut last_failed_status: u16 = 0;
 
-    let candidates = ordered_candidates(&app_state, &route_name, &candidates);
+    let candidates = ordered_candidates(
+        &app_state,
+        &route_name,
+        session_key(&app_state, &headers, &payload).as_deref(),
+        &candidates,
+    );
     let candidate_states: Vec<&ProviderState> = candidates.iter().map(|(p, _)| *p).collect();
 
     // Route-level counters: one row per virtual model, one request each,
@@ -933,6 +991,9 @@ pub async fn create_completions(
                     let model_counters = target_provider_state
                         .model_stats
                         .counters(&ModelStats::key(&selected.name, &target_model));
+                    if let Some(key) = session_key(&app_state, &headers, &payload).as_deref() {
+                        app_state.session_affinity.pin(key, &selected.name);
+                    }
                     for counters in [&model_counters, &route_counters] {
                         counters
                             .successes
@@ -1057,6 +1118,9 @@ pub async fn create_completions(
     route_counters
         .failures
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if let Some(key) = session_key(&app_state, &headers, &payload).as_deref() {
+        app_state.session_affinity.unpin(key);
+    }
     json_error_response(&message, "server_error", StatusCode::BAD_GATEWAY)
 }
 
@@ -1114,7 +1178,12 @@ pub async fn create_chat_completions(
     let mut last_failed_provider = String::new();
     let mut last_failed_status: u16 = 0;
 
-    let candidates = ordered_candidates(&app_state, &route_name, &candidates);
+    let candidates = ordered_candidates(
+        &app_state,
+        &route_name,
+        session_key(&app_state, &headers, &payload).as_deref(),
+        &candidates,
+    );
     let candidate_states: Vec<&ProviderState> = candidates.iter().map(|(p, _)| *p).collect();
 
     // Route-level counters: one row per virtual model, one request each,
@@ -1294,6 +1363,9 @@ pub async fn create_chat_completions(
                         let model_counters = target_provider_state
                             .model_stats
                             .counters(&ModelStats::key(&selected.name, &target_model));
+                        if let Some(key) = session_key(&app_state, &headers, &payload).as_deref() {
+                            app_state.session_affinity.pin(key, &selected.name);
+                        }
                         for counters in [&model_counters, &route_counters] {
                             counters
                                 .successes
@@ -1425,6 +1497,9 @@ pub async fn create_chat_completions(
     route_counters
         .failures
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if let Some(key) = session_key(&app_state, &headers, &payload).as_deref() {
+        app_state.session_affinity.unpin(key);
+    }
     json_error_response(&message, "server_error", StatusCode::BAD_GATEWAY)
 }
 

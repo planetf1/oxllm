@@ -19,6 +19,19 @@ pub struct ServerConfig {
     /// constant time. An empty list (default) keeps the proxy open.
     #[serde(default)]
     pub api_keys: Vec<String>,
+    /// Header inspected for the routing session key (default
+    /// "x-session-id"; the request body's `prompt_cache_key` field is the
+    /// fallback). Sessions stick to one provider while it stays healthy, so
+    /// upstream prefix caches stay warm. Set to "" to disable header-based
+    /// affinity.
+    #[serde(default = "default_session_affinity_header")]
+    pub session_affinity_header: String,
+    /// How long a session pin survives without traffic (seconds).
+    #[serde(default = "default_session_affinity_ttl_secs")]
+    pub session_affinity_ttl_secs: u64,
+    /// Maximum number of concurrent session pins.
+    #[serde(default = "default_session_affinity_capacity")]
+    pub session_affinity_capacity: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,6 +145,18 @@ impl Config {
 
         Ok(())
     }
+}
+
+fn default_session_affinity_header() -> String {
+    "x-session-id".to_string()
+}
+
+fn default_session_affinity_ttl_secs() -> u64 {
+    900
+}
+
+fn default_session_affinity_capacity() -> usize {
+    1024
 }
 
 fn default_upstream_timeout() -> u64 {

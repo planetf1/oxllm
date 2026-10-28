@@ -222,6 +222,19 @@ sampled, and unmeasured providers sort first so a newly added one is tried
 immediately rather than starved. Health checks (circuit breaker, rate limits,
 manual overrides) apply before ordering in all cases.
 
+### Session Affinity
+
+Requests that carry a session key stick to one provider while it stays
+healthy, so upstream prompt-prefix caches stay warm (a cold provider re-pays
+prompt processing on every turn). The key is taken from the `x-session-id`
+header (configurable via `server.session_affinity_header`, or `""` to disable
+header affinity) with the request body's `prompt_cache_key` as fallback. Pins
+expire after 15 minutes idle (`session_affinity_ttl_secs`) and the table is
+bounded (`session_affinity_capacity`, default 1024, LRU eviction). When the
+pinned provider's circuit trips, the session re-routes by policy immediately
+and re-pins to whatever serves it. Keyless traffic is unaffected and keeps
+rotating by policy.
+
 ### Status & Metrics
 
 `oxllm status` prints per-virtual-model routing tables, a per-route rollup with

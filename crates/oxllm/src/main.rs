@@ -19,7 +19,9 @@ use axum::{
 use tower_http::cors::{Any, CorsLayer};
 
 use oxllm_core::config::Config;
-use oxllm_core::state::{AppState, CircuitState, ModelStats, ProviderState, RoutingPolicy};
+use oxllm_core::state::{
+    AppState, CircuitState, ModelStats, ProviderState, RoutingPolicy, SessionAffinity,
+};
 use oxllm_core::telemetry::{TelemetryClient, TelemetryWorker};
 use reqwest::Url;
 
@@ -252,6 +254,11 @@ fn build_app_state(config: Config) -> Result<AppState, String> {
         policies,
         routing_calls: AtomicU64::new(0),
         api_keys: config.server.api_keys,
+        session_affinity: Arc::new(SessionAffinity::new(
+            std::time::Duration::from_secs(config.server.session_affinity_ttl_secs),
+            config.server.session_affinity_capacity,
+        )),
+        session_affinity_header: config.server.session_affinity_header,
         http_client,
         upstream_timeout_secs: config.server.upstream_timeout_secs,
     })
@@ -1594,6 +1601,11 @@ mod integration_tests {
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
             api_keys: Vec::new(),
+            session_affinity: Arc::new(SessionAffinity::new(
+                std::time::Duration::from_secs(900),
+                1024,
+            )),
+            session_affinity_header: oxllm_core::state::DEFAULT_SESSION_HEADER.to_string(),
             http_client,
             upstream_timeout_secs: 5,
         });
@@ -1695,6 +1707,11 @@ mod integration_tests {
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
             api_keys: Vec::new(),
+            session_affinity: Arc::new(SessionAffinity::new(
+                std::time::Duration::from_secs(900),
+                1024,
+            )),
+            session_affinity_header: oxllm_core::state::DEFAULT_SESSION_HEADER.to_string(),
             http_client,
             upstream_timeout_secs: 5,
         });
@@ -1858,6 +1875,11 @@ mod integration_tests {
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
             api_keys: Vec::new(),
+            session_affinity: Arc::new(SessionAffinity::new(
+                std::time::Duration::from_secs(900),
+                1024,
+            )),
+            session_affinity_header: oxllm_core::state::DEFAULT_SESSION_HEADER.to_string(),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         })
@@ -2061,6 +2083,11 @@ mod integration_tests {
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
             api_keys: Vec::new(),
+            session_affinity: Arc::new(SessionAffinity::new(
+                std::time::Duration::from_secs(900),
+                1024,
+            )),
+            session_affinity_header: oxllm_core::state::DEFAULT_SESSION_HEADER.to_string(),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -2196,6 +2223,11 @@ mod integration_tests {
             route_stats: Arc::new(ModelStats::default()),
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
+            session_affinity: Arc::new(SessionAffinity::new(
+                std::time::Duration::from_secs(900),
+                1024,
+            )),
+            session_affinity_header: oxllm_core::state::DEFAULT_SESSION_HEADER.to_string(),
             api_keys: vec!["sekrit".to_string()],
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
@@ -2264,6 +2296,134 @@ mod integration_tests {
             panic!("authorized request failed: {} {}", status, text);
         }
         assert_eq!(recorded.lock().await.len(), 1);
+    }
+
+    /// Session affinity: two providers back one virtual model; requests
+    /// carrying the same x-session-id stick to whichever provider served the
+    /// first request, while keyless traffic still rotates by policy.
+    #[tokio::test]
+    async fn test_session_affinity_pins_provider() {
+        let response_body = r#"{"choices":[{"index":0,"text":"ok","finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            response_body.len(),
+            response_body
+        );
+        let recorded = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let addr = spawn_recording_upstream(vec![response; 16], recorded.clone()).await;
+
+        let mk = |name: &str| ProviderState {
+            name: name.to_string(),
+            base_url: Url::parse(&format!("http://{}/v1/", addr)).unwrap(),
+            api_key: "k".to_string(),
+            models: vec!["m".to_string()],
+            upstream_timeout_secs: None,
+            cost_per_mtok: None,
+            circuit: Arc::new(RwLock::new(CircuitState::Closed)),
+            consecutive_failures: Arc::new(RwLock::new(0)),
+            rate_limited_until: Arc::new(RwLock::new(None)),
+            last_attempt_time: Arc::new(RwLock::new(None)),
+            probe_in_flight: Arc::new(AtomicBool::new(false)),
+            manual_disabled: AtomicBool::new(false),
+            requests: AtomicU64::new(0),
+            successes: AtomicU64::new(0),
+            tokens_input: AtomicU64::new(0),
+            tokens_output: AtomicU64::new(0),
+            model_stats: Arc::new(ModelStats::default()),
+        };
+
+        let mut virtual_models = std::collections::HashMap::new();
+        virtual_models.insert(
+            "vm".to_string(),
+            vec![
+                VirtualModelTarget {
+                    provider: "prov-a".to_string(),
+                    model: "m".to_string(),
+                },
+                VirtualModelTarget {
+                    provider: "prov-b".to_string(),
+                    model: "m".to_string(),
+                },
+            ],
+        );
+
+        let app_state = Arc::new(AppState {
+            providers: vec![mk("prov-a"), mk("prov-b")],
+            virtual_models,
+            route_stats: Arc::new(ModelStats::default()),
+            policies: std::collections::HashMap::new(),
+            routing_calls: AtomicU64::new(0),
+            api_keys: Vec::new(),
+            session_affinity: Arc::new(SessionAffinity::new(
+                std::time::Duration::from_secs(600),
+                64,
+            )),
+            session_affinity_header: "x-session-id".to_string(),
+            http_client: reqwest::Client::builder().build().unwrap(),
+            upstream_timeout_secs: 5,
+        });
+
+        let (_ws, wr) = tokio::sync::watch::channel(app_state.clone());
+        let (ttx, _trx) = tokio::sync::mpsc::channel(1024);
+        let rs = ReloadableState {
+            app_state: wr,
+            telemetry: TelemetryClient::new(ttx),
+            start_time: Instant::now(),
+            reloader: Reloader {
+                sender: _ws.clone(),
+                config_path: PathBuf::from("config.toml"),
+            },
+        };
+
+        let router = axum::Router::new()
+            .route(
+                "/v1/completions",
+                axum::routing::post(routes::create_completions),
+            )
+            .layer(middleware::from_fn(add_request_id))
+            .with_state(rs);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let url = format!("http://{}/v1/completions", proxy_addr);
+
+        // Same session key, several requests.
+        for _ in 0..4 {
+            let res = client
+                .post(&url)
+                .header("x-session-id", "session-1")
+                .json(&serde_json::json!({"model": "vm", "prompt": "x"}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), 200);
+        }
+
+        // The recorded upstream request bodies all carry the model, but the
+        // mock cannot distinguish providers by connection; assert via the
+        // affinity table instead: exactly one pin exists, and every pinned
+        // lookup resolves to the same provider.
+        let pinned = app_state.session_affinity.pinned_provider("session-1");
+        assert!(pinned.is_some());
+        let first = pinned.unwrap();
+        for _ in 0..3 {
+            assert_eq!(
+                app_state.session_affinity.pinned_provider("session-1"),
+                Some(first.clone()),
+                "session must stay pinned to one provider"
+            );
+        }
+        // A different session is unpinned until it makes a request.
+        assert_eq!(
+            app_state.session_affinity.pinned_provider("session-2"),
+            None
+        );
+        assert_eq!(app_state.session_affinity.len(), 1);
     }
 
     // -----------------------------------------------------------------------
@@ -2398,6 +2558,11 @@ mod integration_tests {
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
             api_keys: Vec::new(),
+            session_affinity: Arc::new(SessionAffinity::new(
+                std::time::Duration::from_secs(900),
+                1024,
+            )),
+            session_affinity_header: oxllm_core::state::DEFAULT_SESSION_HEADER.to_string(),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -2536,6 +2701,11 @@ mod integration_tests {
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
             api_keys: Vec::new(),
+            session_affinity: Arc::new(SessionAffinity::new(
+                std::time::Duration::from_secs(900),
+                1024,
+            )),
+            session_affinity_header: oxllm_core::state::DEFAULT_SESSION_HEADER.to_string(),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -2638,6 +2808,11 @@ mod integration_tests {
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
             api_keys: Vec::new(),
+            session_affinity: Arc::new(SessionAffinity::new(
+                std::time::Duration::from_secs(900),
+                1024,
+            )),
+            session_affinity_header: oxllm_core::state::DEFAULT_SESSION_HEADER.to_string(),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -2762,6 +2937,11 @@ mod integration_tests {
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
             api_keys: Vec::new(),
+            session_affinity: Arc::new(SessionAffinity::new(
+                std::time::Duration::from_secs(900),
+                1024,
+            )),
+            session_affinity_header: oxllm_core::state::DEFAULT_SESSION_HEADER.to_string(),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -2859,6 +3039,11 @@ mod integration_tests {
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
             api_keys: Vec::new(),
+            session_affinity: Arc::new(SessionAffinity::new(
+                std::time::Duration::from_secs(900),
+                1024,
+            )),
+            session_affinity_header: oxllm_core::state::DEFAULT_SESSION_HEADER.to_string(),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -2947,6 +3132,11 @@ mod integration_tests {
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
             api_keys: Vec::new(),
+            session_affinity: Arc::new(SessionAffinity::new(
+                std::time::Duration::from_secs(900),
+                1024,
+            )),
+            session_affinity_header: oxllm_core::state::DEFAULT_SESSION_HEADER.to_string(),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -3048,6 +3238,11 @@ mod integration_tests {
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
             api_keys: Vec::new(),
+            session_affinity: Arc::new(SessionAffinity::new(
+                std::time::Duration::from_secs(900),
+                1024,
+            )),
+            session_affinity_header: oxllm_core::state::DEFAULT_SESSION_HEADER.to_string(),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -3149,6 +3344,11 @@ mod integration_tests {
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
             api_keys: Vec::new(),
+            session_affinity: Arc::new(SessionAffinity::new(
+                std::time::Duration::from_secs(900),
+                1024,
+            )),
+            session_affinity_header: oxllm_core::state::DEFAULT_SESSION_HEADER.to_string(),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });

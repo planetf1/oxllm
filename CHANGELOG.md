@@ -10,6 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.1.15] - 2026-10-28
 
 ### Added
+- **Session affinity**: requests with a session key (`x-session-id` header,
+  configurable, or the body's `prompt_cache_key`) stick to one provider while
+  it is healthy, keeping upstream prefix caches warm. Bounded LRU with idle
+  TTL; pins break automatically on circuit trips and re-route by policy.
 - **Inbound API keys** (`server.api_keys`): public `/v1/*` routes can require
   `Authorization: Bearer <key>` (constant-time comparison). Empty list keeps
   the proxy open; admin routes stay localhost-only either way.
