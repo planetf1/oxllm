@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **All 11 open RUSTSEC advisories cleared** via `cargo update`: quinn-proto
+  0.11.18 (zero-length DATAGRAM/STREAM panics, unbounded connection-ID
+  retirement, ACK-frequency panic, reassembly memory-exhaustion bypass),
+  rustls 0.23.46+ (cross-level handshake acceptance, session-secret `Debug`
+  leaks, Brotli certificate decompression allocation, KEM downgrade),
+  rustls-webpki 0.103.16 (distrusted intermediates), and tokio 1.54.1
+  (`AsyncFd` I/O-safety unsoundness).
+
 ## [0.1.16] - 2026-10-28
 
 ### Added
