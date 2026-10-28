@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.14] - 2026-10-28
+
 - **Latency-aware routing** (`[policies]`, `"fastest"`): virtual models can
   order healthy candidates by measured EWMA time-to-first-byte instead of
   strict configuration order. 20% bands prevent flapping on noise, every 20th
