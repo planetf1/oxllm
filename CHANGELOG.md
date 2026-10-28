@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.13] - 2026-10-28
+
 ### Added
 - **`POST /v1/completions`**: raw (non-chat) completions route for
   fill-in-the-middle clients such as editor autocomplete. Resolves virtual
