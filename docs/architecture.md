@@ -117,6 +117,10 @@ host = "127.0.0.1"
 port = 8080
 otel_endpoint = "http://127.0.0.1:4318"
 upstream_timeout_secs = 5 # Strict timeout for connecting & receiving upstream headers
+api_keys = []            # Non-empty gates /v1/* behind Authorization: Bearer <key>
+# session_affinity_header = "x-session-id"  # Session key source ("" disables)
+# session_affinity_ttl_secs = 900           # Idle pin lifetime
+# session_affinity_capacity = 1024          # Max concurrent session pins (LRU)
 
 [[providers]]
 name = "google-ai-studio"

@@ -17,6 +17,10 @@ Built to operate entirely in memory with zero local disk persistence, `oxllm` is
 * **&lt;2ms Routing Overhead**: Lock-free concurrency across routing loop, counters, and probe permits. Verified by CI benchmark.
 * **Adaptive Circuit Breaker**: Strict `HalfOpen` state machine with lock-free `probe_in_flight` atomic check-and-set. Rate limits and server errors trip per-provider circuits with exponential backoff. Idle-based penalty decay automatically rehabilitates providers.
 * **Tiered Failover**: Configure fallback chains across multiple providers. If the primary returns 429 or 5xx, the proxy transparently cascades to the next.
+* **Routing Policies**: Per-virtual-model `priority` (configuration order), `fastest` (lowest measured time-to-first-byte), or `cheapest` (lowest configured cost) selection among healthy candidates.
+* **Session Affinity**: Requests carrying a session key stay on one provider while it is healthy, keeping upstream prompt-prefix caches warm. Bounded LRU, idle TTL, automatic break-and-re-pin on failure.
+* **Optional Inbound Auth**: `server.api_keys` gates the public `/v1/*` routes behind constant-time `Authorization: Bearer` checks. Admin routes are always localhost-only.
+* **Raw Completions Route**: `POST /v1/completions` (with SSE streaming) for fill-in-the-middle clients such as editor autocomplete.
 * **Hot Config Reloading**: `SIGHUP` signal or `POST /reload` HTTP endpoint — parses updated `config.toml` and hot-swaps the provider pool via `tokio::sync::watch` without dropping connections.
 * **Local Stats Dashboard**: Every provider tracks request count, success count, token volumes, and last request time via lock-free atomics. Query via `oxllm status` or `curl /status` — no external collector needed.
 * **OOM-Proof Telemetry**: Bounded OTel event channel (1024 cap) with non-blocking `try_send` drops. If `otelite` is offline, telemetry degrades gracefully and the proxy keeps running.
@@ -29,6 +33,25 @@ Built to operate entirely in memory with zero local disk persistence, `oxllm` is
   SDKs, including browser-based usage.
 
 ---
+
+## 🔐 Authentication
+
+Outbound provider credentials live in each provider's `api_key`. Inbound auth is
+opt-in: set `server.api_keys` to a list of keys and the public `/v1/*` routes will
+require a matching `Authorization: Bearer <key>` header, compared in constant time.
+
+```toml
+[server]
+host = "127.0.0.1"
+port = 8080
+otel_endpoint = "http://127.0.0.1:4318"
+api_keys = ["${OXLLM_CLIENT_KEY}"]   # empty list (default) leaves the proxy open
+```
+
+Leaving it empty is appropriate for loopback-only deployments. Administrative
+routes (`/status`, `/reload`, `/health`, `/admin/*`) are localhost-restricted
+regardless of this setting, and a request rejected for a bad key never reaches an
+upstream provider.
 
 ## 🌐 CORS Support
 
@@ -240,7 +263,9 @@ rotating by policy.
 `oxllm status` prints per-virtual-model routing tables, a per-route rollup with
 latency distributions (p50/p95/p99 of total latency and time-to-first-byte), and
 per-provider totals. Traffic is attributed per `(provider, model)` pair, so two
-virtual models sharing one provider do not show each other's traffic. Tables
+virtual models sharing one provider do not show each other's traffic, and
+`cached_tokens` (upstream prompt-cache reuse) is reported per route so warm-vs-cold
+latency differences can be explained. Tables
 drop optional columns to fit the terminal width (`$COLUMNS`, or `--width`), and
 `--json` emits the raw `/status` payload for scripting. The same counters feed
 the OpenTelemetry spans (`gen_ai.usage.*`, `proxy.attempts_required`) and
