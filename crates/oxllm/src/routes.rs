@@ -412,6 +412,13 @@ pub async fn create_embeddings(
     let candidates = ordered_candidates(&app_state, &route_name, &candidates);
     let candidate_states: Vec<&ProviderState> = candidates.iter().map(|(p, _)| *p).collect();
 
+    // Route-level counters: one row per virtual model, one request each,
+    // regardless of how many provider attempts it takes.
+    let route_counters = app_state.route_stats.counters(&route_name);
+    route_counters
+        .requests
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
     while let Some(selected) = strategy.select(&candidate_states).await {
         attempts += 1;
         let target_model = match candidates
@@ -477,13 +484,6 @@ pub async fn create_embeddings(
                 .requests
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-
-        // Route-level counters: one row per virtual model, independent of how
-        // many providers back it.
-        let route_counters = app_state.route_stats.counters(&route_name);
-        route_counters
-            .requests
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let res = req.send().await;
 
@@ -697,6 +697,9 @@ pub async fn create_embeddings(
     } else {
         "All upstream embeddings providers failed or are rate-limited".to_string()
     };
+    route_counters
+        .failures
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     json_error_response(&message, "server_error", StatusCode::BAD_GATEWAY)
 }
 
@@ -761,6 +764,13 @@ pub async fn create_completions(
     let candidates = ordered_candidates(&app_state, &route_name, &candidates);
     let candidate_states: Vec<&ProviderState> = candidates.iter().map(|(p, _)| *p).collect();
 
+    // Route-level counters: one row per virtual model, one request each,
+    // regardless of how many provider attempts it takes.
+    let route_counters = app_state.route_stats.counters(&route_name);
+    route_counters
+        .requests
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
     while let Some(selected) = strategy.select(&candidate_states).await {
         attempts += 1;
         let target_model = match candidates
@@ -821,13 +831,6 @@ pub async fn create_completions(
                 .requests
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-
-        // Route-level counters: one row per virtual model, independent of how
-        // many providers back it.
-        let route_counters = app_state.route_stats.counters(&route_name);
-        route_counters
-            .requests
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let res = req.send().await;
 
@@ -1051,6 +1054,9 @@ pub async fn create_completions(
     } else {
         "All upstream completions providers failed or are rate-limited".to_string()
     };
+    route_counters
+        .failures
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     json_error_response(&message, "server_error", StatusCode::BAD_GATEWAY)
 }
 
@@ -1110,6 +1116,13 @@ pub async fn create_chat_completions(
 
     let candidates = ordered_candidates(&app_state, &route_name, &candidates);
     let candidate_states: Vec<&ProviderState> = candidates.iter().map(|(p, _)| *p).collect();
+
+    // Route-level counters: one row per virtual model, one request each,
+    // regardless of how many provider attempts it takes.
+    let route_counters = app_state.route_stats.counters(&route_name);
+    route_counters
+        .requests
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     while let Some(selected) = strategy.select(&candidate_states).await {
         attempts += 1;
@@ -1172,13 +1185,6 @@ pub async fn create_chat_completions(
                 .requests
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-
-        // Route-level counters: one row per virtual model, independent of how
-        // many providers back it.
-        let route_counters = app_state.route_stats.counters(&route_name);
-        route_counters
-            .requests
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let res = req.send().await;
 
@@ -1416,6 +1422,9 @@ pub async fn create_chat_completions(
     } else {
         "All upstream chat completions providers failed or are rate-limited".to_string()
     };
+    route_counters
+        .failures
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     json_error_response(&message, "server_error", StatusCode::BAD_GATEWAY)
 }
 

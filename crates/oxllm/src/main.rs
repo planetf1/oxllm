@@ -2132,6 +2132,8 @@ mod integration_tests {
             .find(|r| r["route"] == "router-small")
             .expect("router-small route row");
         assert_eq!(small_route["requests"], 2);
+        assert_eq!(small_route["successes"], 2);
+        assert_eq!(small_route["failures"], 0);
         assert_eq!(small_route["policy"], "priority");
         assert!(
             small_route["latency_p50_ms"].is_number(),
