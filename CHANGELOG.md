@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.16] - 2026-10-28
+
 ### Added
 - **Session affinity**: requests with a session key (`x-session-id` header,
   configurable, or the body's `prompt_cache_key`) stick to one provider while
