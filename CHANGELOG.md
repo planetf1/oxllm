@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`POST /v1/completions`**: raw (non-chat) completions route for
+  fill-in-the-middle clients such as editor autocomplete. Resolves virtual
+  models, fails over across providers, accounts token usage, and honours
+  `stream: true`.
+- The SSE forwarding path is now shared by `/v1/chat/completions` and
+  `/v1/completions` (`stream_upstream_body`), so both stream chunk-by-chunk
+  with circuit-breaker feedback deferred until the stream ends.
+
 ## [0.1.12] - 2026-06-01
 
 ### Fixed

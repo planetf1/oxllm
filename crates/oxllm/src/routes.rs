@@ -537,6 +537,319 @@ pub async fn create_embeddings(
     json_error_response(&message, "server_error", StatusCode::BAD_GATEWAY)
 }
 
+/// POST /v1/completions
+///
+/// Raw (non-chat) completions, used by fill-in-the-middle clients such as
+/// editor autocomplete. Adds no buffering: streaming requests are forwarded
+/// chunk-by-chunk exactly as /v1/chat/completions does.
+pub async fn create_completions(
+    State((app_state, telemetry)): State<(Arc<AppState>, TelemetryClient)>,
+    Extension(request_id): Extension<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let mut payload: Value = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(e) => {
+            return json_error_response(
+                &format!("Invalid JSON payload: {}", e),
+                "invalid_request_error",
+                StatusCode::BAD_REQUEST,
+            )
+        },
+    };
+
+    let requested_model = match payload.get("model").and_then(|m| m.as_str()) {
+        Some(m) => m,
+        None => {
+            return json_error_response(
+                "Missing required 'model' field",
+                "invalid_request_error",
+                StatusCode::BAD_REQUEST,
+            )
+        },
+    };
+
+    let candidates = app_state.resolve_candidates(requested_model);
+    if candidates.is_empty() {
+        return json_error_response(
+            &format!("Invalid or unmapped virtual model: {}", requested_model),
+            "invalid_request_error",
+            StatusCode::BAD_REQUEST,
+        );
+    }
+
+    let is_streaming = payload
+        .get("stream")
+        .and_then(|s| s.as_bool())
+        .unwrap_or(false);
+    let (trace_id, parent_span_id) = extract_traceparent(&headers);
+
+    let strategy = AdaptivePriorityStrategy;
+    let mut attempts = 0;
+    let start_time = Instant::now();
+    let mut last_upstream_error = String::new();
+    let mut last_failed_provider = String::new();
+    let mut last_failed_status: u16 = 0;
+
+    let candidate_states: Vec<&ProviderState> = candidates.iter().map(|(p, _)| *p).collect();
+
+    while let Some(selected) = strategy.select(&candidate_states).await {
+        attempts += 1;
+        let target_model = match candidates
+            .iter()
+            .find(|(p, _)| p.name == selected.name)
+            .map(|(_, m)| m.clone())
+        {
+            Some(m) => m,
+            None => {
+                warn!(
+                    request_id = %request_id,
+                    "Provider {} removed from candidates during completions routing",
+                    selected.name
+                );
+                continue;
+            },
+        };
+
+        payload["model"] = Value::String(target_model.clone());
+        let rewritten_body = Bytes::from(serde_json::to_vec(&payload).unwrap());
+
+        let endpoint_url = match selected.base_url.join("completions") {
+            Ok(url) => url,
+            Err(e) => {
+                error!("Invalid base URL path join for {}: {}", selected.name, e);
+                continue;
+            },
+        };
+
+        let mut req = app_state
+            .http_client
+            .post(endpoint_url.as_str())
+            .body(rewritten_body)
+            .timeout(Duration::from_secs(app_state.upstream_timeout_secs))
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {}", selected.api_key));
+
+        if let Some(traceparent) = headers.get("traceparent") {
+            req = req.header("traceparent", traceparent);
+        }
+
+        debug!(
+            "Completion request routing to {} (attempt {})",
+            selected.name, attempts
+        );
+
+        if let Some(target) = app_state.providers.iter().find(|p| p.name == selected.name) {
+            target
+                .requests
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        let res = req.send().await;
+
+        match res {
+            Ok(res) if res.status().is_success() => {
+                let status_code = res.status().as_u16();
+                let upstream_headers = res.headers().clone();
+
+                if is_streaming {
+                    return stream_upstream_body(
+                        res,
+                        upstream_headers,
+                        status_code,
+                        app_state.clone(),
+                        selected.name.clone(),
+                        selected.is_probe,
+                        "completions",
+                        target_model,
+                        telemetry.clone(),
+                        trace_id.clone(),
+                        parent_span_id.clone(),
+                        request_id.clone(),
+                        start_time,
+                        attempts,
+                    )
+                    .into_response();
+                }
+
+                let target_provider_state = app_state
+                    .providers
+                    .iter()
+                    .find(|p| p.name == selected.name)
+                    .unwrap();
+
+                let res_body = match res.bytes().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warn!(
+                            request_id = %request_id,
+                            "Failed to read success response body from {}: {}",
+                            selected.name, e
+                        );
+                        strategy
+                            .feedback(
+                                target_provider_state,
+                                false,
+                                selected.is_probe,
+                                Some(status_code),
+                                None,
+                            )
+                            .await;
+                        telemetry.emit(TelemetryEvent::UpdateStatus {
+                            provider: selected.name.clone(),
+                            status: circuit_status(target_provider_state).await,
+                        });
+                        continue;
+                    },
+                };
+
+                let (input_tokens, output_tokens) = serde_json::from_slice::<Value>(&res_body)
+                    .map(|v| {
+                        let usage = v.get("usage");
+                        let input = usage
+                            .and_then(|u| u.get("prompt_tokens"))
+                            .and_then(|t| t.as_u64())
+                            .unwrap_or(0);
+                        let output = usage
+                            .and_then(|u| u.get("completion_tokens"))
+                            .and_then(|t| t.as_u64())
+                            .unwrap_or(0);
+                        (input, output)
+                    })
+                    .unwrap_or((0, 0));
+
+                strategy
+                    .feedback(
+                        target_provider_state,
+                        true,
+                        selected.is_probe,
+                        Some(status_code),
+                        None,
+                    )
+                    .await;
+                telemetry.emit(TelemetryEvent::UpdateStatus {
+                    provider: selected.name.clone(),
+                    status: circuit_status(target_provider_state).await,
+                });
+
+                target_provider_state
+                    .successes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                target_provider_state
+                    .tokens_input
+                    .fetch_add(input_tokens, std::sync::atomic::Ordering::Relaxed);
+                target_provider_state
+                    .tokens_output
+                    .fetch_add(output_tokens, std::sync::atomic::Ordering::Relaxed);
+
+                telemetry.emit(TelemetryEvent::RecordTransaction {
+                    operation: "completions".to_string(),
+                    provider: selected.name.clone(),
+                    model: target_model,
+                    input_tokens,
+                    output_tokens,
+                    duration: start_time.elapsed(),
+                    attempts,
+                    failure_reason: None,
+                    trace_id: trace_id.clone(),
+                    parent_span_id: parent_span_id.clone(),
+                    request_id: request_id.clone(),
+                });
+
+                let mut response = Response::new(Body::from(res_body));
+                *response.status_mut() = StatusCode::OK;
+                copy_response_headers(&upstream_headers, response.headers_mut());
+                return response.into_response();
+            },
+            Ok(res) => {
+                let status_code = res.status().as_u16();
+                warn!(
+                    request_id = %request_id,
+                    "Completions upstream {} failed with status {}",
+                    selected.name, status_code
+                );
+
+                let retry_after = extract_retry_after(res.headers());
+
+                let error_body = match res.bytes().await {
+                    Ok(b) => String::from_utf8_lossy(&b).to_string(),
+                    Err(e) => {
+                        warn!(
+                            request_id = %request_id,
+                            "Failed to read error body from {}: {}", selected.name, e
+                        );
+                        String::new()
+                    },
+                };
+                let parsed_error = if !error_body.is_empty() {
+                    serde_json::from_str::<Value>(&error_body)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("error")
+                                .and_then(|e| e.get("message"))
+                                .and_then(|m| m.as_str().map(String::from))
+                        })
+                        .unwrap_or(error_body)
+                } else {
+                    String::new()
+                };
+                last_upstream_error = parsed_error;
+                last_failed_provider = selected.name.clone();
+                last_failed_status = status_code;
+
+                let target_provider_state = app_state
+                    .providers
+                    .iter()
+                    .find(|p| p.name == selected.name)
+                    .unwrap();
+                strategy
+                    .feedback(
+                        target_provider_state,
+                        false,
+                        selected.is_probe,
+                        Some(status_code),
+                        retry_after,
+                    )
+                    .await;
+                telemetry.emit(TelemetryEvent::UpdateStatus {
+                    provider: selected.name.clone(),
+                    status: circuit_status(target_provider_state).await,
+                });
+            },
+            Err(e) => {
+                warn!(
+                    request_id = %request_id,
+                    "Completions upstream {} connection failed: {}",
+                    selected.name, e
+                );
+                let target_provider_state = app_state
+                    .providers
+                    .iter()
+                    .find(|p| p.name == selected.name)
+                    .unwrap();
+                strategy
+                    .feedback(target_provider_state, false, selected.is_probe, None, None)
+                    .await;
+                telemetry.emit(TelemetryEvent::UpdateStatus {
+                    provider: selected.name.clone(),
+                    status: circuit_status(target_provider_state).await,
+                });
+            },
+        }
+    }
+
+    let message = if !last_upstream_error.is_empty() {
+        format!(
+            "All upstream completions providers failed or are rate-limited. Last error from {} ({}): {}",
+            last_failed_provider, last_failed_status, last_upstream_error
+        )
+    } else {
+        "All upstream completions providers failed or are rate-limited".to_string()
+    };
+    json_error_response(&message, "server_error", StatusCode::BAD_GATEWAY)
+}
+
 /// POST /v1/chat/completions
 pub async fn create_chat_completions(
     State((app_state, telemetry)): State<(Arc<AppState>, TelemetryClient)>,
@@ -656,104 +969,23 @@ pub async fn create_chat_completions(
                     .unwrap();
 
                 if is_streaming {
-                    let app_state_clone = app_state.clone();
-                    let provider_name = selected.name.clone();
-                    let is_probe = selected.is_probe;
-                    let telemetry_clone = telemetry.clone();
-                    let trace_id_clone = trace_id.clone();
-                    let parent_span_id_clone = parent_span_id.clone();
-                    let request_id_clone = request_id.clone();
-                    let duration = start_time.elapsed();
-                    let attempt_count = attempts;
-                    let model_name = target_model;
-
-                    let (tx, rx) = tokio::sync::mpsc::channel::<
-                        Result<Bytes, Box<dyn std::error::Error + Send + Sync>>,
-                    >(32);
-
-                    tokio::spawn(async move {
-                        let mut reqwest_stream = res.bytes_stream();
-                        let mut stream_success = true;
-
-                        while let Some(chunk_result) = reqwest_stream.next().await {
-                            match chunk_result {
-                                Ok(chunk) => {
-                                    if tx.send(Ok(chunk)).await.is_err() {
-                                        // Client disconnected
-                                        stream_success = false;
-                                        break;
-                                    }
-                                },
-                                Err(e) => {
-                                    stream_success = false;
-                                    let _ = tx
-                                        .send(Err(
-                                            Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-                                        ))
-                                        .await;
-                                    break;
-                                },
-                            }
-                        }
-
-                        // Deferred circuit-breaker feedback after stream completes
-                        if let Some(provider_state) = app_state_clone
-                            .providers
-                            .iter()
-                            .find(|p| p.name == provider_name)
-                        {
-                            let strategy = AdaptivePriorityStrategy;
-                            strategy
-                                .feedback(
-                                    provider_state,
-                                    stream_success,
-                                    is_probe,
-                                    Some(status_code),
-                                    None,
-                                )
-                                .await;
-                            telemetry_clone.emit(TelemetryEvent::UpdateStatus {
-                                provider: provider_name.clone(),
-                                status: circuit_status(provider_state).await,
-                            });
-
-                            if stream_success {
-                                provider_state
-                                    .successes
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            }
-                        }
-
-                        // Push Telemetry Metrics
-                        telemetry_clone.emit(TelemetryEvent::RecordTransaction {
-                            operation: "chat".to_string(),
-                            provider: provider_name,
-                            model: model_name,
-                            input_tokens: 0,
-                            output_tokens: 0,
-                            duration,
-                            attempts: attempt_count,
-                            failure_reason: if stream_success {
-                                None
-                            } else {
-                                Some("stream_failed".to_string())
-                            },
-                            trace_id: trace_id_clone,
-                            parent_span_id: parent_span_id_clone,
-                            request_id: request_id_clone,
-                        });
-                    });
-
-                    // Convert mpsc receiver to a Stream for axum
-                    let axum_stream = unfold(Some(rx), |state| async move {
-                        let mut rx = state?;
-                        rx.recv().await.map(|item| (item, Some(rx)))
-                    });
-
-                    let mut response = Response::new(Body::from_stream(axum_stream));
-                    *response.status_mut() = StatusCode::OK;
-                    copy_response_headers(&upstream_headers, response.headers_mut());
-                    return response.into_response();
+                    return stream_upstream_body(
+                        res,
+                        upstream_headers,
+                        status_code,
+                        app_state.clone(),
+                        selected.name.clone(),
+                        selected.is_probe,
+                        "chat",
+                        target_model,
+                        telemetry.clone(),
+                        trace_id.clone(),
+                        parent_span_id.clone(),
+                        request_id.clone(),
+                        start_time,
+                        attempts,
+                    )
+                    .into_response();
                 } else {
                     // Report Success feedback (non-streaming: immediate, as before)
                     strategy
@@ -939,6 +1171,110 @@ pub async fn create_chat_completions(
 
 /// Reads the current circuit and rate-limit state to produce a status code
 /// for telemetry: 0 = Healthy, 1 = Cooldown, 2 = Tripped.
+/// Forwards an upstream SSE body to the client chunk-by-chunk (never buffered),
+/// and defers circuit-breaker feedback until the stream ends so that a failure
+/// part-way through is still attributed to the provider that served it.
+#[allow(clippy::too_many_arguments)]
+fn stream_upstream_body(
+    res: reqwest::Response,
+    upstream_headers: HeaderMap,
+    status_code: u16,
+    app_state: Arc<AppState>,
+    provider_name: String,
+    is_probe: bool,
+    operation: &'static str,
+    model_name: String,
+    telemetry: TelemetryClient,
+    trace_id: Option<String>,
+    parent_span_id: Option<String>,
+    request_id: String,
+    start_time: Instant,
+    attempts: u32,
+) -> Response {
+    let duration = start_time.elapsed();
+
+    let (tx, rx) =
+        tokio::sync::mpsc::channel::<Result<Bytes, Box<dyn std::error::Error + Send + Sync>>>(32);
+
+    tokio::spawn(async move {
+        let mut reqwest_stream = res.bytes_stream();
+        let mut stream_success = true;
+
+        while let Some(chunk_result) = reqwest_stream.next().await {
+            match chunk_result {
+                Ok(chunk) => {
+                    if tx.send(Ok(chunk)).await.is_err() {
+                        // Client disconnected
+                        stream_success = false;
+                        break;
+                    }
+                },
+                Err(e) => {
+                    stream_success = false;
+                    let _ = tx
+                        .send(Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>))
+                        .await;
+                    break;
+                },
+            }
+        }
+
+        // Deferred circuit-breaker feedback after stream completes
+        if let Some(provider_state) = app_state.providers.iter().find(|p| p.name == provider_name) {
+            let strategy = AdaptivePriorityStrategy;
+            strategy
+                .feedback(
+                    provider_state,
+                    stream_success,
+                    is_probe,
+                    Some(status_code),
+                    None,
+                )
+                .await;
+            telemetry.emit(TelemetryEvent::UpdateStatus {
+                provider: provider_name.clone(),
+                status: circuit_status(provider_state).await,
+            });
+
+            if stream_success {
+                provider_state
+                    .successes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        // Push Telemetry Metrics
+        telemetry.emit(TelemetryEvent::RecordTransaction {
+            operation: operation.to_string(),
+            provider: provider_name,
+            model: model_name,
+            input_tokens: 0,
+            output_tokens: 0,
+            duration,
+            attempts,
+            failure_reason: if stream_success {
+                None
+            } else {
+                Some("stream_failed".to_string())
+            },
+            trace_id,
+            parent_span_id,
+            request_id,
+        });
+    });
+
+    // Convert mpsc receiver to a Stream for axum
+    let axum_stream = unfold(Some(rx), |state| async move {
+        let mut rx = state?;
+        rx.recv().await.map(|item| (item, Some(rx)))
+    });
+
+    let mut response = Response::new(Body::from_stream(axum_stream));
+    *response.status_mut() = StatusCode::OK;
+    copy_response_headers(&upstream_headers, response.headers_mut());
+    response
+}
+
 async fn circuit_status(provider: &ProviderState) -> u64 {
     let circuit = *provider.circuit.read().await;
     let now = Instant::now();

@@ -43,16 +43,17 @@
 
 ### Supported Endpoints
 1.  `POST /v1/chat/completions` – Supports both standard JSON payloads and Server-Sent Events (SSE) streaming (`stream: true`).
-2.  `POST /v1/embeddings` – Standard non-streaming batch vectors.
-3.  `GET /v1/models` – Returns a consolidated virtual array of all models exposed by currently active and healthy upstream providers.
-4.  `GET /status` – Administrative endpoint displaying per-provider circuit state, request counters, token volumes, and last request time. Localhost-restricted.
-5. `POST /reload` – Administrative endpoint triggering config hot-reload via HTTP. Same effect as SIGHUP. Localhost-restricted.
-6. `GET /health` – Lightweight health-check endpoint. Localhost-restricted.
-7. `POST /admin/providers/{name}/offline` – Manually mark a provider as disabled. Localhost-restricted.
-8. `POST /admin/providers/{name}/online` – Re-enable a manually disabled provider. Localhost-restricted.
-9. `POST /admin/providers/{name}/reset` – Reset a provider's circuit-breaker state and failure counters. Localhost-restricted.
+2.  `POST /v1/completions` – Raw (non-chat) completions for fill-in-the-middle clients such as editor autocomplete. Also supports SSE streaming; no buffering beyond the per-chunk forward.
+3.  `POST /v1/embeddings` – Standard non-streaming batch vectors.
+4.  `GET /v1/models` – Returns a consolidated virtual array of all models exposed by currently active and healthy upstream providers.
+5.  `GET /status` – Administrative endpoint displaying per-provider circuit state, request counters, token volumes, and last request time. Localhost-restricted.
+6. `POST /reload` – Administrative endpoint triggering config hot-reload via HTTP. Same effect as SIGHUP. Localhost-restricted.
+7. `GET /health` – Lightweight health-check endpoint. Localhost-restricted.
+8. `POST /admin/providers/{name}/offline` – Manually mark a provider as disabled. Localhost-restricted.
+9. `POST /admin/providers/{name}/online` – Re-enable a manually disabled provider. Localhost-restricted.
+10. `POST /admin/providers/{name}/reset` – Reset a provider's circuit-breaker state and failure counters. Localhost-restricted.
 
-All public endpoints (`/v1/chat/completions`, `/v1/embeddings`, `/v1/models`) return CORS headers (`Access-Control-Allow-Origin: *`) and include an `x-request-id` correlation header on every response.
+All public endpoints (`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`) return CORS headers (`Access-Control-Allow-Origin: *`) and include an `x-request-id` correlation header on every response.
 
 ---
 

@@ -517,6 +517,7 @@ async fn run_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     let app = axum::Router::new()
         .route("/v1/models", get(routes::list_models))
         .route("/v1/embeddings", post(routes::create_embeddings))
+        .route("/v1/completions", post(routes::create_completions))
         .route(
             "/v1/chat/completions",
             post(routes::create_chat_completions),
@@ -1234,6 +1235,246 @@ mod integration_tests {
 
         assert!(body.contains("data: {\"token\": \"Hello\"}"));
         assert!(body.contains("data: {\"token\": \" World\"}"));
+    }
+
+    /// Mock upstream that records the request line path and body so tests can
+    /// assert routing targets and model rewriting.
+    async fn spawn_recording_upstream(
+        responses: Vec<String>,
+        recorded: Arc<tokio::sync::Mutex<Vec<(String, String)>>>,
+    ) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let mut idx = 0usize;
+
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let recorded = recorded.clone();
+                let responses = responses.clone();
+                let response_idx = idx;
+                idx += 1;
+
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 4096];
+
+                    // Read until the header terminator; the request bodies in
+                    // these tests are far smaller than the buffer.
+                    loop {
+                        match stream.read(&mut tmp).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                buf.extend_from_slice(&tmp[..n]);
+                                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            },
+                        }
+                    }
+
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    let path = text
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or_default()
+                        .to_string();
+                    let body = text
+                        .split("\r\n\r\n")
+                        .nth(1)
+                        .unwrap_or_default()
+                        .to_string();
+                    recorded.lock().await.push((path, body));
+
+                    let response = responses.get(response_idx).cloned().unwrap_or_else(|| {
+                        "HTTP/1.1 500 Internal Error\r\nContent-Length: 0\r\n\r\n".to_string()
+                    });
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.flush().await;
+                });
+            }
+        });
+
+        addr
+    }
+
+    fn completions_test_state(addr: SocketAddr) -> Arc<AppState> {
+        let provider = ProviderState {
+            name: "omlx-local".to_string(),
+            base_url: Url::parse(&format!("http://{}/v1/", addr)).unwrap(),
+            api_key: "test-key".to_string(),
+            models: vec!["granite-4.1-3b-4bit".to_string()],
+            circuit: Arc::new(RwLock::new(CircuitState::Closed)),
+            consecutive_failures: Arc::new(RwLock::new(0)),
+            rate_limited_until: Arc::new(RwLock::new(None)),
+            last_attempt_time: Arc::new(RwLock::new(None)),
+            probe_in_flight: Arc::new(AtomicBool::new(false)),
+            manual_disabled: AtomicBool::new(false),
+            requests: AtomicU64::new(0),
+            successes: AtomicU64::new(0),
+            tokens_input: AtomicU64::new(0),
+            tokens_output: AtomicU64::new(0),
+        };
+
+        let mut virtual_models = std::collections::HashMap::new();
+        virtual_models.insert(
+            "fim-virtual".to_string(),
+            vec![VirtualModelTarget {
+                provider: "omlx-local".to_string(),
+                model: "granite-4.1-3b-4bit".to_string(),
+            }],
+        );
+
+        Arc::new(AppState {
+            providers: vec![provider],
+            virtual_models,
+            http_client: reqwest::Client::builder().build().unwrap(),
+            upstream_timeout_secs: 5,
+        })
+    }
+
+    /// POST /v1/completions: virtual model is rewritten to the upstream model,
+    /// the request lands on <base>/completions, the body passes through intact,
+    /// and token usage is accounted on the provider.
+    #[tokio::test]
+    async fn test_integration_completions_passthrough() {
+        let upstream_body = r#"{"id":"cmpl-1","object":"text_completion","choices":[{"index":0,"text":"    return json.load(f)","finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            upstream_body.len(),
+            upstream_body
+        );
+
+        let recorded = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let addr = spawn_recording_upstream(vec![response], recorded.clone()).await;
+        let app_state = completions_test_state(addr);
+
+        let (_watch_sender, watch_receiver) = tokio::sync::watch::channel(app_state.clone());
+        let (telemetry_tx, _telemetry_rx) = tokio::sync::mpsc::channel(1024);
+        let reloadable_state = ReloadableState {
+            app_state: watch_receiver,
+            telemetry: TelemetryClient::new(telemetry_tx),
+            start_time: Instant::now(),
+            reloader: Reloader {
+                sender: _watch_sender.clone(),
+                config_path: PathBuf::from("config.toml"),
+            },
+        };
+
+        let router = axum::Router::new()
+            .route(
+                "/v1/completions",
+                axum::routing::post(routes::create_completions),
+            )
+            .layer(middleware::from_fn(add_request_id))
+            .with_state(reloadable_state);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let payload = serde_json::json!({
+            "model": "fim-virtual",
+            "prompt": "def read_config(path):\n    ",
+            "max_tokens": 8
+        });
+        let res = reqwest::Client::new()
+            .post(format!("http://{}/v1/completions", proxy_addr))
+            .json(&payload)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), 200);
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["choices"][0]["text"], "    return json.load(f)");
+
+        let recorded = recorded.lock().await;
+        let (path, upstream_request) = recorded.first().expect("upstream never called");
+        assert_eq!(path, "/v1/completions");
+        let upstream_json: Value = serde_json::from_str(upstream_request).unwrap();
+        assert_eq!(upstream_json["model"], "granite-4.1-3b-4bit");
+        assert_eq!(upstream_json["prompt"], "def read_config(path):\n    ");
+        drop(recorded);
+
+        assert_eq!(
+            app_state.providers[0]
+                .tokens_input
+                .load(std::sync::atomic::Ordering::Relaxed),
+            11
+        );
+        assert_eq!(
+            app_state.providers[0]
+                .tokens_output
+                .load(std::sync::atomic::Ordering::Relaxed),
+            7
+        );
+    }
+
+    /// POST /v1/completions with stream=true must forward SSE frames as they
+    /// arrive (content-type preserved, no buffering into a single JSON body).
+    #[tokio::test]
+    async fn test_integration_completions_sse_streaming() {
+        let sse_response = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: {\"choices\":[{\"text\":\"Hello\"}]}\n\ndata: {\"choices\":[{\"text\":\" World\"}]}\n\n".to_string();
+
+        let recorded = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let addr = spawn_recording_upstream(vec![sse_response], recorded).await;
+        let app_state = completions_test_state(addr);
+
+        let (_watch_sender, watch_receiver) = tokio::sync::watch::channel(app_state);
+        let (telemetry_tx, _telemetry_rx) = tokio::sync::mpsc::channel(1024);
+        let reloadable_state = ReloadableState {
+            app_state: watch_receiver,
+            telemetry: TelemetryClient::new(telemetry_tx),
+            start_time: Instant::now(),
+            reloader: Reloader {
+                sender: _watch_sender.clone(),
+                config_path: PathBuf::from("config.toml"),
+            },
+        };
+
+        let router = axum::Router::new()
+            .route(
+                "/v1/completions",
+                axum::routing::post(routes::create_completions),
+            )
+            .layer(middleware::from_fn(add_request_id))
+            .with_state(reloadable_state);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let payload = serde_json::json!({
+            "model": "fim-virtual",
+            "prompt": "x",
+            "stream": true
+        });
+        let mut res = reqwest::Client::new()
+            .post(format!("http://{}/v1/completions", proxy_addr))
+            .json(&payload)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), 200);
+        assert_eq!(
+            res.headers().get("content-type").unwrap(),
+            "text/event-stream"
+        );
+
+        let mut body = String::new();
+        while let Some(chunk) = res.chunk().await.unwrap() {
+            body.push_str(std::str::from_utf8(&chunk).unwrap());
+        }
+
+        assert!(body.contains("data: {\"choices\":[{\"text\":\"Hello\"}]}"));
+        assert!(body.contains("data: {\"choices\":[{\"text\":\" World\"}]}"));
     }
 
     // -----------------------------------------------------------------------

@@ -149,6 +149,11 @@ curl -X POST http://127.0.0.1:8080/v1/embeddings \
   -H "Content-Type: application/json" \
   -d '{"model": "basic", "input": "hello world"}'
 
+# Raw completions (fill-in-the-middle, e.g. editor autocomplete)
+curl -X POST http://127.0.0.1:8080/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "basic", "prompt": "def add(a, b):\n    ", "max_tokens": 16}'
+
 # Live dashboard (no external collector needed)
 curl http://127.0.0.1:8080/status
 ```
