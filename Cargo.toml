@@ -32,7 +32,7 @@ futures-util = "0.3"
 hex = "0.4"
 opentelemetry = { version = "0.28", features = ["trace", "metrics"] }
 opentelemetry_sdk = { version = "0.28", features = ["trace", "metrics", "rt-tokio"] }
-opentelemetry-otlp = { version = "0.28", default-features = false, features = ["http-json", "reqwest-rustls"] }
+opentelemetry-otlp = { version = "0.28", default-features = false, features = ["http-json", "reqwest-blocking-client", "reqwest-rustls"] }
 opentelemetry-semantic-conventions = "0.28"
 socket2 = "0.5"
 rand = "0.9"

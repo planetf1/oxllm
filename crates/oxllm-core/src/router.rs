@@ -212,6 +212,52 @@ impl RoutingStrategy for AdaptivePriorityStrategy {
     }
 }
 
+/// A routing candidate with the upstream model name it maps to.
+#[derive(Debug, Clone)]
+pub struct LatencyCandidate {
+    pub provider: String,
+    pub model: String,
+    /// Observed EWMA time-to-first-byte; `None` means never measured yet.
+    pub ewma_ttft_ms: Option<f64>,
+}
+
+/// Latency band width. Providers whose EWMA sits within this ratio of each
+/// other share a band and therefore keep configuration order between them.
+/// 1.2 means "20% apart before we reorder", which is wider than the jitter of a
+/// warm local upstream, so the order does not flap on noise.
+pub const LATENCY_BAND_RATIO: f64 = 1.20;
+
+/// Maps an EWMA TTFT onto a band index. Unmeasured candidates (band 0) sort
+/// ahead of measured ones, so a newly added provider is sampled promptly and
+/// then lands in its real band — this doubles as the exploration mechanism.
+pub fn latency_band(ms: Option<f64>) -> u32 {
+    match ms {
+        None => 0,
+        Some(v) if !v.is_finite() || v <= 0.0 => 1,
+        Some(v) => 1 + (v.ln() / LATENCY_BAND_RATIO.ln()).floor().max(0.0) as u32,
+    }
+}
+
+/// Orders candidate indices for latency-aware routing.
+///
+/// The sort is stable, so candidates in the same latency band keep their
+/// configured order — a fast provider must be meaningfully faster (one whole
+/// band, i.e. 20%) to displace one above it. Every `explore_every`-th call the
+/// order is rotated, so a provider that was demoted by a temporary blip is
+/// re-sampled even while a better one is winning.
+pub fn order_by_latency(
+    candidates: &[LatencyCandidate],
+    call_index: u64,
+    explore_every: u64,
+) -> Vec<usize> {
+    let mut indices: Vec<usize> = (0..candidates.len()).collect();
+    indices.sort_by_key(|&i| latency_band(candidates[i].ewma_ttft_ms));
+    if explore_every > 1 && call_index % explore_every == 0 && indices.len() > 1 {
+        indices.rotate_left(1);
+    }
+    indices
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,6 +282,7 @@ mod tests {
             successes: AtomicU64::new(0),
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
+            model_stats: Arc::new(crate::state::ModelStats::default()),
         }
     }
 
@@ -337,6 +384,70 @@ mod tests {
         strategy.feedback(&p, true, true, Some(200), None).await;
         assert_eq!(*p.circuit.read().await, CircuitState::Closed);
         assert!(!p.probe_in_flight.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_latency_band_separates_by_twenty_percent() {
+        // 100ms vs 110ms is inside the band -> same bucket, order preserved.
+        assert_eq!(latency_band(Some(100.0)), latency_band(Some(110.0)));
+        // 100ms vs 200ms is a different band.
+        assert_ne!(latency_band(Some(100.0)), latency_band(Some(200.0)));
+        // Unmeasured sorts ahead of any measured value.
+        assert!(latency_band(None) < latency_band(Some(1.0)));
+    }
+
+    #[test]
+    fn test_order_by_latency_prefers_faster_band_and_keeps_ties_stable() {
+        let candidates = vec![
+            LatencyCandidate {
+                provider: "slow".into(),
+                model: "m".into(),
+                ewma_ttft_ms: Some(900.0),
+            },
+            LatencyCandidate {
+                provider: "fast".into(),
+                model: "m".into(),
+                ewma_ttft_ms: Some(120.0),
+            },
+            LatencyCandidate {
+                provider: "peers".into(),
+                model: "m".into(),
+                ewma_ttft_ms: Some(130.0),
+            },
+        ];
+
+        // call_index 1 avoids the exploration rotation at index 0.
+        let order = order_by_latency(&candidates, 1, 20);
+        let names: Vec<&str> = order
+            .iter()
+            .map(|&i| candidates[i].provider.as_str())
+            .collect();
+        assert_eq!(names, vec!["fast", "peers", "slow"]);
+    }
+
+    #[test]
+    fn test_order_by_latency_explores_on_schedule() {
+        let candidates = vec![
+            LatencyCandidate {
+                provider: "slow".into(),
+                model: "m".into(),
+                ewma_ttft_ms: Some(900.0),
+            },
+            LatencyCandidate {
+                provider: "fast".into(),
+                model: "m".into(),
+                ewma_ttft_ms: Some(120.0),
+            },
+        ];
+
+        let steady = order_by_latency(&candidates, 1, 20);
+        assert_eq!(candidates[steady[0]].provider, "fast");
+
+        // The scheduled exploration call rotates, so the demoted provider is
+        // deliberately sampled instead of being starved forever.
+        let exploring = order_by_latency(&candidates, 0, 20);
+        assert_eq!(candidates[exploring[0]].provider, "slow");
+        assert_ne!(steady, exploring, "exploration must rotate the order");
     }
 
     #[tokio::test]

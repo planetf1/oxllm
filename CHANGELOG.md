@@ -7,16 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.1.13] - 2026-10-28
+- **Latency-aware routing** (`[policies]`, `"fastest"`): virtual models can
+  order healthy candidates by measured EWMA time-to-first-byte instead of
+  strict configuration order. 20% bands prevent flapping on noise, every 20th
+  request rotates the order so demoted providers are still sampled, and
+  unmeasured providers sort first so new additions are tried immediately.
+- **Per-(provider, model) traffic attribution** in `/status`: two virtual
+  models sharing one provider no longer show each other's counters. Route
+  rows also carry TTFT and total-latency distributions (p50/p95/p99) from
+  fixed-bucket histograms (relaxed atomics, no hot-path locking).
+- **`oxllm status --json`** emits the raw `/status` payload for scripting;
+  tables now adapt to terminal width (`$COLUMNS` or `--width`), dropping
+  optional columns rather than wrapping.
 
-### Added
-- **`POST /v1/completions`**: raw (non-chat) completions route for
-  fill-in-the-middle clients such as editor autocomplete. Resolves virtual
-  models, fails over across providers, accounts token usage, and honours
-  `stream: true`.
-- The SSE forwarding path is now shared by `/v1/chat/completions` and
-  `/v1/completions` (`stream_upstream_body`), so both stream chunk-by-chunk
-  with circuit-breaker feedback deferred until the stream ends.
+### Fixed
+- **OTLP export was silently dead**: the exporter had no HTTP client feature
+  enabled, so spans and metrics were never sent (logged as a warning at
+  startup since 0.1.12). Now uses `reqwest-blocking-client`, which is required
+  because OTel's batch processor runs off the Tokio runtime.
+- **Chat non-streaming successes were double-counted**: the per-provider
+  counter was incremented before the response body was read and again after,
+  which could report more successes than requests.
 
 ## [0.1.12] - 2026-06-01
 
@@ -210,3 +221,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - POSIX signal SIGHUP reloader watcher to hot-swap configuration on the fly.
 - Graceful shutdown logic that drains active streaming clients on SIGINT/SIGTERM.
 - Backpressure-safe, bounded OpenTelemetry span and metrics pipeline.
+
+## [0.1.13] - 2026-10-28
+
+### Added
+- **`POST /v1/completions`**: raw (non-chat) completions route for
+  fill-in-the-middle clients such as editor autocomplete. Resolves virtual
+  models, fails over across providers, accounts token usage, and honours
+  `stream: true`.
+- The SSE forwarding path is now shared by `/v1/chat/completions` and
+  `/v1/completions` (`stream_upstream_body`), so both stream chunk-by-chunk
+  with circuit-breaker feedback deferred until the stream ends.

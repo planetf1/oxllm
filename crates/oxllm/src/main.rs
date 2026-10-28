@@ -18,7 +18,7 @@ use axum::{
 use tower_http::cors::{Any, CorsLayer};
 
 use oxllm_core::config::Config;
-use oxllm_core::state::{AppState, CircuitState, ProviderState};
+use oxllm_core::state::{AppState, CircuitState, ModelStats, ProviderState, RoutingPolicy};
 use oxllm_core::telemetry::{TelemetryClient, TelemetryWorker};
 use reqwest::Url;
 
@@ -87,6 +87,12 @@ enum Commands {
         /// Port of the running gateway server
         #[arg(short, long, default_value_t = 8080, env = "OXLLM_PORT")]
         port: u16,
+        /// Emit the raw /status JSON instead of formatted tables
+        #[arg(long)]
+        json: bool,
+        /// Table width in characters (defaults to $COLUMNS, else 120)
+        #[arg(short, long)]
+        width: Option<usize>,
     },
     /// Triggers hot-reload by sending SIGHUP to the running gateway daemon
     Reload {
@@ -211,6 +217,7 @@ fn build_app_state(config: Config) -> Result<AppState, String> {
             successes: AtomicU64::new(0),
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
+            model_stats: Arc::new(ModelStats::default()),
         });
     }
 
@@ -219,9 +226,24 @@ fn build_app_state(config: Config) -> Result<AppState, String> {
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
+    let policies: std::collections::HashMap<String, RoutingPolicy> = config
+        .policies
+        .iter()
+        .map(|(vm, policy)| {
+            let mapped = match policy {
+                oxllm_core::config::PolicyConfig::Priority => RoutingPolicy::Priority,
+                oxllm_core::config::PolicyConfig::Fastest => RoutingPolicy::Fastest,
+            };
+            (vm.clone(), mapped)
+        })
+        .collect();
+
     Ok(AppState {
         providers,
         virtual_models: config.virtual_models,
+        route_stats: Arc::new(ModelStats::default()),
+        policies,
+        routing_calls: AtomicU64::new(0),
         http_client,
         upstream_timeout_secs: config.server.upstream_timeout_secs,
     })
@@ -628,7 +650,152 @@ fn run_validate(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-async fn run_status(port: u16) -> Result<(), Box<dyn std::error::Error>> {
+/// One column of an ASCII status table.
+struct TableColumn {
+    header: &'static str,
+    right_align: bool,
+    /// Dropped first (right-to-left) when the table will not fit the terminal.
+    optional: bool,
+}
+
+/// Renders a bordered table, dropping optional columns rather than wrapping or
+/// overflowing when the terminal is narrow. Falls back to ellipsis truncation
+/// only when even the required columns do not fit.
+fn render_table(columns: &[TableColumn], rows: &[Vec<String>], max_width: usize) -> String {
+    let mut keep: Vec<usize> = (0..columns.len()).collect();
+
+    loop {
+        let widths: Vec<usize> = keep
+            .iter()
+            .map(|&i| {
+                let mut w = columns[i].header.chars().count();
+                for row in rows {
+                    w = w.max(row.get(i).map(|c| c.chars().count()).unwrap_or(0));
+                }
+                w
+            })
+            .collect();
+        let total = widths.iter().sum::<usize>() + 3 * keep.len() + 1;
+        if total <= max_width {
+            break;
+        }
+        match keep.iter().rposition(|&i| columns[i].optional) {
+            Some(pos) => {
+                keep.remove(pos);
+            },
+            None => break,
+        }
+    }
+
+    let widths: Vec<usize> = keep
+        .iter()
+        .map(|&i| {
+            let mut w = columns[i].header.chars().count();
+            for row in rows {
+                w = w.max(row.get(i).map(|c| c.chars().count()).unwrap_or(0));
+            }
+            w
+        })
+        .collect();
+
+    // Last resort: shrink the widest columns so the table cannot overflow.
+    let mut widths = widths;
+    let mut total = widths.iter().sum::<usize>() + 3 * keep.len() + 1;
+    while total > max_width {
+        let Some((widest, _)) = widths
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| **w > 3)
+            .max_by_key(|(_, w)| **w)
+        else {
+            break;
+        };
+        widths[widest] -= 1;
+        total -= 1;
+    }
+
+    let truncate = |text: &str, width: usize| -> String {
+        let len = text.chars().count();
+        if len <= width {
+            return text.to_string();
+        }
+        if width <= 1 {
+            return text.chars().take(width).collect();
+        }
+        let mut out: String = text.chars().take(width - 1).collect();
+        out.push('\u{2026}');
+        out
+    };
+
+    let border = |left: char, mid: char, right: char| -> String {
+        let mut line = String::new();
+        line.push(left);
+        for (i, w) in widths.iter().enumerate() {
+            if i > 0 {
+                line.push(mid);
+            }
+            line.push_str(&"\u{2500}".repeat(w + 2));
+        }
+        line.push(right);
+        line
+    };
+
+    let mut out = String::new();
+    out.push_str(&border('+', '+', '+'));
+    out.push('\n');
+
+    let mut header_line = String::from("|");
+    for (pos, &col) in keep.iter().enumerate() {
+        header_line.push_str(&format!(
+            " {:<width$} |",
+            truncate(columns[col].header, widths[pos]),
+            width = widths[pos]
+        ));
+    }
+    out.push_str(&header_line);
+    out.push('\n');
+    out.push_str(&border('+', '+', '+'));
+    out.push('\n');
+
+    for row in rows {
+        let mut line = String::from("|");
+        for (pos, &col) in keep.iter().enumerate() {
+            let cell = truncate(row.get(col).map(String::as_str).unwrap_or(""), widths[pos]);
+            if columns[col].right_align {
+                line.push_str(&format!(" {:>width$} |", cell, width = widths[pos]));
+            } else {
+                line.push_str(&format!(" {:<width$} |", cell, width = widths[pos]));
+            }
+        }
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out.push_str(&border('+', '+', '+'));
+    out
+}
+
+/// Renders an optional millisecond measurement for a table cell.
+fn fmt_ms(value: Option<u64>) -> String {
+    match value {
+        Some(v) if v == u64::MAX => ">10s".to_string(),
+        Some(v) => format!("{}ms", v),
+        None => "-".to_string(),
+    }
+}
+
+/// Terminal width: explicit override, then $COLUMNS, then a safe default.
+fn status_width(override_width: Option<usize>) -> usize {
+    override_width
+        .or_else(|| std::env::var("COLUMNS").ok().and_then(|v| v.parse().ok()))
+        .unwrap_or(120)
+        .max(40)
+}
+
+async fn run_status(
+    port: u16,
+    json: bool,
+    width_override: Option<usize>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
     let url = format!("http://127.0.0.1:{}/status", port);
     let res = match client.get(&url).send().await {
@@ -642,6 +809,14 @@ async fn run_status(port: u16) -> Result<(), Box<dyn std::error::Error>> {
     };
     if !res.status().is_success() {
         return Err(format!("Server returned error status: {}", res.status()).into());
+    }
+
+    let body = res.text().await?;
+
+    if json {
+        let parsed: serde_json::Value = serde_json::from_str(&body)?;
+        println!("{}", serde_json::to_string_pretty(&parsed)?);
+        return Ok(());
     }
 
     #[derive(serde::Deserialize)]
@@ -665,6 +840,29 @@ async fn run_status(port: u16) -> Result<(), Box<dyn std::error::Error>> {
         circuit: String,
         requests: u64,
         successes: u64,
+        #[serde(default)]
+        tokens_input: u64,
+        #[serde(default)]
+        tokens_output: u64,
+        #[serde(default)]
+        ttft_p50_ms: Option<u64>,
+        #[serde(default)]
+        latency_p50_ms: Option<u64>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct RouteSummary {
+        route: String,
+        policy: String,
+        requests: u64,
+        successes: u64,
+        failures: u64,
+        tokens_input: u64,
+        tokens_output: u64,
+        latency_p50_ms: Option<u64>,
+        latency_p95_ms: Option<u64>,
+        latency_p99_ms: Option<u64>,
+        ttft_p50_ms: Option<u64>,
     }
 
     #[derive(serde::Deserialize)]
@@ -673,61 +871,273 @@ async fn run_status(port: u16) -> Result<(), Box<dyn std::error::Error>> {
         total_requests: u64,
         providers: Vec<ProviderStatus>,
         virtual_models: std::collections::HashMap<String, Vec<RouteEntry>>,
+        #[serde(default)]
+        routes: Vec<RouteSummary>,
     }
 
-    let status: StatusResponse = res.json().await?;
+    let status: StatusResponse = serde_json::from_str(&body)?;
+    let max_width = status_width(width_override);
 
-    let uptime_mins = status.uptime_secs / 60;
-    let uptime_secs_rem = status.uptime_secs % 60;
     println!(
         "\nUptime: {}m {}s  |  Total Requests: {}",
-        uptime_mins, uptime_secs_rem, status.total_requests
+        status.uptime_secs / 60,
+        status.uptime_secs % 60,
+        status.total_requests
     );
 
-    // Virtual model routing tables
-    for (vm_name, routes) in &status.virtual_models {
+    // Per-virtual-model routing tables. Counters are per (provider, model), so
+    // two virtual models backed by different models on one provider no longer
+    // show each other's traffic.
+    let mut vms: Vec<(&String, &Vec<RouteEntry>)> = status.virtual_models.iter().collect();
+    vms.sort_by(|a, b| a.0.cmp(b.0));
+
+    for (vm_name, routes) in vms {
         println!("\nVirtual Model: {}", vm_name);
-        println!("{}", "-".repeat(127));
+        let rows: Vec<Vec<String>> = routes
+            .iter()
+            .map(|e| {
+                vec![
+                    e.provider.clone(),
+                    e.model.clone(),
+                    e.circuit.clone(),
+                    e.requests.to_string(),
+                    e.successes.to_string(),
+                    e.tokens_input.to_string(),
+                    e.tokens_output.to_string(),
+                    fmt_ms(e.ttft_p50_ms),
+                    fmt_ms(e.latency_p50_ms),
+                ]
+            })
+            .collect();
         println!(
-            "| {:<20} | {:<45} | {:<30} | {:>8} | {:>8} |",
-            "Provider", "Model", "Circuit", "Requests", "Success"
+            "{}",
+            render_table(
+                &[
+                    TableColumn {
+                        header: "Provider",
+                        right_align: false,
+                        optional: false
+                    },
+                    TableColumn {
+                        header: "Model",
+                        right_align: false,
+                        optional: false
+                    },
+                    TableColumn {
+                        header: "Circuit",
+                        right_align: false,
+                        optional: true
+                    },
+                    TableColumn {
+                        header: "Requests",
+                        right_align: true,
+                        optional: false
+                    },
+                    TableColumn {
+                        header: "Success",
+                        right_align: true,
+                        optional: false
+                    },
+                    TableColumn {
+                        header: "Tokens In",
+                        right_align: true,
+                        optional: true
+                    },
+                    TableColumn {
+                        header: "Tokens Out",
+                        right_align: true,
+                        optional: true
+                    },
+                    TableColumn {
+                        header: "TTFT p50",
+                        right_align: true,
+                        optional: true
+                    },
+                    TableColumn {
+                        header: "Lat p50",
+                        right_align: true,
+                        optional: true
+                    },
+                ],
+                &rows,
+                max_width,
+            )
         );
-        println!("{}", "-".repeat(127));
-        for entry in routes {
-            println!(
-                "| {:<20} | {:<45} | {:<30} | {:>8} | {:>8} |",
-                entry.provider, entry.model, entry.circuit, entry.requests, entry.successes
-            );
-        }
     }
 
-    // Per-provider table
-    println!(
-        "\n+--------------------+-----------------------------------------------+--------------------------------+----------+---------------+----------+-----------+--------------+---------------+--------------+"
-    );
-    println!("| Provider Name      | Models                                                | Circuit Breaker State          | Failures | Rate Limited? | Requests | Successes | Tokens Input | Tokens Output | Last Request|");
-    println!("+--------------------+-----------------------------------------------+--------------------------------+----------+---------------+----------+-----------+--------------+---------------+--------------+");
-    for s in &status.providers {
+    // Per-route rollup with latency distributions (one row per virtual model,
+    // regardless of how many providers back it).
+    if !status.routes.is_empty() {
+        println!("\nRoutes");
+        let rows: Vec<Vec<String>> = status
+            .routes
+            .iter()
+            .map(|r| {
+                vec![
+                    r.route.clone(),
+                    r.policy.clone(),
+                    r.requests.to_string(),
+                    r.successes.to_string(),
+                    r.failures.to_string(),
+                    r.tokens_input.to_string(),
+                    r.tokens_output.to_string(),
+                    fmt_ms(r.ttft_p50_ms),
+                    fmt_ms(r.latency_p50_ms),
+                    fmt_ms(r.latency_p95_ms),
+                    fmt_ms(r.latency_p99_ms),
+                ]
+            })
+            .collect();
         println!(
-            "| {:<18} | {:<45} | {:<30} | {:<8} | {:<13} | {:<8} | {:<9} | {:<12} | {:<13} | {:<12} |",
-            s.name,
-            s.models,
-            s.circuit,
-            s.failures,
-            if s.rate_limited { "Yes" } else { "No" },
-            s.requests,
-            s.successes,
-            s.tokens_input,
-            s.tokens_output,
-            s.last_request,
+            "{}",
+            render_table(
+                &[
+                    TableColumn {
+                        header: "Route",
+                        right_align: false,
+                        optional: false
+                    },
+                    TableColumn {
+                        header: "Policy",
+                        right_align: false,
+                        optional: true
+                    },
+                    TableColumn {
+                        header: "Req",
+                        right_align: true,
+                        optional: false
+                    },
+                    TableColumn {
+                        header: "OK",
+                        right_align: true,
+                        optional: false
+                    },
+                    TableColumn {
+                        header: "Fail",
+                        right_align: true,
+                        optional: true
+                    },
+                    TableColumn {
+                        header: "Tok In",
+                        right_align: true,
+                        optional: true
+                    },
+                    TableColumn {
+                        header: "Tok Out",
+                        right_align: true,
+                        optional: true
+                    },
+                    TableColumn {
+                        header: "TTFT50",
+                        right_align: true,
+                        optional: true
+                    },
+                    TableColumn {
+                        header: "p50",
+                        right_align: true,
+                        optional: true
+                    },
+                    TableColumn {
+                        header: "p95",
+                        right_align: true,
+                        optional: true
+                    },
+                    TableColumn {
+                        header: "p99",
+                        right_align: true,
+                        optional: true
+                    },
+                ],
+                &rows,
+                max_width,
+            )
         );
     }
+
+    // Per-provider totals (all models on that provider combined).
+    println!("\nProviders");
+    let rows: Vec<Vec<String>> = status
+        .providers
+        .iter()
+        .map(|s| {
+            vec![
+                s.name.clone(),
+                s.models.clone(),
+                s.circuit.clone(),
+                s.failures.to_string(),
+                if s.rate_limited { "Yes" } else { "No" }.to_string(),
+                s.requests.to_string(),
+                s.successes.to_string(),
+                s.tokens_input.to_string(),
+                s.tokens_output.to_string(),
+                s.last_request.clone(),
+            ]
+        })
+        .collect();
     println!(
-        "+--------------------+-----------------------------------------------+--------------------------------+----------+---------------+----------+-----------+--------------+---------------+--------------+\n"
+        "{}",
+        render_table(
+            &[
+                TableColumn {
+                    header: "Provider",
+                    right_align: false,
+                    optional: false
+                },
+                TableColumn {
+                    header: "Models",
+                    right_align: false,
+                    optional: true
+                },
+                TableColumn {
+                    header: "Circuit",
+                    right_align: false,
+                    optional: true
+                },
+                TableColumn {
+                    header: "Failures",
+                    right_align: true,
+                    optional: true
+                },
+                TableColumn {
+                    header: "Rate Limited",
+                    right_align: false,
+                    optional: true
+                },
+                TableColumn {
+                    header: "Requests",
+                    right_align: true,
+                    optional: false
+                },
+                TableColumn {
+                    header: "Successes",
+                    right_align: true,
+                    optional: false
+                },
+                TableColumn {
+                    header: "Tokens In",
+                    right_align: true,
+                    optional: true
+                },
+                TableColumn {
+                    header: "Tokens Out",
+                    right_align: true,
+                    optional: true
+                },
+                TableColumn {
+                    header: "Last Request",
+                    right_align: false,
+                    optional: true
+                },
+            ],
+            &rows,
+            max_width,
+        )
     );
+    println!();
 
     Ok(())
 }
+
 fn run_reload(pid_opt: Option<u32>) -> Result<(), Box<dyn std::error::Error>> {
     let pid = match pid_opt {
         Some(p) => p,
@@ -944,8 +1354,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Validate { config } => {
             run_validate(config)?;
         },
-        Commands::Status { port } => {
-            run_status(port).await?;
+        Commands::Status { port, json, width } => {
+            run_status(port, json, width).await?;
         },
         Commands::Reload { pid } => {
             run_reload(pid)?;
@@ -1041,6 +1451,7 @@ mod integration_tests {
             successes: AtomicU64::new(0),
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
+            model_stats: Arc::new(ModelStats::default()),
         };
 
         let p2 = ProviderState {
@@ -1058,6 +1469,7 @@ mod integration_tests {
             successes: AtomicU64::new(0),
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
+            model_stats: Arc::new(ModelStats::default()),
         };
 
         let mut virtual_models = std::collections::HashMap::new();
@@ -1079,6 +1491,9 @@ mod integration_tests {
         let app_state = Arc::new(AppState {
             providers: vec![p1, p2],
             virtual_models,
+            route_stats: Arc::new(ModelStats::default()),
+            policies: std::collections::HashMap::new(),
+            routing_calls: AtomicU64::new(0),
             http_client,
             upstream_timeout_secs: 5,
         });
@@ -1158,6 +1573,7 @@ mod integration_tests {
             successes: AtomicU64::new(0),
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
+            model_stats: Arc::new(ModelStats::default()),
         };
 
         let mut virtual_models = std::collections::HashMap::new();
@@ -1173,6 +1589,9 @@ mod integration_tests {
         let app_state = Arc::new(AppState {
             providers: vec![p],
             virtual_models,
+            route_stats: Arc::new(ModelStats::default()),
+            policies: std::collections::HashMap::new(),
+            routing_calls: AtomicU64::new(0),
             http_client,
             upstream_timeout_secs: 5,
         });
@@ -1315,6 +1734,7 @@ mod integration_tests {
             successes: AtomicU64::new(0),
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
+            model_stats: Arc::new(ModelStats::default()),
         };
 
         let mut virtual_models = std::collections::HashMap::new();
@@ -1329,6 +1749,9 @@ mod integration_tests {
         Arc::new(AppState {
             providers: vec![provider],
             virtual_models,
+            route_stats: Arc::new(ModelStats::default()),
+            policies: std::collections::HashMap::new(),
+            routing_calls: AtomicU64::new(0),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         })
@@ -1477,6 +1900,142 @@ mod integration_tests {
         assert!(body.contains("data: {\"choices\":[{\"text\":\" World\"}]}"));
     }
 
+    /// Per-(provider, model) attribution: two virtual models sharing one
+    /// provider must not show each other's traffic, and /status must report
+    /// the latency distribution for the route that actually ran.
+    #[tokio::test]
+    async fn test_status_attributes_traffic_per_model_not_per_provider() {
+        let response =
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}";
+        let recorded = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let addr =
+            spawn_recording_upstream(vec![response.to_string(), response.to_string()], recorded)
+                .await;
+
+        let provider = ProviderState {
+            name: "omlx-local".to_string(),
+            base_url: Url::parse(&format!("http://{}/v1/", addr)).unwrap(),
+            api_key: "k".to_string(),
+            models: vec!["small".to_string()],
+            circuit: Arc::new(RwLock::new(CircuitState::Closed)),
+            consecutive_failures: Arc::new(RwLock::new(0)),
+            rate_limited_until: Arc::new(RwLock::new(None)),
+            last_attempt_time: Arc::new(RwLock::new(None)),
+            probe_in_flight: Arc::new(AtomicBool::new(false)),
+            manual_disabled: AtomicBool::new(false),
+            requests: AtomicU64::new(0),
+            successes: AtomicU64::new(0),
+            tokens_input: AtomicU64::new(0),
+            tokens_output: AtomicU64::new(0),
+            model_stats: Arc::new(ModelStats::default()),
+        };
+
+        let mut virtual_models = std::collections::HashMap::new();
+        virtual_models.insert(
+            "router-small".to_string(),
+            vec![VirtualModelTarget {
+                provider: "omlx-local".to_string(),
+                model: "small".to_string(),
+            }],
+        );
+        virtual_models.insert(
+            "router-big".to_string(),
+            vec![VirtualModelTarget {
+                provider: "omlx-local".to_string(),
+                model: "big".to_string(),
+            }],
+        );
+
+        let app_state = Arc::new(AppState {
+            providers: vec![provider],
+            virtual_models,
+            route_stats: Arc::new(ModelStats::default()),
+            policies: std::collections::HashMap::new(),
+            routing_calls: AtomicU64::new(0),
+            http_client: reqwest::Client::builder().build().unwrap(),
+            upstream_timeout_secs: 5,
+        });
+
+        let (_ws, wr) = tokio::sync::watch::channel(app_state.clone());
+        let (ttx, _trx) = tokio::sync::mpsc::channel(1024);
+        let rs = ReloadableState {
+            app_state: wr,
+            telemetry: TelemetryClient::new(ttx),
+            start_time: Instant::now(),
+            reloader: Reloader {
+                sender: _ws.clone(),
+                config_path: PathBuf::from("config.toml"),
+            },
+        };
+
+        let router = axum::Router::new()
+            .route(
+                "/v1/completions",
+                axum::routing::post(routes::create_completions),
+            )
+            .route("/status", axum::routing::get(routes::get_status))
+            .layer(middleware::from_fn(add_request_id))
+            .with_state(rs);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        // Two calls to the small route only.
+        for _ in 0..2 {
+            let res = client
+                .post(format!("http://{}/v1/completions", proxy_addr))
+                .json(&serde_json::json!({"model": "router-small", "prompt": "x"}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), 200);
+        }
+
+        let status: Value = client
+            .get(format!("http://{}/status", proxy_addr))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        let small = &status["virtual_models"]["router-small"][0];
+        assert_eq!(small["model"], "small");
+        assert_eq!(small["requests"], 2, "small route should have 2 requests");
+
+        let big = &status["virtual_models"]["router-big"][0];
+        assert_eq!(big["model"], "big");
+        assert_eq!(
+            big["requests"], 0,
+            "the sibling model on the same provider must not inherit traffic"
+        );
+        assert_eq!(big["tokens_input"], 0);
+
+        // Route rollup carries the distribution for the route that ran.
+        let routes = status["routes"].as_array().expect("routes array");
+        let small_route = routes
+            .iter()
+            .find(|r| r["route"] == "router-small")
+            .expect("router-small route row");
+        assert_eq!(small_route["requests"], 2);
+        assert_eq!(small_route["policy"], "priority");
+        assert!(
+            small_route["latency_p50_ms"].is_number(),
+            "p50 should be populated after two requests"
+        );
+
+        let big_route = routes
+            .iter()
+            .find(|r| r["route"] == "router-big")
+            .expect("router-big route row");
+        assert_eq!(big_route["requests"], 0);
+    }
+
     // -----------------------------------------------------------------------
     // New integration tests: timeout failover, all-providers-fail, manual
     // offline, rate-limit recovery, embeddings endpoint
@@ -1502,6 +2061,7 @@ mod integration_tests {
             successes: AtomicU64::new(0),
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
+            model_stats: Arc::new(ModelStats::default()),
         };
 
         let p2 = ProviderState {
@@ -1519,6 +2079,7 @@ mod integration_tests {
             successes: AtomicU64::new(0),
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
+            model_stats: Arc::new(ModelStats::default()),
         };
 
         let strategy = AdaptivePriorityStrategy;
@@ -1573,6 +2134,7 @@ mod integration_tests {
             successes: AtomicU64::new(0),
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
+            model_stats: Arc::new(ModelStats::default()),
         };
 
         let p1 = make_provider("p1");
@@ -1596,6 +2158,9 @@ mod integration_tests {
         let app_state = Arc::new(AppState {
             providers: vec![p1, p2],
             virtual_models,
+            route_stats: Arc::new(ModelStats::default()),
+            policies: std::collections::HashMap::new(),
+            routing_calls: AtomicU64::new(0),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -1687,6 +2252,7 @@ mod integration_tests {
             successes: AtomicU64::new(0),
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
+            model_stats: Arc::new(ModelStats::default()),
         };
 
         let p2 = ProviderState {
@@ -1704,6 +2270,7 @@ mod integration_tests {
             successes: AtomicU64::new(0),
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
+            model_stats: Arc::new(ModelStats::default()),
         };
 
         let mut virtual_models = std::collections::HashMap::new();
@@ -1724,6 +2291,9 @@ mod integration_tests {
         let app_state = Arc::new(AppState {
             providers: vec![p1, p2],
             virtual_models,
+            route_stats: Arc::new(ModelStats::default()),
+            policies: std::collections::HashMap::new(),
+            routing_calls: AtomicU64::new(0),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -1805,6 +2375,7 @@ mod integration_tests {
             successes: AtomicU64::new(0),
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
+            model_stats: Arc::new(ModelStats::default()),
         };
 
         let mut virtual_models = std::collections::HashMap::new();
@@ -1819,6 +2390,9 @@ mod integration_tests {
         let app_state = Arc::new(AppState {
             providers: vec![p],
             virtual_models,
+            route_stats: Arc::new(ModelStats::default()),
+            policies: std::collections::HashMap::new(),
+            routing_calls: AtomicU64::new(0),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -1922,6 +2496,7 @@ mod integration_tests {
             successes: AtomicU64::new(0),
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
+            model_stats: Arc::new(ModelStats::default()),
         };
 
         let mut virtual_models = std::collections::HashMap::new();
@@ -1936,6 +2511,9 @@ mod integration_tests {
         let app_state = Arc::new(AppState {
             providers: vec![p],
             virtual_models,
+            route_stats: Arc::new(ModelStats::default()),
+            policies: std::collections::HashMap::new(),
+            routing_calls: AtomicU64::new(0),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -2013,6 +2591,7 @@ mod integration_tests {
             successes: AtomicU64::new(0),
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
+            model_stats: Arc::new(ModelStats::default()),
         };
         let mut vm = std::collections::HashMap::new();
         vm.insert(
@@ -2026,6 +2605,9 @@ mod integration_tests {
         let state = Arc::new(AppState {
             providers: vec![p],
             virtual_models: vm,
+            route_stats: Arc::new(ModelStats::default()),
+            policies: std::collections::HashMap::new(),
+            routing_calls: AtomicU64::new(0),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -2094,6 +2676,7 @@ mod integration_tests {
             successes: AtomicU64::new(0),
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
+            model_stats: Arc::new(ModelStats::default()),
         };
 
         let mut vms = std::collections::HashMap::new();
@@ -2107,6 +2690,9 @@ mod integration_tests {
         let state = Arc::new(AppState {
             providers: vec![p],
             virtual_models: vms,
+            route_stats: Arc::new(ModelStats::default()),
+            policies: std::collections::HashMap::new(),
+            routing_calls: AtomicU64::new(0),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -2188,6 +2774,7 @@ mod integration_tests {
             successes: AtomicU64::new(0),
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
+            model_stats: Arc::new(ModelStats::default()),
         };
 
         let mut vms = std::collections::HashMap::new();
@@ -2201,6 +2788,9 @@ mod integration_tests {
         let state = Arc::new(AppState {
             providers: vec![p],
             virtual_models: vms,
+            route_stats: Arc::new(ModelStats::default()),
+            policies: std::collections::HashMap::new(),
+            routing_calls: AtomicU64::new(0),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -2282,6 +2872,7 @@ mod integration_tests {
             successes: AtomicU64::new(0),
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
+            model_stats: Arc::new(ModelStats::default()),
         };
         let mut vm = std::collections::HashMap::new();
         vm.insert(
@@ -2295,6 +2886,9 @@ mod integration_tests {
         let app_state = Arc::new(AppState {
             providers: vec![p],
             virtual_models: vm,
+            route_stats: Arc::new(ModelStats::default()),
+            policies: std::collections::HashMap::new(),
+            routing_calls: AtomicU64::new(0),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });

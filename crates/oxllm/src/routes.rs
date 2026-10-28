@@ -13,9 +13,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, warn};
 
-use oxllm_core::router::{AdaptivePriorityStrategy, RoutingStrategy};
-use oxllm_core::state::{AppState, CircuitState, ProviderState};
+use oxllm_core::router::{
+    order_by_latency, AdaptivePriorityStrategy, LatencyCandidate, RoutingStrategy,
+};
+use oxllm_core::state::{AppState, CircuitState, ModelStats, ProviderState, RoutingPolicy};
 use oxllm_core::telemetry::{TelemetryClient, TelemetryEvent};
+
+/// Every Nth request ignores measured latency for one routing decision, so a
+/// provider demoted by a transient blip is still re-sampled.
+const LATENCY_EXPLORE_EVERY: u64 = 20;
 
 #[derive(Serialize)]
 struct ModelObject {
@@ -88,6 +94,10 @@ struct RouteEntry {
     circuit: String,
     requests: u64,
     successes: u64,
+    tokens_input: u64,
+    tokens_output: u64,
+    ttft_p50_ms: Option<u64>,
+    latency_p50_ms: Option<u64>,
 }
 
 /// GET /status (localhost restricted in main.rs routing)
@@ -108,12 +118,31 @@ pub async fn get_status(
         last_request: String,
     }
 
+    /// Per-virtual-model totals, independent of how many providers back it.
+    #[derive(Serialize)]
+    struct RouteSummary {
+        route: String,
+        policy: String,
+        requests: u64,
+        successes: u64,
+        failures: u64,
+        tokens_input: u64,
+        tokens_output: u64,
+        latency_p50_ms: Option<u64>,
+        latency_p95_ms: Option<u64>,
+        latency_p99_ms: Option<u64>,
+        latency_mean_ms: Option<f64>,
+        ttft_p50_ms: Option<u64>,
+        ttft_p95_ms: Option<u64>,
+    }
+
     #[derive(Serialize)]
     struct StatusResponse {
         uptime_secs: u64,
         total_requests: u64,
         providers: Vec<ProviderStatus>,
         virtual_models: std::collections::HashMap<String, Vec<RouteEntry>>,
+        routes: Vec<RouteSummary>,
     }
 
     let mut status_list = Vec::new();
@@ -196,43 +225,112 @@ pub async fn get_status(
                 .providers
                 .iter()
                 .find(|p| p.name == target.provider);
-            let (circuit_str, requests, successes) = match provider_state {
+            let circuit_str = match provider_state {
                 Some(provider) => {
                     let circ = *provider.circuit.read().await;
                     let now = std::time::Instant::now();
-                    let circuit_str = match circ {
+                    match circ {
                         CircuitState::Closed => "Closed (Healthy)".to_string(),
                         CircuitState::HalfOpen => "Half-Open (Probing)".to_string(),
                         CircuitState::Open { until } => {
                             let left = until.saturating_duration_since(now).as_secs();
                             format!("Open ({}s cooldown)", left)
                         },
-                    };
-                    let requests = provider.requests.load(std::sync::atomic::Ordering::Relaxed);
-                    let successes = provider
-                        .successes
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    (circuit_str, requests, successes)
+                    }
                 },
-                None => ("Unknown".to_string(), 0, 0),
+                None => "Unknown".to_string(),
             };
+            // Traffic attributed to this (provider, model) pair, not to the
+            // provider as a whole: one provider may serve several routes.
+            let stats = provider_state
+                .map(|provider| {
+                    provider
+                        .model_stats
+                        .snapshot(&oxllm_core::state::ModelStats::key(
+                            &target.provider,
+                            &target.model,
+                        ))
+                })
+                .unwrap_or_default();
             entries.push(RouteEntry {
                 provider: target.provider.clone(),
                 model: target.model.clone(),
                 circuit: circuit_str,
-                requests,
-                successes,
+                requests: stats.requests,
+                successes: stats.successes,
+                tokens_input: stats.tokens_input,
+                tokens_output: stats.tokens_output,
+                ttft_p50_ms: stats.ttft_p50_ms,
+                latency_p50_ms: stats.latency_p50_ms,
             });
         }
         virtual_models.insert(vm_name.clone(), entries);
     }
+
+    let mut routes: Vec<RouteSummary> = app_state
+        .route_stats_keys()
+        .into_iter()
+        .map(|route_name| {
+            let snap = app_state.route_stats.snapshot(&route_name);
+            RouteSummary {
+                policy: match app_state.policies.get(&route_name) {
+                    Some(RoutingPolicy::Fastest) => "fastest".to_string(),
+                    _ => "priority".to_string(),
+                },
+                requests: snap.requests,
+                successes: snap.successes,
+                failures: snap.failures,
+                tokens_input: snap.tokens_input,
+                tokens_output: snap.tokens_output,
+                latency_p50_ms: snap.latency_p50_ms,
+                latency_p95_ms: snap.latency_p95_ms,
+                latency_p99_ms: snap.latency_p99_ms,
+                latency_mean_ms: snap.latency_mean_ms,
+                ttft_p50_ms: snap.ttft_p50_ms,
+                ttft_p95_ms: snap.ttft_p95_ms,
+                route: route_name,
+            }
+        })
+        .collect();
+    routes.sort_by(|a, b| a.route.cmp(&b.route));
 
     Json(StatusResponse {
         uptime_secs: start_time.elapsed().as_secs(),
         total_requests,
         providers: status_list,
         virtual_models,
+        routes,
     })
+}
+
+/// Applies the configured routing policy to a resolved candidate list.
+/// `Priority` keeps configuration order untouched; `Fastest` sorts by observed
+/// EWMA TTFT in 20% bands (with periodic exploration), so the order only
+/// changes when one provider is meaningfully quicker.
+fn ordered_candidates<'a>(
+    app_state: &AppState,
+    route_name: &str,
+    candidates: &[(&'a ProviderState, String)],
+) -> Vec<(&'a ProviderState, String)> {
+    let ordered: Vec<(&'a ProviderState, String)> = candidates.to_vec();
+    if app_state.policies.get(route_name) != Some(&RoutingPolicy::Fastest) || ordered.len() < 2 {
+        return ordered;
+    }
+
+    let latency: Vec<LatencyCandidate> = ordered
+        .iter()
+        .map(|(provider, model)| LatencyCandidate {
+            provider: provider.name.clone(),
+            model: model.clone(),
+            ewma_ttft_ms: provider.model_stats.ewma_ttft_ms(&provider.name, model),
+        })
+        .collect();
+
+    let call_index = app_state
+        .routing_calls
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let order = order_by_latency(&latency, call_index, LATENCY_EXPLORE_EVERY);
+    order.into_iter().map(|i| ordered[i].clone()).collect()
 }
 
 /// POST /v1/embeddings
@@ -264,6 +362,9 @@ pub async fn create_embeddings(
         },
     };
 
+    // Owned copy: `payload` is mutated per attempt, so the &str borrow cannot
+    // live across the routing loop.
+    let route_name = requested_model.to_string();
     let candidates = app_state.resolve_candidates(requested_model);
     if candidates.is_empty() {
         return json_error_response(
@@ -284,6 +385,7 @@ pub async fn create_embeddings(
     let mut last_failed_status: u16 = 0;
 
     // Map candidate provider references for select strategy
+    let candidates = ordered_candidates(&app_state, &route_name, &candidates);
     let candidate_states: Vec<&ProviderState> = candidates.iter().map(|(p, _)| *p).collect();
 
     while let Some(selected) = strategy.select(&candidate_states).await {
@@ -341,7 +443,19 @@ pub async fn create_embeddings(
             target
                 .requests
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            target
+                .model_stats
+                .counters(&ModelStats::key(&selected.name, &target_model))
+                .requests
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+
+        // Route-level counters: one row per virtual model, independent of how
+        // many providers back it.
+        let route_counters = app_state.route_stats.counters(&route_name);
+        route_counters
+            .requests
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let res = req.send().await;
 
@@ -425,6 +539,27 @@ pub async fn create_embeddings(
                 target_provider_state
                     .tokens_output
                     .fetch_add(output_tokens, std::sync::atomic::Ordering::Relaxed);
+                {
+                    let elapsed_ms = start_time.elapsed().as_millis() as u64;
+                    let model_counters = target_provider_state
+                        .model_stats
+                        .counters(&ModelStats::key(&selected.name, &target_model));
+                    for counters in [&model_counters, &route_counters] {
+                        counters
+                            .successes
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        counters
+                            .tokens_input
+                            .fetch_add(input_tokens, std::sync::atomic::Ordering::Relaxed);
+                        counters
+                            .tokens_output
+                            .fetch_add(output_tokens, std::sync::atomic::Ordering::Relaxed);
+                        counters.latency.record(elapsed_ms);
+                        // Non-streaming: first byte is indistinguishable from the
+                        // whole response, so total latency is the TTFT sample.
+                        counters.record_ttft(elapsed_ms * 1000);
+                    }
+                }
 
                 // Push Telemetry Metrics
                 telemetry.emit(TelemetryEvent::RecordTransaction {
@@ -570,6 +705,9 @@ pub async fn create_completions(
         },
     };
 
+    // Owned copy: `payload` is mutated per attempt, so the &str borrow cannot
+    // live across the routing loop.
+    let route_name = requested_model.to_string();
     let candidates = app_state.resolve_candidates(requested_model);
     if candidates.is_empty() {
         return json_error_response(
@@ -592,6 +730,7 @@ pub async fn create_completions(
     let mut last_failed_provider = String::new();
     let mut last_failed_status: u16 = 0;
 
+    let candidates = ordered_candidates(&app_state, &route_name, &candidates);
     let candidate_states: Vec<&ProviderState> = candidates.iter().map(|(p, _)| *p).collect();
 
     while let Some(selected) = strategy.select(&candidate_states).await {
@@ -644,7 +783,19 @@ pub async fn create_completions(
             target
                 .requests
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            target
+                .model_stats
+                .counters(&ModelStats::key(&selected.name, &target_model))
+                .requests
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+
+        // Route-level counters: one row per virtual model, independent of how
+        // many providers back it.
+        let route_counters = app_state.route_stats.counters(&route_name);
+        route_counters
+            .requests
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let res = req.send().await;
 
@@ -742,6 +893,27 @@ pub async fn create_completions(
                 target_provider_state
                     .tokens_output
                     .fetch_add(output_tokens, std::sync::atomic::Ordering::Relaxed);
+                {
+                    let elapsed_ms = start_time.elapsed().as_millis() as u64;
+                    let model_counters = target_provider_state
+                        .model_stats
+                        .counters(&ModelStats::key(&selected.name, &target_model));
+                    for counters in [&model_counters, &route_counters] {
+                        counters
+                            .successes
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        counters
+                            .tokens_input
+                            .fetch_add(input_tokens, std::sync::atomic::Ordering::Relaxed);
+                        counters
+                            .tokens_output
+                            .fetch_add(output_tokens, std::sync::atomic::Ordering::Relaxed);
+                        counters.latency.record(elapsed_ms);
+                        // Non-streaming: first byte is indistinguishable from the
+                        // whole response, so total latency is the TTFT sample.
+                        counters.record_ttft(elapsed_ms * 1000);
+                    }
+                }
 
                 telemetry.emit(TelemetryEvent::RecordTransaction {
                     operation: "completions".to_string(),
@@ -879,6 +1051,9 @@ pub async fn create_chat_completions(
         },
     };
 
+    // Owned copy: `payload` is mutated per attempt, so the &str borrow cannot
+    // live across the routing loop.
+    let route_name = requested_model.to_string();
     let candidates = app_state.resolve_candidates(requested_model);
     if candidates.is_empty() {
         return json_error_response(
@@ -901,6 +1076,7 @@ pub async fn create_chat_completions(
     let mut last_failed_provider = String::new();
     let mut last_failed_status: u16 = 0;
 
+    let candidates = ordered_candidates(&app_state, &route_name, &candidates);
     let candidate_states: Vec<&ProviderState> = candidates.iter().map(|(p, _)| *p).collect();
 
     while let Some(selected) = strategy.select(&candidate_states).await {
@@ -954,7 +1130,19 @@ pub async fn create_chat_completions(
             target
                 .requests
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            target
+                .model_stats
+                .counters(&ModelStats::key(&selected.name, &target_model))
+                .requests
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+
+        // Route-level counters: one row per virtual model, independent of how
+        // many providers back it.
+        let route_counters = app_state.route_stats.counters(&route_name);
+        route_counters
+            .requests
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let res = req.send().await;
 
@@ -1002,10 +1190,6 @@ pub async fn create_chat_completions(
                         status: circuit_status(target_provider_state).await,
                     });
 
-                    // Increment local counters (streaming: token counts deferred)
-                    target_provider_state
-                        .successes
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let res_body = match res.bytes().await {
                         Ok(b) => b,
                         Err(e) => {
@@ -1057,6 +1241,27 @@ pub async fn create_chat_completions(
                     target_provider_state
                         .tokens_output
                         .fetch_add(output_tokens, std::sync::atomic::Ordering::Relaxed);
+                    {
+                        let elapsed_ms = start_time.elapsed().as_millis() as u64;
+                        let model_counters = target_provider_state
+                            .model_stats
+                            .counters(&ModelStats::key(&selected.name, &target_model));
+                        for counters in [&model_counters, &route_counters] {
+                            counters
+                                .successes
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            counters
+                                .tokens_input
+                                .fetch_add(input_tokens, std::sync::atomic::Ordering::Relaxed);
+                            counters
+                                .tokens_output
+                                .fetch_add(output_tokens, std::sync::atomic::Ordering::Relaxed);
+                            counters.latency.record(elapsed_ms);
+                            // Non-streaming: first byte is indistinguishable from the
+                            // whole response, so total latency is the TTFT sample.
+                            counters.record_ttft(elapsed_ms * 1000);
+                        }
+                    }
 
                     // Push Telemetry Metrics
                     telemetry.emit(TelemetryEvent::RecordTransaction {

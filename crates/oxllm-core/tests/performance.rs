@@ -26,6 +26,7 @@ async fn test_routing_loop_latency_performance() {
             successes: AtomicU64::new(0),
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
+            model_stats: Arc::new(oxllm_core::state::ModelStats::default()),
         });
     }
 

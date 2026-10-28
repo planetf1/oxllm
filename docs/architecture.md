@@ -46,7 +46,7 @@
 2.  `POST /v1/completions` – Raw (non-chat) completions for fill-in-the-middle clients such as editor autocomplete. Also supports SSE streaming; no buffering beyond the per-chunk forward.
 3.  `POST /v1/embeddings` – Standard non-streaming batch vectors.
 4.  `GET /v1/models` – Returns a consolidated virtual array of all models exposed by currently active and healthy upstream providers.
-5.  `GET /status` – Administrative endpoint displaying per-provider circuit state, request counters, token volumes, and last request time. Localhost-restricted.
+5.  `GET /status` – Administrative endpoint displaying per-provider circuit state, per-(provider, model) request counters and token volumes, per-route latency distributions (p50/p95/p99 total and TTFT), and last request time. Localhost-restricted.
 6. `POST /reload` – Administrative endpoint triggering config hot-reload via HTTP. Same effect as SIGHUP. Localhost-restricted.
 7. `GET /health` – Lightweight health-check endpoint. Localhost-restricted.
 8. `POST /admin/providers/{name}/offline` – Manually mark a provider as disabled. Localhost-restricted.
@@ -103,6 +103,7 @@ pub struct ProviderState {
     * Increment `consecutive_failures`. If failures >= 3, set `circuit = CircuitState::Open { until: Instant::now() + Duration::from_secs(60) }`.
     * Immediately drop the connection to this upstream, advance the loop index, and dispatch to the next available provider.
 5. **Mid-Stream Fallback**: If an upstream accepts the connection with a `200 OK` and fails mid-stream during an SSE event transfer, the proxy will transparently forward the disconnect to the downstream agent. As of v0.1.9, streaming success feedback is deferred until stream completion, and mid-stream failures ARE counted as failures (incrementing `consecutive_failures`). The proxy does not attempt to hot-swap upstreams mid-flight to avoid corrupted JSON token streams.
+6. **Latency-Aware Ordering (`fastest` policy)**: A virtual model configured with `policy = "fastest"` orders its healthy candidates by an EWMA of observed time-to-first-byte, bucketed into 20% bands. Candidates within the same band keep their configured order (anti-flap), every 20th request rotates the order so demoted providers are still sampled (exploration), and unmeasured providers sort first so new additions are tried immediately. Health checks always apply before ordering. The default `priority` policy keeps strict configuration order.
 
 ### 3.2. Configuration Schema & Hot Reloading
 Configuration is declared in a single `config.toml` file (avoiding deprecated YAML dependencies).
@@ -147,6 +148,12 @@ complex-free = [
   { provider = "sambanova", model = "llama-3.3-70b-instruct" },
   { provider = "google-ai-studio", model = "gemini-2.5-flash" }
 ]
+
+# Optional: routing policy per virtual model. Omitted means "priority"
+# (strict configuration order). "fastest" orders healthy candidates by
+# measured EWMA time-to-first-byte in 20% bands.
+[policies]
+complex-free = "fastest"
 ```
 
 #### Reloading Mechanism

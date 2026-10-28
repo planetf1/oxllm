@@ -194,7 +194,7 @@ smart = [
 
 ### How the Routing Algorithm Works
 
-1. When a request arrives, the proxy iterates the virtual model's provider list in order.
+1. When a request arrives, the proxy iterates the virtual model's provider list in order (or by measured latency — see **Routing Policies** below).
 2. For each provider, it checks: **circuit breaker state** (Closed? Open? HalfOpen?), **rate-limit window** (cooling down?), **manual override** (admin-disabled?).
 3. The first healthy provider is selected for the request.
 4. On success: circuit resets to Closed, failure count drops to 0.
@@ -202,6 +202,35 @@ smart = [
 6. On 5xx: increments failure counter. After 3 failures, circuit opens for **60 × 2^(failures-3)** seconds.
 7. **HalfOpen probes**: After cooldown expires, a single probe request is allowed. Only one concurrent probe — others bypass via atomic `compare_exchange`.
 8. **Idle decay**: Every 5 minutes without a request, failure count decreases by 1. Below 3 failures, Open circuits automatically rehabilitate to Closed.
+
+### Routing Policies
+
+By default a virtual model uses `priority`: strict configuration order with the
+health checks above. A virtual model can instead route by measured latency:
+
+```toml
+[policies]
+smart = "fastest"
+```
+
+Under `fastest`, each provider's time-to-first-byte is tracked as an EWMA and
+candidates are ordered by it in 20% bands — a provider must be meaningfully
+faster to move up, so near-ties keep their configured order and do not flap on
+noise. Every 20th request rotates the order so a demoted provider is still
+sampled, and unmeasured providers sort first so a newly added one is tried
+immediately rather than starved. Health checks (circuit breaker, rate limits,
+manual overrides) apply before ordering in all cases.
+
+### Status & Metrics
+
+`oxllm status` prints per-virtual-model routing tables, a per-route rollup with
+latency distributions (p50/p95/p99 of total latency and time-to-first-byte), and
+per-provider totals. Traffic is attributed per `(provider, model)` pair, so two
+virtual models sharing one provider do not show each other's traffic. Tables
+drop optional columns to fit the terminal width (`$COLUMNS`, or `--width`), and
+`--json` emits the raw `/status` payload for scripting. The same counters feed
+the OpenTelemetry spans (`gen_ai.usage.*`, `proxy.attempts_required`) and
+metrics exported to the configured OTLP endpoint.
 
 ### Example Configs
 

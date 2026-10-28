@@ -30,11 +30,33 @@ pub struct VirtualModelTarget {
     pub model: String,
 }
 
+/// Routing policy for one virtual model. Omitted virtual models keep strict
+/// configuration order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PolicyConfig {
+    /// Strict configuration order (default): deterministic, and the circuit
+    /// breaker still skips unhealthy providers.
+    #[default]
+    Priority,
+    /// Lowest measured EWMA time-to-first-byte first, with hysteresis so a
+    /// near-tie does not flap and periodic exploration so a demoted provider
+    /// can win its place back.
+    Fastest,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub server: ServerConfig,
     pub providers: Vec<ProviderConfig>,
     pub virtual_models: HashMap<String, Vec<VirtualModelTarget>>,
+    /// Optional per-virtual-model routing policy, e.g.
+    /// ```toml
+    /// [policies]
+    /// my-model = "fastest"
+    /// ```
+    #[serde(default)]
+    pub policies: HashMap<String, PolicyConfig>,
 }
 
 impl Config {
