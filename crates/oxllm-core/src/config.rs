@@ -13,6 +13,12 @@ pub struct ServerConfig {
     pub upstream_timeout_secs: u64,
     #[serde(default = "default_bind_family")]
     pub bind_family: String,
+    /// Inbound API keys. When non-empty, requests to the public /v1/* routes
+    /// must present `Authorization: Bearer <key>` matching one of these;
+    /// admin routes remain localhost-only regardless. Keys are compared in
+    /// constant time. An empty list (default) keeps the proxy open.
+    #[serde(default)]
+    pub api_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,6 +28,15 @@ pub struct ProviderConfig {
     pub base_url: String,
     pub api_key: String,
     pub models: Vec<String>,
+    /// Optional per-provider timeout override (seconds) for connecting and
+    /// receiving upstream headers. Falls back to `server.upstream_timeout_secs`.
+    #[serde(default)]
+    pub upstream_timeout_secs: Option<u64>,
+    /// Optional relative cost weight per 1M output tokens, used by the
+    /// `cheapest` routing policy. Absent means "no cost signal" and such
+    /// providers are treated as free.
+    #[serde(default)]
+    pub cost_per_mtok: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,6 +58,9 @@ pub enum PolicyConfig {
     /// near-tie does not flap and periodic exploration so a demoted provider
     /// can win its place back.
     Fastest,
+    /// Lowest cost per 1M output tokens first; latency breaks ties. Providers
+    /// without a configured cost are treated as free.
+    Cheapest,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

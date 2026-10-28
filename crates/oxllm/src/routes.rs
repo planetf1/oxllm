@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 use tracing::{debug, error, warn};
 
 use oxllm_core::router::{
-    order_by_latency, AdaptivePriorityStrategy, LatencyCandidate, RoutingStrategy,
+    latency_band, order_by_cost, order_by_latency, rotate_within_band, AdaptivePriorityStrategy,
+    LatencyCandidate, RoutingStrategy,
 };
 use oxllm_core::state::{AppState, CircuitState, ModelStats, ProviderState, RoutingPolicy};
 use oxllm_core::telemetry::{TelemetryClient, TelemetryEvent};
@@ -98,6 +99,7 @@ struct RouteEntry {
     tokens_output: u64,
     ttft_p50_ms: Option<u64>,
     latency_p50_ms: Option<u64>,
+    cached_tokens: u64,
 }
 
 /// GET /status (localhost restricted in main.rs routing)
@@ -134,6 +136,7 @@ pub async fn get_status(
         latency_mean_ms: Option<f64>,
         ttft_p50_ms: Option<u64>,
         ttft_p95_ms: Option<u64>,
+        cached_tokens: u64,
     }
 
     #[derive(Serialize)]
@@ -262,6 +265,7 @@ pub async fn get_status(
                 tokens_output: stats.tokens_output,
                 ttft_p50_ms: stats.ttft_p50_ms,
                 latency_p50_ms: stats.latency_p50_ms,
+                cached_tokens: stats.cached_tokens,
             });
         }
         virtual_models.insert(vm_name.clone(), entries);
@@ -275,6 +279,7 @@ pub async fn get_status(
             RouteSummary {
                 policy: match app_state.policies.get(&route_name) {
                     Some(RoutingPolicy::Fastest) => "fastest".to_string(),
+                    Some(RoutingPolicy::Cheapest) => "cheapest".to_string(),
                     _ => "priority".to_string(),
                 },
                 requests: snap.requests,
@@ -288,6 +293,7 @@ pub async fn get_status(
                 latency_mean_ms: snap.latency_mean_ms,
                 ttft_p50_ms: snap.ttft_p50_ms,
                 ttft_p95_ms: snap.ttft_p95_ms,
+                cached_tokens: snap.cached_tokens,
                 route: route_name,
             }
         })
@@ -313,23 +319,41 @@ fn ordered_candidates<'a>(
     candidates: &[(&'a ProviderState, String)],
 ) -> Vec<(&'a ProviderState, String)> {
     let ordered: Vec<(&'a ProviderState, String)> = candidates.to_vec();
-    if app_state.policies.get(route_name) != Some(&RoutingPolicy::Fastest) || ordered.len() < 2 {
+    if ordered.len() < 2 {
+        return ordered;
+    }
+    let policy = app_state.policies.get(route_name).copied();
+    if policy.is_none() {
         return ordered;
     }
 
-    let latency: Vec<LatencyCandidate> = ordered
+    let call_index = app_state
+        .routing_calls
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    let described: Vec<LatencyCandidate> = ordered
         .iter()
         .map(|(provider, model)| LatencyCandidate {
             provider: provider.name.clone(),
             model: model.clone(),
             ewma_ttft_ms: provider.model_stats.ewma_ttft_ms(&provider.name, model),
+            cost_per_mtok: provider.cost_per_mtok,
         })
         .collect();
 
-    let call_index = app_state
-        .routing_calls
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let order = order_by_latency(&latency, call_index, LATENCY_EXPLORE_EVERY);
+    let order = match policy {
+        Some(RoutingPolicy::Cheapest) => order_by_cost(&described, call_index),
+        _ => {
+            let bands: Vec<u32> = described
+                .iter()
+                .map(|c| latency_band(c.ewma_ttft_ms))
+                .collect();
+            let base = order_by_latency(&described, call_index, LATENCY_EXPLORE_EVERY);
+            // Spread load across equal-speed providers, then let the periodic
+            // exploration rotation still surface the demoted ones.
+            rotate_within_band(base, &bands, call_index / LATENCY_EXPLORE_EVERY)
+        },
+    };
     order.into_iter().map(|i| ordered[i].clone()).collect()
 }
 
@@ -424,7 +448,11 @@ pub async fn create_embeddings(
             .http_client
             .post(endpoint_url.as_str())
             .body(rewritten_body)
-            .timeout(Duration::from_secs(app_state.upstream_timeout_secs))
+            .timeout(Duration::from_secs(
+                selected
+                    .upstream_timeout_secs
+                    .unwrap_or(app_state.upstream_timeout_secs),
+            ))
             .header("Content-Type", "application/json")
             .header("Authorization", format!("Bearer {}", selected.api_key));
 
@@ -766,7 +794,11 @@ pub async fn create_completions(
             .http_client
             .post(endpoint_url.as_str())
             .body(rewritten_body)
-            .timeout(Duration::from_secs(app_state.upstream_timeout_secs))
+            .timeout(Duration::from_secs(
+                selected
+                    .upstream_timeout_secs
+                    .unwrap_or(app_state.upstream_timeout_secs),
+            ))
             .header("Content-Type", "application/json")
             .header("Authorization", format!("Bearer {}", selected.api_key));
 
@@ -1112,7 +1144,11 @@ pub async fn create_chat_completions(
             .http_client
             .post(endpoint_url.as_str())
             .body(rewritten_body)
-            .timeout(Duration::from_secs(app_state.upstream_timeout_secs))
+            .timeout(Duration::from_secs(
+                selected
+                    .upstream_timeout_secs
+                    .unwrap_or(app_state.upstream_timeout_secs),
+            ))
             .header("Content-Type", "application/json")
             .header("Authorization", format!("Bearer {}", selected.api_key));
 
@@ -1216,20 +1252,26 @@ pub async fn create_chat_completions(
                     };
 
                     // Parse token counts from upstream response
-                    let (input_tokens, output_tokens) = serde_json::from_slice::<Value>(&res_body)
-                        .map(|v| {
-                            let usage = v.get("usage");
-                            let input = usage
-                                .and_then(|u| u.get("prompt_tokens"))
-                                .and_then(|t| t.as_u64())
-                                .unwrap_or(0);
-                            let output = usage
-                                .and_then(|u| u.get("completion_tokens"))
-                                .and_then(|t| t.as_u64())
-                                .unwrap_or(0);
-                            (input, output)
-                        })
-                        .unwrap_or((0, 0));
+                    let (input_tokens, output_tokens, cached_tokens) =
+                        serde_json::from_slice::<Value>(&res_body)
+                            .map(|v| {
+                                let usage = v.get("usage");
+                                let input = usage
+                                    .and_then(|u| u.get("prompt_tokens"))
+                                    .and_then(|t| t.as_u64())
+                                    .unwrap_or(0);
+                                let output = usage
+                                    .and_then(|u| u.get("completion_tokens"))
+                                    .and_then(|t| t.as_u64())
+                                    .unwrap_or(0);
+                                let cached = usage
+                                    .and_then(|u| u.get("prompt_tokens_details"))
+                                    .and_then(|d| d.get("cached_tokens"))
+                                    .and_then(|t| t.as_u64())
+                                    .unwrap_or(0);
+                                (input, output, cached)
+                            })
+                            .unwrap_or((0, 0, 0));
 
                     // Increment local counters
                     target_provider_state
@@ -1260,6 +1302,9 @@ pub async fn create_chat_completions(
                             // Non-streaming: first byte is indistinguishable from the
                             // whole response, so total latency is the TTFT sample.
                             counters.record_ttft(elapsed_ms * 1000);
+                            counters
+                                .cached_tokens
+                                .fetch_add(cached_tokens, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
 

@@ -177,7 +177,7 @@ oxllm serve --config config-local-test.toml
 
 ### Provider Definition
 
-Each provider requires `name`, `enabled`, `base_url` (with trailing `/v1/`), `api_key` (or `${VAR}` env reference), and `models` list.
+Each provider requires `name`, `enabled`, `base_url` (with trailing `/v1/`), `api_key` (or `${VAR}` env reference), and `models` list. Optional per-provider keys: `upstream_timeout_secs` (overrides `server.upstream_timeout_secs`, so a fast-failing local provider can fail over sooner than a slow global timeout) and `cost_per_mtok` (cost weight used by the `cheapest` policy).
 
 ### Virtual Models (Fallback Chains)
 
@@ -206,11 +206,12 @@ smart = [
 ### Routing Policies
 
 By default a virtual model uses `priority`: strict configuration order with the
-health checks above. A virtual model can instead route by measured latency:
+health checks above. Alternatives, set per virtual model:
 
 ```toml
 [policies]
-smart = "fastest"
+smart = "fastest"     # lowest measured EWMA time-to-first-byte
+budget = "cheapest"   # lowest cost_per_mtok, latency breaking ties
 ```
 
 Under `fastest`, each provider's time-to-first-byte is tracked as an EWMA and

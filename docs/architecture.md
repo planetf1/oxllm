@@ -53,7 +53,7 @@
 9. `POST /admin/providers/{name}/online` – Re-enable a manually disabled provider. Localhost-restricted.
 10. `POST /admin/providers/{name}/reset` – Reset a provider's circuit-breaker state and failure counters. Localhost-restricted.
 
-All public endpoints (`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`) return CORS headers (`Access-Control-Allow-Origin: *`) and include an `x-request-id` correlation header on every response.
+All public endpoints (`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`) return CORS headers (`Access-Control-Allow-Origin: *`) and include an `x-request-id` correlation header on every response. When `server.api_keys` is configured, public endpoints require a matching `Authorization: Bearer <key>` (compared in constant time); admin routes remain localhost-only regardless.
 
 ---
 

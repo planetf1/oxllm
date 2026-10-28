@@ -82,6 +82,7 @@ impl RoutingStrategy for AdaptivePriorityStrategy {
                         base_url: provider.base_url.clone(),
                         api_key: provider.api_key.clone(),
                         is_probe: false,
+                        upstream_timeout_secs: provider.upstream_timeout_secs,
                     });
                 },
                 CircuitState::Open { until } => {
@@ -103,6 +104,7 @@ impl RoutingStrategy for AdaptivePriorityStrategy {
                                 base_url: provider.base_url.clone(),
                                 api_key: provider.api_key.clone(),
                                 is_probe: true,
+                                upstream_timeout_secs: provider.upstream_timeout_secs,
                             });
                         }
                     }
@@ -123,6 +125,7 @@ impl RoutingStrategy for AdaptivePriorityStrategy {
                             base_url: provider.base_url.clone(),
                             api_key: provider.api_key.clone(),
                             is_probe: true,
+                            upstream_timeout_secs: provider.upstream_timeout_secs,
                         });
                     }
                     continue;
@@ -219,6 +222,8 @@ pub struct LatencyCandidate {
     pub model: String,
     /// Observed EWMA time-to-first-byte; `None` means never measured yet.
     pub ewma_ttft_ms: Option<f64>,
+    /// Configured cost per 1M output tokens; `None` means free/unknown.
+    pub cost_per_mtok: Option<f64>,
 }
 
 /// Latency band width. Providers whose EWMA sits within this ratio of each
@@ -236,6 +241,61 @@ pub fn latency_band(ms: Option<f64>) -> u32 {
         Some(v) if !v.is_finite() || v <= 0.0 => 1,
         Some(v) => 1 + (v.ln() / LATENCY_BAND_RATIO.ln()).floor().max(0.0) as u32,
     }
+}
+
+/// Orders candidate indices for cost-aware routing: cheapest configured cost
+/// per 1M output tokens first, EWMA TTFT breaking ties within the same cost.
+/// Providers without a configured cost are treated as free and sort first,
+/// which keeps the policy useful in mixed local/remote pools where local is
+/// both free and fast.
+pub fn order_by_cost(candidates: &[LatencyCandidate], call_index: u64) -> Vec<usize> {
+    let mut indices: Vec<usize> = (0..candidates.len()).collect();
+    indices.sort_by(|&a, &b| {
+        let cost_a = candidates[a].cost_per_mtok.unwrap_or(0.0);
+        let cost_b = candidates[b].cost_per_mtok.unwrap_or(0.0);
+        cost_a
+            .partial_cmp(&cost_b)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                let ta = candidates[a].ewma_ttft_ms.unwrap_or(f64::MAX);
+                let tb = candidates[b].ewma_ttft_ms.unwrap_or(f64::MAX);
+                ta.partial_cmp(&tb).unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+    // Same exploration contract as `fastest`: rotate every Nth call so a
+    // costlier provider still gets sampled (its price may have dropped).
+    if call_index % 20 == 0 && indices.len() > 1 {
+        indices.rotate_left(1);
+    }
+    indices
+}
+
+/// Weighted rotation inside one latency band: spreads load across equal-speed
+/// providers instead of always hitting the first. Deterministic from the call
+/// index, so it needs no shared state beyond the counter `order_by_latency`
+/// already consumes.
+pub fn rotate_within_band(order: Vec<usize>, bands: &[u32], call_index: u64) -> Vec<usize> {
+    if bands.is_empty() {
+        return order;
+    }
+    // Group indices by band, preserving the band ordering of `order`.
+    let mut result = Vec::with_capacity(order.len());
+    let mut i = 0;
+    while i < order.len() {
+        let band = bands[order[i]];
+        let mut group: Vec<usize> = Vec::new();
+        while i < order.len() && bands[order[i]] == band {
+            group.push(order[i]);
+            i += 1;
+        }
+        // Rotate this equal-band group by the call index modulo group size.
+        let len = group.len();
+        if len > 1 {
+            group.rotate_right((call_index % len as u64) as usize);
+        }
+        result.extend(group);
+    }
+    result
 }
 
 /// Orders candidate indices for latency-aware routing.
@@ -272,6 +332,8 @@ mod tests {
             base_url: Url::parse("https://api.example.com").unwrap(),
             api_key: "test_key".to_string(),
             models: vec!["gpt-4".to_string()],
+            upstream_timeout_secs: None,
+            cost_per_mtok: None,
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -402,16 +464,19 @@ mod tests {
             LatencyCandidate {
                 provider: "slow".into(),
                 model: "m".into(),
+                cost_per_mtok: None,
                 ewma_ttft_ms: Some(900.0),
             },
             LatencyCandidate {
                 provider: "fast".into(),
                 model: "m".into(),
+                cost_per_mtok: None,
                 ewma_ttft_ms: Some(120.0),
             },
             LatencyCandidate {
                 provider: "peers".into(),
                 model: "m".into(),
+                cost_per_mtok: None,
                 ewma_ttft_ms: Some(130.0),
             },
         ];
@@ -431,11 +496,13 @@ mod tests {
             LatencyCandidate {
                 provider: "slow".into(),
                 model: "m".into(),
+                cost_per_mtok: None,
                 ewma_ttft_ms: Some(900.0),
             },
             LatencyCandidate {
                 provider: "fast".into(),
                 model: "m".into(),
+                cost_per_mtok: None,
                 ewma_ttft_ms: Some(120.0),
             },
         ];
@@ -448,6 +515,80 @@ mod tests {
         let exploring = order_by_latency(&candidates, 0, 20);
         assert_eq!(candidates[exploring[0]].provider, "slow");
         assert_ne!(steady, exploring, "exploration must rotate the order");
+    }
+
+    #[test]
+    fn test_order_by_cost_prefers_cheap_then_fast() {
+        let candidates = vec![
+            LatencyCandidate {
+                provider: "expensive-fast".into(),
+                model: "m".into(),
+                ewma_ttft_ms: Some(100.0),
+                cost_per_mtok: Some(5.0),
+            },
+            LatencyCandidate {
+                provider: "cheap-slow".into(),
+                model: "m".into(),
+                ewma_ttft_ms: Some(900.0),
+                cost_per_mtok: Some(0.5),
+            },
+            LatencyCandidate {
+                provider: "free".into(),
+                model: "m".into(),
+                ewma_ttft_ms: Some(300.0),
+                cost_per_mtok: None,
+            },
+        ];
+
+        let order = order_by_cost(&candidates, 1);
+        let names: Vec<&str> = order
+            .iter()
+            .map(|&i| candidates[i].provider.as_str())
+            .collect();
+        // Free sorts first (None = free), then by cost, then latency.
+        assert_eq!(names, vec!["free", "cheap-slow", "expensive-fast"]);
+    }
+
+    #[test]
+    fn test_rotate_within_band_spreads_equal_speed_providers() {
+        let candidates = vec![
+            LatencyCandidate {
+                provider: "a".into(),
+                model: "m".into(),
+                ewma_ttft_ms: Some(100.0),
+                cost_per_mtok: None,
+            },
+            LatencyCandidate {
+                provider: "b".into(),
+                model: "m".into(),
+                ewma_ttft_ms: Some(105.0),
+                cost_per_mtok: None,
+            },
+            LatencyCandidate {
+                provider: "c".into(),
+                model: "m".into(),
+                ewma_ttft_ms: Some(5000.0),
+                cost_per_mtok: None,
+            },
+        ];
+        let bands: Vec<u32> = candidates
+            .iter()
+            .map(|c| latency_band(c.ewma_ttft_ms))
+            .collect();
+        assert_eq!(bands[0], bands[1], "a and b share a band");
+        assert_ne!(bands[2], bands[0], "c is in a slower band");
+
+        // Baseline order from latency ordering.
+        let base = order_by_latency(&candidates, 1, 20);
+        assert_eq!(candidates[base[0]].provider, "a");
+
+        // Rotating within bands must keep the slow provider last while
+        // alternating between the two equal-speed providers.
+        let r0 = rotate_within_band(base.clone(), &bands, 0);
+        let r1 = rotate_within_band(base.clone(), &bands, 1);
+        assert_eq!(candidates[*r0.last().unwrap()].provider, "c");
+        assert_eq!(candidates[*r1.last().unwrap()].provider, "c");
+        assert_ne!(r0, r1, "equal-band providers should rotate between calls");
     }
 
     #[tokio::test]

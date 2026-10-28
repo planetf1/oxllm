@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Inbound API keys** (`server.api_keys`): public `/v1/*` routes can require
+  `Authorization: Bearer <key>` (constant-time comparison). Empty list keeps
+  the proxy open; admin routes stay localhost-only either way.
+- **`cheapest` routing policy**: orders healthy candidates by configured
+  `cost_per_mtok` (absent = free), latency breaking ties.
+- **Per-provider `upstream_timeout_secs`**: overrides the global timeout so a
+  fast-failing provider can fail over sooner.
+- **Weighted rotation within latency bands**: equal-speed providers now share
+  load instead of always hitting the first configured.
+- **Cache-hit tracking**: `cached_tokens` from upstream usage is counted per
+  provider/model and surfaced in `/status` (`oxllm status --json`).
+- **`oxllm provider list --json`** emits the raw `/status` payload.
+
 ## [0.1.14] - 2026-10-28
 
 - **Latency-aware routing** (`[policies]`, `"fastest"`): virtual models can

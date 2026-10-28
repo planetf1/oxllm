@@ -19,6 +19,10 @@ pub struct ProviderState {
     pub base_url: Url, // Parsed reqwest::Url to handle safe path joins and trailing slashes
     pub api_key: String,
     pub models: Vec<String>,
+    /// Per-provider timeout override (seconds); `None` = server default.
+    pub upstream_timeout_secs: Option<u64>,
+    /// Cost per 1M output tokens; `None` = free / unknown.
+    pub cost_per_mtok: Option<f64>,
 
     // Protects volatile metrics without needing a write lock on the entire pool vector
     pub circuit: Arc<RwLock<CircuitState>>,
@@ -145,6 +149,9 @@ pub struct Counters {
     pub ttft: Histogram,
     /// Fixed-point (microseconds) EWMA of TTFT, used by latency-aware routing.
     pub ewma_ttft_us: AtomicU64,
+    /// Prompt tokens served from the upstream prefix cache (from usage
+    /// `cached_tokens`), for cache hit-rate reporting.
+    pub cached_tokens: AtomicU64,
 }
 
 impl Counters {
@@ -188,6 +195,7 @@ pub struct CountersSnapshot {
     pub latency_mean_ms: Option<f64>,
     pub ttft_p50_ms: Option<u64>,
     pub ttft_p95_ms: Option<u64>,
+    pub cached_tokens: u64,
 }
 
 /// Shared counter table keyed by an opaque string. Reads take a read lock and
@@ -239,6 +247,7 @@ impl ModelStats {
             latency_mean_ms: counters.latency.mean(),
             ttft_p50_ms: counters.ttft.percentile(50.0),
             ttft_p95_ms: counters.ttft.percentile(95.0),
+            cached_tokens: counters.cached_tokens.load(Ordering::Relaxed),
         }
     }
 
@@ -261,6 +270,7 @@ pub struct SelectedProvider {
     pub base_url: Url,
     pub api_key: String,
     pub is_probe: bool,
+    pub upstream_timeout_secs: Option<u64>,
 }
 
 pub struct AppState {
@@ -273,6 +283,8 @@ pub struct AppState {
     pub policies: HashMap<String, RoutingPolicy>,
     /// Monotonic counter driving periodic exploration under `Fastest`.
     pub routing_calls: AtomicU64,
+    /// Inbound API keys; empty means the public /v1 routes are open.
+    pub api_keys: Vec<String>,
     pub http_client: reqwest::Client,
     pub upstream_timeout_secs: u64,
 }
@@ -285,6 +297,8 @@ pub enum RoutingPolicy {
     Priority,
     /// Lowest measured EWMA TTFT first, with hysteresis and exploration.
     Fastest,
+    /// Lowest configured cost per 1M output tokens first; latency breaks ties.
+    Cheapest,
 }
 
 impl AppState {

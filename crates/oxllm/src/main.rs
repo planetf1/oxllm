@@ -10,10 +10,11 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use axum::{
     body::Body,
-    extract::ConnectInfo,
+    extract::{ConnectInfo, State},
     http::{header, HeaderValue, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
+    Json,
 };
 use tower_http::cors::{Any, CorsLayer};
 
@@ -118,6 +119,9 @@ enum ProviderCommand {
         /// Port of the running gateway server
         #[arg(short, long, default_value_t = 8080, env = "OXLLM_PORT")]
         port: u16,
+        /// Emit the raw /status JSON instead of a table
+        #[arg(long)]
+        json: bool,
     },
     /// Take a provider offline (circuit breaker + manual disabled)
     Offline {
@@ -207,6 +211,8 @@ fn build_app_state(config: Config) -> Result<AppState, String> {
             base_url: url,
             api_key: p.api_key,
             models: p.models,
+            upstream_timeout_secs: p.upstream_timeout_secs,
+            cost_per_mtok: p.cost_per_mtok,
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -233,6 +239,7 @@ fn build_app_state(config: Config) -> Result<AppState, String> {
             let mapped = match policy {
                 oxllm_core::config::PolicyConfig::Priority => RoutingPolicy::Priority,
                 oxllm_core::config::PolicyConfig::Fastest => RoutingPolicy::Fastest,
+                oxllm_core::config::PolicyConfig::Cheapest => RoutingPolicy::Cheapest,
             };
             (vm.clone(), mapped)
         })
@@ -244,6 +251,7 @@ fn build_app_state(config: Config) -> Result<AppState, String> {
         route_stats: Arc::new(ModelStats::default()),
         policies,
         routing_calls: AtomicU64::new(0),
+        api_keys: config.server.api_keys,
         http_client,
         upstream_timeout_secs: config.server.upstream_timeout_secs,
     })
@@ -291,6 +299,62 @@ async fn add_request_id(mut req: Request<Body>, next: Next) -> Response {
         );
     }
     response
+}
+
+/// Constant-time byte-slice equality, so a key comparison does not leak its
+/// length or prefix through response timing.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Rejects /v1/* requests when `server.api_keys` is non-empty and the
+/// `Authorization: Bearer <key>` header matches none of them. Empty list
+/// keeps the proxy open (loopback deployments). Admin routes stay
+/// localhost-only regardless.
+async fn require_api_key(
+    State((app_state, _telemetry)): State<(Arc<AppState>, TelemetryClient)>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    // The key set is captured per-reload in AppState; read it through the
+    // watch channel without cloning the vec on every request.
+    let api_keys = &app_state.api_keys;
+    if api_keys.is_empty() {
+        return next.run(req).await;
+    }
+
+    let presented = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+
+    let authorized = presented.is_some_and(|key| {
+        api_keys
+            .iter()
+            .any(|candidate| constant_time_eq(candidate.as_bytes(), key.as_bytes()))
+    });
+
+    if authorized {
+        next.run(req).await
+    } else {
+        warn!(target: "oxllm::security", "Rejected /v1 request with invalid or missing API key");
+        let body = serde_json::json!({
+            "error": {
+                "message": "Missing or invalid API key",
+                "type": "invalid_request_error",
+                "code": 401
+            }
+        });
+        (StatusCode::UNAUTHORIZED, Json(body)).into_response()
+    }
 }
 
 async fn localhost_only(
@@ -536,13 +600,38 @@ async fn run_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     };
 
     use axum::routing::{get, post};
+    // A watch::Receiver is itself Clone-and-cheap: `from_fn_with_state` needs
+    // an owned copy per layer, and each request reads through it without
+    // locking the routing pool.
+    let state_for_middleware = reloadable_state.clone();
     let app = axum::Router::new()
-        .route("/v1/models", get(routes::list_models))
-        .route("/v1/embeddings", post(routes::create_embeddings))
-        .route("/v1/completions", post(routes::create_completions))
+        .route(
+            "/v1/models",
+            get(routes::list_models).layer(middleware::from_fn_with_state(
+                state_for_middleware.clone(),
+                require_api_key,
+            )),
+        )
+        .route(
+            "/v1/embeddings",
+            post(routes::create_embeddings).layer(middleware::from_fn_with_state(
+                state_for_middleware.clone(),
+                require_api_key,
+            )),
+        )
+        .route(
+            "/v1/completions",
+            post(routes::create_completions).layer(middleware::from_fn_with_state(
+                state_for_middleware.clone(),
+                require_api_key,
+            )),
+        )
         .route(
             "/v1/chat/completions",
-            post(routes::create_chat_completions),
+            post(routes::create_chat_completions).layer(middleware::from_fn_with_state(
+                state_for_middleware.clone(),
+                require_api_key,
+            )),
         )
         .route(
             "/status",
@@ -1255,7 +1344,7 @@ async fn run_provider_reset(name: &str, port: u16) -> Result<(), Box<dyn std::er
     Ok(())
 }
 
-async fn run_provider_list(port: u16) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_provider_list(port: u16, json: bool) -> Result<(), Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
     let url = format!("http://127.0.0.1:{}/status", port);
     let res = match client.get(&url).send().await {
@@ -1280,6 +1369,12 @@ async fn run_provider_list(port: u16) -> Result<(), Box<dyn std::error::Error>> 
     #[derive(serde::Deserialize)]
     struct StatusResponse {
         virtual_models: std::collections::HashMap<String, Vec<RouteEntry>>,
+    }
+
+    if json {
+        let parsed: serde_json::Value = serde_json::from_str(&res.text().await?)?;
+        println!("{}", serde_json::to_string_pretty(&parsed)?);
+        return Ok(());
     }
 
     let status: StatusResponse = res.json().await?;
@@ -1364,8 +1459,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_stop(pid)?;
         },
         Commands::Provider(cmd) => match cmd {
-            ProviderCommand::List { port } => {
-                run_provider_list(port).await?;
+            ProviderCommand::List { port, json } => {
+                run_provider_list(port, json).await?;
             },
             ProviderCommand::Offline { name, port } => {
                 run_provider_offline(&name, port).await?;
@@ -1441,6 +1536,8 @@ mod integration_tests {
             base_url: Url::parse(&format!("http://{}", addr1)).unwrap(),
             api_key: "key1".to_string(),
             models: vec!["gpt-4-upstream".to_string()],
+            upstream_timeout_secs: None,
+            cost_per_mtok: None,
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -1459,6 +1556,8 @@ mod integration_tests {
             base_url: Url::parse(&format!("http://{}", addr2)).unwrap(),
             api_key: "key2".to_string(),
             models: vec!["gpt-4-upstream".to_string()],
+            upstream_timeout_secs: None,
+            cost_per_mtok: None,
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -1494,6 +1593,7 @@ mod integration_tests {
             route_stats: Arc::new(ModelStats::default()),
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
+            api_keys: Vec::new(),
             http_client,
             upstream_timeout_secs: 5,
         });
@@ -1563,6 +1663,8 @@ mod integration_tests {
             base_url: Url::parse(&format!("http://{}", addr)).unwrap(),
             api_key: "key1".to_string(),
             models: vec!["gpt-4-upstream".to_string()],
+            upstream_timeout_secs: None,
+            cost_per_mtok: None,
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -1592,6 +1694,7 @@ mod integration_tests {
             route_stats: Arc::new(ModelStats::default()),
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
+            api_keys: Vec::new(),
             http_client,
             upstream_timeout_secs: 5,
         });
@@ -1724,6 +1827,8 @@ mod integration_tests {
             base_url: Url::parse(&format!("http://{}/v1/", addr)).unwrap(),
             api_key: "test-key".to_string(),
             models: vec!["granite-4.1-3b-4bit".to_string()],
+            upstream_timeout_secs: None,
+            cost_per_mtok: None,
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -1752,6 +1857,7 @@ mod integration_tests {
             route_stats: Arc::new(ModelStats::default()),
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
+            api_keys: Vec::new(),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         })
@@ -1917,6 +2023,8 @@ mod integration_tests {
             base_url: Url::parse(&format!("http://{}/v1/", addr)).unwrap(),
             api_key: "k".to_string(),
             models: vec!["small".to_string()],
+            upstream_timeout_secs: None,
+            cost_per_mtok: None,
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -1952,6 +2060,7 @@ mod integration_tests {
             route_stats: Arc::new(ModelStats::default()),
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
+            api_keys: Vec::new(),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -2036,6 +2145,125 @@ mod integration_tests {
         assert_eq!(big_route["requests"], 0);
     }
 
+    /// Inbound auth: with server.api_keys set, /v1 routes reject requests
+    /// without a valid Bearer key and accept requests with one. Admin routes
+    /// stay localhost-only regardless.
+    #[tokio::test]
+    async fn test_api_key_auth_gate() {
+        let upstream_body = r#"{"choices":[{"index":0,"text":"ok","finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            upstream_body.len(),
+            upstream_body
+        );
+        let recorded = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let addr = spawn_recording_upstream(vec![response], recorded.clone()).await;
+
+        let provider = ProviderState {
+            name: "omlx-local".to_string(),
+            base_url: Url::parse(&format!("http://{}/v1/", addr)).unwrap(),
+            api_key: "upstream-key".to_string(),
+            models: vec!["m".to_string()],
+            upstream_timeout_secs: Some(2),
+            cost_per_mtok: None,
+            circuit: Arc::new(RwLock::new(CircuitState::Closed)),
+            consecutive_failures: Arc::new(RwLock::new(0)),
+            rate_limited_until: Arc::new(RwLock::new(None)),
+            last_attempt_time: Arc::new(RwLock::new(None)),
+            probe_in_flight: Arc::new(AtomicBool::new(false)),
+            manual_disabled: AtomicBool::new(false),
+            requests: AtomicU64::new(0),
+            successes: AtomicU64::new(0),
+            tokens_input: AtomicU64::new(0),
+            tokens_output: AtomicU64::new(0),
+            model_stats: Arc::new(ModelStats::default()),
+        };
+
+        let mut virtual_models = std::collections::HashMap::new();
+        virtual_models.insert(
+            "vm".to_string(),
+            vec![VirtualModelTarget {
+                provider: "omlx-local".to_string(),
+                model: "m".to_string(),
+            }],
+        );
+
+        let app_state = Arc::new(AppState {
+            providers: vec![provider],
+            virtual_models,
+            route_stats: Arc::new(ModelStats::default()),
+            policies: std::collections::HashMap::new(),
+            routing_calls: AtomicU64::new(0),
+            api_keys: vec!["sekrit".to_string()],
+            http_client: reqwest::Client::builder().build().unwrap(),
+            upstream_timeout_secs: 5,
+        });
+
+        let (_ws, wr) = tokio::sync::watch::channel(app_state.clone());
+        let (ttx, _trx) = tokio::sync::mpsc::channel(1024);
+        let rs = ReloadableState {
+            app_state: wr,
+            telemetry: TelemetryClient::new(ttx),
+            start_time: Instant::now(),
+            reloader: Reloader {
+                sender: _ws.clone(),
+                config_path: PathBuf::from("config.toml"),
+            },
+        };
+
+        let router = axum::Router::new()
+            .route(
+                "/v1/completions",
+                axum::routing::post(routes::create_completions)
+                    .layer(middleware::from_fn_with_state(rs.clone(), require_api_key)),
+            )
+            .layer(middleware::from_fn(add_request_id))
+            .with_state(rs);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let url = format!("http://{}/v1/completions", proxy_addr);
+        let body = serde_json::json!({"model": "vm", "prompt": "x"});
+
+        // No key -> 401, and the upstream is never contacted.
+        let res = client.post(&url).json(&body).send().await.unwrap();
+        assert_eq!(res.status(), 401);
+        assert!(
+            recorded.lock().await.is_empty(),
+            "unauthorized request must not reach upstream"
+        );
+
+        // Wrong key -> 401.
+        let res = client
+            .post(&url)
+            .header("Authorization", "Bearer wrong")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 401);
+
+        // Correct key -> routed.
+        let res = client
+            .post(&url)
+            .header("Authorization", "Bearer sekrit")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        if res.status() != 200 {
+            let status = res.status();
+            let text = res.text().await.unwrap_or_default();
+            panic!("authorized request failed: {} {}", status, text);
+        }
+        assert_eq!(recorded.lock().await.len(), 1);
+    }
+
     // -----------------------------------------------------------------------
     // New integration tests: timeout failover, all-providers-fail, manual
     // offline, rate-limit recovery, embeddings endpoint
@@ -2051,6 +2279,8 @@ mod integration_tests {
             base_url: Url::parse("https://api.fail.example.com/v1/").unwrap(),
             api_key: "key".into(),
             models: vec!["model".into()],
+            upstream_timeout_secs: None,
+            cost_per_mtok: None,
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -2069,6 +2299,8 @@ mod integration_tests {
             base_url: Url::parse("https://api.ok.example.com/v1/").unwrap(),
             api_key: "key".into(),
             models: vec!["model".into()],
+            upstream_timeout_secs: None,
+            cost_per_mtok: None,
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -2124,6 +2356,8 @@ mod integration_tests {
             base_url: Url::parse(&format!("http://{}/v1/", addr)).unwrap(),
             api_key: "key".into(),
             models: vec!["model".into()],
+            upstream_timeout_secs: None,
+            cost_per_mtok: None,
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -2161,6 +2395,7 @@ mod integration_tests {
             route_stats: Arc::new(ModelStats::default()),
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
+            api_keys: Vec::new(),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -2242,6 +2477,8 @@ mod integration_tests {
             base_url: Url::parse(&format!("http://{}/v1/", p1_addr)).unwrap(),
             api_key: "key".into(),
             models: vec!["model".into()],
+            upstream_timeout_secs: None,
+            cost_per_mtok: None,
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -2260,6 +2497,8 @@ mod integration_tests {
             base_url: Url::parse(&format!("http://{}/v1/", p2_addr)).unwrap(),
             api_key: "key".into(),
             models: vec!["model".into()],
+            upstream_timeout_secs: None,
+            cost_per_mtok: None,
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -2294,6 +2533,7 @@ mod integration_tests {
             route_stats: Arc::new(ModelStats::default()),
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
+            api_keys: Vec::new(),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -2365,6 +2605,8 @@ mod integration_tests {
             base_url: Url::parse(&format!("http://{}/v1/", addr)).unwrap(),
             api_key: "key".into(),
             models: vec!["model".into()],
+            upstream_timeout_secs: None,
+            cost_per_mtok: None,
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -2393,6 +2635,7 @@ mod integration_tests {
             route_stats: Arc::new(ModelStats::default()),
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
+            api_keys: Vec::new(),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -2486,6 +2729,8 @@ mod integration_tests {
             base_url: Url::parse(&format!("http://{}/v1/", addr)).unwrap(),
             api_key: "key".into(),
             models: vec!["model".into()],
+            upstream_timeout_secs: None,
+            cost_per_mtok: None,
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -2514,6 +2759,7 @@ mod integration_tests {
             route_stats: Arc::new(ModelStats::default()),
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
+            api_keys: Vec::new(),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -2581,6 +2827,8 @@ mod integration_tests {
             base_url: Url::parse(&format!("http://{}/v1/", addr)).unwrap(),
             api_key: "key".into(),
             models: vec!["real-model".into()],
+            upstream_timeout_secs: None,
+            cost_per_mtok: None,
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -2608,6 +2856,7 @@ mod integration_tests {
             route_stats: Arc::new(ModelStats::default()),
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
+            api_keys: Vec::new(),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -2666,6 +2915,8 @@ mod integration_tests {
             base_url: Url::parse(&format!("http://{}/v1/", addr)).unwrap(),
             api_key: "key".into(),
             models: vec!["model".into()],
+            upstream_timeout_secs: None,
+            cost_per_mtok: None,
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -2693,6 +2944,7 @@ mod integration_tests {
             route_stats: Arc::new(ModelStats::default()),
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
+            api_keys: Vec::new(),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -2764,6 +3016,8 @@ mod integration_tests {
             base_url: Url::parse(&format!("http://{}/v1/", addr)).unwrap(),
             api_key: "key".into(),
             models: vec!["model".into()],
+            upstream_timeout_secs: None,
+            cost_per_mtok: None,
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -2791,6 +3045,7 @@ mod integration_tests {
             route_stats: Arc::new(ModelStats::default()),
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
+            api_keys: Vec::new(),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -2862,6 +3117,8 @@ mod integration_tests {
             base_url: Url::parse(&format!("http://{}/v1/", upstream_addr)).unwrap(),
             api_key: "key".into(),
             models: vec!["model".into()],
+            upstream_timeout_secs: None,
+            cost_per_mtok: None,
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -2889,6 +3146,7 @@ mod integration_tests {
             route_stats: Arc::new(ModelStats::default()),
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
+            api_keys: Vec::new(),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
