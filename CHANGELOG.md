@@ -32,8 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`oxllm install` refuses an occupied port** (issue #8): installing
   while something already listens on the configured port used to produce
   a service that crash-looped on bind failures under KeepAlive. The
-  preflight check runs before anything is written, so a refusal leaves
-  an existing installation untouched.
+  preflight gates fresh installs only — replacing an existing
+  installation with `--force` stops the old service first, which frees
+  the port, so a running daemon no longer blocks its own upgrade. The
+  refusal runs before anything is written, leaving existing files
+  untouched; the install tests are hermetic against a throwaway HOME.
 - **An explicit `policies.<vm> = "priority"` behaved like `fastest`**: the
   policy match fell through to latency ordering. Explicit `priority` now
   means strict configured order, same as omitting the policy.

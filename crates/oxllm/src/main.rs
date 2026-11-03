@@ -1593,7 +1593,10 @@ fn run_install(config_path: PathBuf, force: bool) -> Result<(), Box<dyn std::err
     let config_path = resolve_config_path(config_path);
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    if service_unit_path().exists() && !force {
+    let unit_exists = service_unit_path().exists();
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if unit_exists && !force {
         println!(
             "oxllm is already installed at {}",
             service_unit_path().display()
@@ -1606,10 +1609,14 @@ fn run_install(config_path: PathBuf, force: bool) -> Result<(), Box<dyn std::err
     let config = Config::load_from_file(&config_path)?;
     config.validate()?;
 
-    // Preflight: an occupied port would make the installed service
-    // crash-loop on bind failures (issue #8). Checked before anything is
-    // written, so a refusal leaves an existing installation untouched.
-    if port_in_use(&config.server) {
+    // Preflight: a fresh install into an occupied port would make the
+    // service crash-loop on bind failures (issue #8). Replacing an
+    // existing installation is exempt — the old service is stopped as
+    // part of the replacement, freeing the port — and the check runs
+    // before anything is written, so a refusal leaves an existing
+    // installation untouched.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if !unit_exists && port_in_use(&config.server) {
         println!(
             "Port {} is already in use — the installed service would fail to bind and crash-loop.",
             config.server.port

@@ -7,6 +7,19 @@ use std::net::TcpListener;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+/// The per-platform service unit path under a (throwaway) HOME.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn install_unit_path(home: &std::path::Path) -> std::path::PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        home.join("Library/LaunchAgents/org.oxllm.proxy.plist")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        home.join(".config/systemd/user/oxllm.service")
+    }
+}
+
 fn oxllm() -> Command {
     Command::new(env!("CARGO_BIN_EXE_oxllm"))
 }
@@ -49,47 +62,50 @@ fn status_exits_nonzero_when_no_daemon_listens() {
     assert!(stdout.contains("not running"), "got: {}", stdout);
 }
 /// `oxllm install` must refuse to replace an existing service without
-/// --force, before touching launchctl/systemd (issue #2 acceptance: never
-/// silently overwrite). On a machine where nothing is installed, a dummy
-/// unit file is created first and deliberately left behind: nextest runs
-/// tests as separate processes, so a parallel test deleting this path is a
-/// race, and the file is harmless on an ephemeral CI runner.
+/// --force (issue #2 acceptance: never silently overwrite). Runs against a
+/// throwaway HOME so the test is hermetic: it never touches (or depends
+/// on) a real installation, and parallel runs cannot race on the shared
+/// unit path.
 #[test]
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn install_refuses_existing_unit_without_force() {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    #[cfg(target_os = "macos")]
-    let unit = std::path::Path::new(&home).join("Library/LaunchAgents/org.oxllm.proxy.plist");
-    #[cfg(target_os = "linux")]
-    let unit = std::path::Path::new(&home).join(".config/systemd/user/oxllm.service");
+    let home = std::env::temp_dir().join(format!(
+        "oxllm-install-test-home-{}-existing",
+        std::process::id()
+    ));
+    let unit = install_unit_path(&home);
 
-    if !unit.exists() {
-        std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
-        std::fs::write(&unit, "dummy").unwrap();
-    }
+    std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
+    std::fs::write(&unit, "pre-existing installation").unwrap();
 
-    let out = oxllm().arg("install").output().unwrap();
+    let out = oxllm().arg("install").env("HOME", &home).output().unwrap();
     assert!(
         !out.status.success(),
         "install must refuse an existing unit without --force"
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("already installed"), "got: {}", stdout);
+    assert_eq!(
+        std::fs::read_to_string(&unit).unwrap(),
+        "pre-existing installation",
+        "refusal must not modify the unit"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
 }
-/// `oxllm install` must refuse an occupied port before writing anything:
-/// installing into a port conflict would produce a crash-looping service,
-/// and the refusal must leave an existing installation untouched (issue #8).
-/// The byte-identity check runs only where a real installation pre-exists;
-/// the unit path may also be a parallel test's fixture, whose lifecycle is
-/// not this test's to assert about.
+/// `oxllm install` must refuse an occupied port before writing anything
+/// (issue #8): a fresh install into a port conflict would produce a
+/// crash-looping service. Runs against a throwaway HOME with no existing
+/// installation, so the fresh-install preflight path is exercised without
+/// touching (or depending on) a real installation.
 #[test]
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn install_refuses_occupied_port() {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    #[cfg(target_os = "macos")]
-    let unit = std::path::Path::new(&home).join("Library/LaunchAgents/org.oxllm.proxy.plist");
-    #[cfg(target_os = "linux")]
-    let unit = std::path::Path::new(&home).join(".config/systemd/user/oxllm.service");
+    let home = std::env::temp_dir().join(format!(
+        "oxllm-install-test-home-{}-port",
+        std::process::id()
+    ));
+    let unit = install_unit_path(&home);
 
     // Occupy a port and point a config at it.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -120,11 +136,9 @@ vm = [{{ provider = "p", model = "m" }}]
     )
     .unwrap();
 
-    // A pre-existing real installation must be byte-identical afterwards;
-    // the refusal runs before anything is written.
-    let before = std::fs::read(&unit).ok();
     let out = oxllm()
         .args(["install", "--force", "--config", config.to_str().unwrap()])
+        .env("HOME", &home)
         .output()
         .unwrap();
     assert!(
@@ -133,17 +147,11 @@ vm = [{{ provider = "p", model = "m" }}]
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("already in use"), "got: {}", stdout);
-    if let Some(before) = before {
-        let after = std::fs::read(&unit).ok();
-        assert_eq!(
-            Some(before),
-            after,
-            "refusal must not modify an existing installation"
-        );
-    }
+    assert!(!unit.exists(), "refusal must not write a unit file");
 
     let _ = std::fs::remove_file(&config);
     let _ = std::fs::remove_dir(&dir);
+    let _ = std::fs::remove_dir_all(&home);
 }
 
 /// SIGTERM drains in-flight requests only until
