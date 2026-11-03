@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.21] - 2026-11-03
+
 ### Added
 - **Per-target `weight` for proportional load sharing** (issue #10):
   under the default policy, candidates carrying a `weight` share traffic
