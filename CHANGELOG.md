@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Critical: the daemon restart-looped every `shutdown_timeout_secs`**:
+  the v0.1.19 graceful-shutdown deadline wrapped `tokio::time::timeout`
+  around the entire serve future instead of only the post-signal drain,
+  so with the default 30s the process exited cleanly after ~31s of
+  serving and KeepAlive restarted it — wiping circuit state, counters,
+  and session pins on every cycle. The deadline is now a watchdog armed
+  when the shutdown signal arrives: it bounds only the drain, and normal
+  exit cancels it. Regression test: a daemon with a 2s deadline and no
+  signal must still be serving 6s later.
+
 ## [0.1.22] - 2026-11-03
 
 ### Fixed

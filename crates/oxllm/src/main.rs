@@ -527,7 +527,12 @@ async fn health_check() -> impl IntoResponse {
     (StatusCode::OK, "OK")
 }
 
-async fn shutdown_signal() {
+/// Resolves on SIGINT/SIGTERM, cleaning up the PID file, and arms the
+/// drain deadline: a watchdog that force-exits the process if in-flight
+/// requests have not drained within `deadline` of the signal. The
+/// deadline bounds only the drain, never the serve lifetime — the
+/// watchdog is cancelled by normal process exit if the drain completes.
+async fn shutdown_signal(deadline: Option<Duration>) {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await
@@ -552,6 +557,20 @@ async fn shutdown_signal() {
         _ = terminate => {
             info!("Received SIGTERM, shutting down gracefully...");
         },
+    }
+
+    // The drain deadline: if the graceful drain (which starts when this
+    // future resolves) has not finished within the deadline, exit anyway
+    // so a request stuck on a hung upstream cannot hold shutdown hostage.
+    if let Some(deadline) = deadline {
+        tokio::spawn(async move {
+            tokio::time::sleep(deadline).await;
+            warn!(
+                "Graceful shutdown exceeded the {:?} deadline (server.shutdown_timeout_secs); exiting with in-flight requests dropped",
+                deadline
+            );
+            std::process::exit(0);
+        });
     }
 
     // Clean up PID file on shutdown, but only if it still records our PID
@@ -944,29 +963,21 @@ async fn run_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         warn!("Failed to write PID file: {}", e);
     }
 
-    let serve = axum::serve(
+    // The graceful drain starts when the shutdown signal arrives and runs
+    // until in-flight requests finish; the drain deadline is armed inside
+    // shutdown_signal (a watchdog that exits if the drain overruns). The
+    // serve future itself is never time-bounded.
+    let deadline = if shutdown_timeout_secs == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(shutdown_timeout_secs))
+    };
+    axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal());
-
-    // Drain in-flight requests after SIGTERM/SIGINT, but only until the
-    // configured deadline: a stuck upstream must not hold the shutdown
-    // hostage (launchd would eventually SIGKILL, losing the clean exit).
-    // `shutdown_timeout_secs = 0` restores the old wait-forever behaviour.
-    if shutdown_timeout_secs == 0 {
-        serve.await?;
-    } else {
-        match tokio::time::timeout(Duration::from_secs(shutdown_timeout_secs), serve).await {
-            Ok(result) => result?,
-            Err(_) => {
-                warn!(
-                    "Graceful shutdown exceeded the {}s deadline (server.shutdown_timeout_secs); exiting with in-flight requests dropped",
-                    shutdown_timeout_secs
-                );
-            },
-        }
-    }
+    .with_graceful_shutdown(shutdown_signal(deadline))
+    .await?;
 
     Ok(())
 }

@@ -154,6 +154,75 @@ vm = [{{ provider = "p", model = "m" }}]
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// The shutdown deadline must bound only the post-signal drain, never the
+/// serve lifetime: a daemon with `shutdown_timeout_secs = 2` and no signal
+/// must still be serving well past 2s. Regression test for the v0.1.19
+/// bug where `tokio::time::timeout` wrapped the whole serve future and
+/// KeepAlive restart-looped the daemon every (deadline + 1)s.
+#[test]
+fn serve_outlives_shutdown_deadline_without_signal() {
+    let daemon_port = free_port();
+
+    let dir = std::env::temp_dir().join(format!("oxllm-alive-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config_path = dir.join("daemon.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+[server]
+host = "127.0.0.1"
+port = {daemon_port}
+otel_endpoint = "http://127.0.0.1:4318"
+shutdown_timeout_secs = 2
+
+[[providers]]
+name = "p"
+enabled = true
+base_url = "http://127.0.0.1:9/v1/"
+api_key = "k"
+models = ["m"]
+
+[virtual_models]
+vm = [{{ provider = "p", model = "m" }}]
+"#
+        ),
+    )
+    .unwrap();
+
+    let mut child = oxllm()
+        .args(["serve", "--config", config_path.to_str().unwrap()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+
+    // Wait for the listener, then wait well past the 2s deadline.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(Instant::now() < deadline, "daemon never started listening");
+        if TcpListener::bind(("127.0.0.1", daemon_port)).is_err() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::thread::sleep(Duration::from_secs(6));
+
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "daemon exited without a shutdown signal — the deadline is bounding the serve lifetime"
+    );
+    assert!(
+        std::net::TcpStream::connect(("127.0.0.1", daemon_port)).is_ok(),
+        "daemon must still be accepting connections past the deadline"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&config_path);
+    let _ = std::fs::remove_dir(&dir);
+}
+
 /// SIGTERM drains in-flight requests only until
 /// `server.shutdown_timeout_secs` expires: a request stuck on a hung
 /// upstream must not hold the shutdown hostage. With a 1s deadline and a
