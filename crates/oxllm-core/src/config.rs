@@ -81,6 +81,12 @@ pub struct ProviderConfig {
 pub struct VirtualModelTarget {
     pub provider: String,
     pub model: String,
+    /// Routing preference within one virtual model: lower wins. Targets
+    /// without a priority keep their configured order, after all targets
+    /// that have one. Absent everywhere, this reproduces the historical
+    /// strict array-order semantics.
+    #[serde(default)]
+    pub priority: Option<u32>,
 }
 
 /// Routing policy for one virtual model. Omitted virtual models keep strict

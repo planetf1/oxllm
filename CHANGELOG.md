@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Service installation** (issue #2): `oxllm install` sets the daemon up
+  as a user-level service — launchd agent on macOS (`RunAtLoad` +
+  `KeepAlive`, logs to `~/Library/Logs/oxllm.log`), systemd user service on
+  Linux — validating the config first and refusing to overwrite an existing
+  installation without `--force`. `oxllm uninstall` stops and removes it.
+  Verified live on macOS: install, status, KeepAlive respawn after kill -9,
+  and clean uninstall. `install` warns when the config uses `${VAR}`
+  references, which services cannot inherit from the shell.
+- **Decision-model routing** (issue #6): `POST /v1/systemone` proxies
+  llama.cpp decision endpoints (typed choice/score questions, one forward
+  pass) through the provider pool like chat — per-target model rewrite,
+  circuit breaking, and failover; responses pass through verbatim and usage
+  (`input_tokens`/`prompt_tokens`) is accounted.
+- **Per-target `priority` in virtual models** (issue #4): lower = preferred;
+  targets without a priority keep their configured order after all
+  prioritized ones. Existing configs behave identically.
+
+### Fixed
+- **`oxllm provider list` table misaligned** (issue #3): the hardcoded
+  border/header/data widths (three different schemes for the same columns)
+  are replaced by the same adaptive renderer `oxllm status` uses — widths
+  computed from the longest cell, optional columns dropped on narrow
+  terminals, over-long cells truncated with an ellipsis.
+
 ## [0.1.19] - 2026-11-03
 
 ### Added

@@ -113,6 +113,19 @@ enum Commands {
         #[arg(short, long)]
         pid: Option<u32>,
     },
+    /// Installs oxllm as a user-level service (launchd agent on macOS,
+    /// systemd user service on Linux) and starts it
+    Install {
+        /// Path to the configuration TOML file
+        /// (searches: <path>, ~/.config/oxllm/config.toml, ./config.toml)
+        #[arg(short, long, default_value = "config.toml", env = "OXLLM_CONFIG")]
+        config: PathBuf,
+        /// Replace an existing installation (restarts the service)
+        #[arg(long)]
+        force: bool,
+    },
+    /// Stops and removes the installed oxllm service
+    Uninstall,
     /// Manage providers (list, offline, online, reset)
     #[command(subcommand)]
     Provider(ProviderCommand),
@@ -797,6 +810,13 @@ async fn run_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         .route(
             "/v1/embeddings",
             post(routes::create_embeddings).layer(middleware::from_fn_with_state(
+                state_for_middleware.clone(),
+                require_api_key,
+            )),
+        )
+        .route(
+            "/v1/systemone",
+            post(routes::create_systemone).layer(middleware::from_fn_with_state(
                 state_for_middleware.clone(),
                 require_api_key,
             )),
@@ -1512,6 +1532,278 @@ fn run_stop(pid_opt: Option<u32>) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Installs oxllm as a user-level service pointing at the current binary
+/// and the resolved config. The config is loaded and validated first, so a
+/// broken config is refused before anything is installed. Installing over
+/// an existing unit requires --force (issue #2).
+fn run_install(config_path: PathBuf, force: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let config_path = resolve_config_path(config_path);
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if service_unit_path().exists() && !force {
+        println!(
+            "oxllm is already installed at {}",
+            service_unit_path().display()
+        );
+        println!("Re-run with --force to replace it; the service is restarted either way.");
+        std::process::exit(1);
+    }
+
+    // Preflight: the installed service is only useful if the config works.
+    let config = Config::load_from_file(&config_path)?;
+    config.validate()?;
+
+    // A service manager does not inherit the interactive shell's
+    // environment, so `${VAR}` references in the config would fail at
+    // service startup even though they validate fine here.
+    if let Ok(raw) = std::fs::read_to_string(&config_path) {
+        if raw.contains("${") {
+            println!("Warning: the config references environment variables (${{VAR}}).");
+            println!("The service does not inherit your shell environment:");
+            #[cfg(target_os = "macos")]
+            println!("  run: launchctl setenv VAR value   (per variable, before loading)");
+            #[cfg(target_os = "linux")]
+            println!("  add Environment=VAR=value to the unit, or avoid env references");
+        }
+    }
+
+    let exe = std::env::current_exe()?.canonicalize()?;
+
+    #[cfg(target_os = "macos")]
+    install_launchd(&exe, &config_path)?;
+
+    #[cfg(target_os = "linux")]
+    install_systemd(&exe, &config_path)?;
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        println!("Service installation is not supported on this platform.");
+        println!("See docs/architecture.md for a manual init-script example.");
+    }
+
+    Ok(())
+}
+
+/// Stops and removes the installed user-level service. Removing nothing
+/// (never installed, or already removed) is a success.
+fn run_uninstall() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(target_os = "macos")]
+    uninstall_launchd()?;
+
+    #[cfg(target_os = "linux")]
+    uninstall_systemd()?;
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        println!("Service installation is not supported on this platform.");
+    }
+
+    Ok(())
+}
+
+// -----------------------------------------------------------------------
+// macOS: launchd user agent
+// -----------------------------------------------------------------------
+
+#[cfg(target_os = "macos")]
+const LAUNCHD_LABEL: &str = "org.oxllm.proxy";
+
+/// Where the launchd agent plist lives for the current user.
+#[cfg(target_os = "macos")]
+fn service_unit_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home)
+        .join("Library")
+        .join("LaunchAgents")
+        .join("org.oxllm.proxy.plist")
+}
+
+/// Minimal XML escaping for paths embedded in the plist.
+#[cfg(target_os = "macos")]
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// The launchd agent plist: RunAtLoad + KeepAlive, logs to
+/// ~/Library/Logs/oxllm.log. Kept in the same shape as the documented
+/// example in docs/architecture.md §5.4.
+#[cfg(target_os = "macos")]
+fn launchd_plist(exe: &std::path::Path, config: &std::path::Path, log: &std::path::Path) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{exe}</string>
+        <string>serve</string>
+        <string>--config</string>
+        <string>{config}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>{log}</string>
+    <key>StandardErrorPath</key>
+    <string>{log}</string>
+</dict>
+</plist>
+"#,
+        label = LAUNCHD_LABEL,
+        exe = xml_escape(&exe.display().to_string()),
+        config = xml_escape(&config.display().to_string()),
+        log = xml_escape(&log.display().to_string()),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn install_launchd(
+    exe: &std::path::Path,
+    config: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let plist_path = service_unit_path();
+    let log = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string()))
+        .join("Library")
+        .join("Logs")
+        .join("oxllm.log");
+
+    std::fs::create_dir_all(plist_path.parent().unwrap_or(std::path::Path::new(".")))?;
+    std::fs::create_dir_all(log.parent().unwrap_or(std::path::Path::new(".")))?;
+    std::fs::write(&plist_path, launchd_plist(exe, config, &log))?;
+
+    // Replace any loaded instance, then load the new one.
+    let _ = std::process::Command::new("launchctl")
+        .arg("unload")
+        .arg(&plist_path)
+        .status();
+    let status = std::process::Command::new("launchctl")
+        .arg("load")
+        .arg(&plist_path)
+        .status()?;
+    if !status.success() {
+        println!("launchctl load failed (exit {:?})", status.code());
+        std::process::exit(1);
+    }
+
+    println!(
+        "Installed launchd agent {} at {}",
+        LAUNCHD_LABEL,
+        plist_path.display()
+    );
+    println!("Starts now and at login; KeepAlive restarts it if it exits.");
+    println!("Check it with: oxllm status");
+    println!("Logs: {}", log.display());
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn uninstall_launchd() -> Result<(), Box<dyn std::error::Error>> {
+    let plist_path = service_unit_path();
+    let _ = std::process::Command::new("launchctl")
+        .arg("unload")
+        .arg(&plist_path)
+        .status();
+    if plist_path.exists() {
+        std::fs::remove_file(&plist_path)?;
+        println!(
+            "Stopped and removed the launchd agent at {}",
+            plist_path.display()
+        );
+    } else {
+        println!("No launchd agent installed at {}", plist_path.display());
+    }
+    Ok(())
+}
+
+// -----------------------------------------------------------------------
+// Linux: systemd user service
+// -----------------------------------------------------------------------
+
+/// Where the systemd user unit lives for the current user.
+#[cfg(target_os = "linux")]
+fn service_unit_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home)
+        .join(".config")
+        .join("systemd")
+        .join("user")
+        .join("oxllm.service")
+}
+
+/// The systemd user unit, in the same shape as the documented example in
+/// docs/architecture.md §5.4 (Restart=on-failure, journald logging).
+#[cfg(target_os = "linux")]
+fn systemd_unit(exe: &std::path::Path, config: &std::path::Path) -> String {
+    format!(
+        "[Unit]\nDescription=Oxide LLM Proxy\nAfter=network.target\n\n[Service]\nType=simple\nExecStart={exe} serve --config {config}\nRestart=on-failure\nRestartSec=5s\n\n[Install]\nWantedBy=default.target\n",
+        exe = exe.display(),
+        config = config.display(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn install_systemd(
+    exe: &std::path::Path,
+    config: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let unit_path = service_unit_path();
+    std::fs::create_dir_all(unit_path.parent().unwrap_or(std::path::Path::new(".")))?;
+    std::fs::write(&unit_path, systemd_unit(exe, config))?;
+
+    let run = |args: &[&str]| -> Result<bool, Box<dyn std::error::Error>> {
+        Ok(std::process::Command::new("systemctl")
+            .arg("--user")
+            .args(args)
+            .status()
+            .map(|s| s.success())?)
+    };
+
+    run(&["daemon-reload"])?;
+    if !run(&["enable", "--now", "oxllm.service"])? {
+        println!("systemctl --user enable --now oxllm.service failed");
+        std::process::exit(1);
+    }
+
+    println!("Installed systemd user service at {}", unit_path.display());
+    println!("Starts now and at login; restarted on failure.");
+    println!("Check it with: oxllm status");
+    println!("Logs: journalctl --user -u oxllm.service -f");
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn uninstall_systemd() -> Result<(), Box<dyn std::error::Error>> {
+    let unit_path = service_unit_path();
+    let _ = std::process::Command::new("systemctl")
+        .args(["--user", "disable", "--now", "oxllm.service"])
+        .status();
+    if unit_path.exists() {
+        std::fs::remove_file(&unit_path)?;
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .status();
+        println!(
+            "Stopped and removed the systemd user service at {}",
+            unit_path.display()
+        );
+    } else {
+        println!(
+            "No systemd user service installed at {}",
+            unit_path.display()
+        );
+    }
+    Ok(())
+}
+
 async fn run_provider_offline(name: &str, port: u16) -> Result<(), Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
     let url = format!("http://127.0.0.1:{}/admin/providers/{}/offline", port, name);
@@ -1612,27 +1904,59 @@ async fn run_provider_list(port: u16, json: bool) -> Result<(), Box<dyn std::err
     }
 
     println!();
-    println!("+----------------------+-----------------------------------------------+--------------------------------+----------+----------+");
-    println!("| Provider             | Model                                         | Circuit                        | Requests | Success  |");
-    println!("+----------------------+-----------------------------------------------+--------------------------------+----------+----------+");
-    for entry in &providers {
-        let icon = if entry.circuit.starts_with("Closed") {
-            '✓'
-        } else if entry.circuit.starts_with("Half") {
-            '⧖'
-        } else {
-            '✗'
-        };
-        println!(
-            "| {:<20} | {:<45} | {:<30} | {:>8} | {:>8} |",
-            format!("{} {}", icon, entry.provider),
-            entry.model,
-            entry.circuit,
-            entry.requests,
-            entry.successes,
-        );
-    }
-    println!("+----------------------+-----------------------------------------------+--------------------------------+----------+----------+");
+    let rows: Vec<Vec<String>> = providers
+        .iter()
+        .map(|entry| {
+            let icon = if entry.circuit.starts_with("Closed") {
+                '✓'
+            } else if entry.circuit.starts_with("Half") {
+                '⧖'
+            } else {
+                '✗'
+            };
+            vec![
+                format!("{} {}", icon, entry.provider),
+                entry.model.clone(),
+                entry.circuit.clone(),
+                entry.requests.to_string(),
+                entry.successes.to_string(),
+            ]
+        })
+        .collect();
+    println!(
+        "{}",
+        render_table(
+            &[
+                TableColumn {
+                    header: "Provider",
+                    right_align: false,
+                    optional: false,
+                },
+                TableColumn {
+                    header: "Model",
+                    right_align: false,
+                    optional: true,
+                },
+                TableColumn {
+                    header: "Circuit",
+                    right_align: false,
+                    optional: true,
+                },
+                TableColumn {
+                    header: "Requests",
+                    right_align: true,
+                    optional: false,
+                },
+                TableColumn {
+                    header: "Success",
+                    right_align: true,
+                    optional: false,
+                },
+            ],
+            &rows,
+            status_width(None),
+        )
+    );
     println!();
     println!("Use 'oxllm provider offline <name>' to take a provider out of rotation.");
     println!("Use 'oxllm provider reset <name>' to clear circuit breaker state.");
@@ -1676,6 +2000,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         Commands::Stop { pid } => {
             run_stop(pid)?;
+        },
+        Commands::Install { config, force } => {
+            run_install(config, force)?;
+        },
+        Commands::Uninstall => {
+            run_uninstall()?;
         },
         Commands::Provider(cmd) => match cmd {
             ProviderCommand::List { port, json } => {
@@ -1797,10 +2127,12 @@ mod integration_tests {
                 VirtualModelTarget {
                     provider: "prov1".to_string(),
                     model: "gpt-4-upstream".to_string(),
+                    priority: None,
                 },
                 VirtualModelTarget {
                     provider: "prov2".to_string(),
                     model: "gpt-4-upstream".to_string(),
+                    priority: None,
                 },
             ],
         );
@@ -1912,6 +2244,7 @@ mod integration_tests {
             vec![VirtualModelTarget {
                 provider: "prov1".to_string(),
                 model: "gpt-4-upstream".to_string(),
+                priority: None,
             }],
         );
 
@@ -2085,6 +2418,7 @@ mod integration_tests {
             vec![VirtualModelTarget {
                 provider: "omlx-local".to_string(),
                 model: "granite-4.1-3b-4bit".to_string(),
+                priority: None,
             }],
         );
 
@@ -2290,6 +2624,7 @@ mod integration_tests {
             vec![VirtualModelTarget {
                 provider: "omlx-local".to_string(),
                 model: "small".to_string(),
+                priority: None,
             }],
         );
         virtual_models.insert(
@@ -2297,6 +2632,7 @@ mod integration_tests {
             vec![VirtualModelTarget {
                 provider: "omlx-local".to_string(),
                 model: "big".to_string(),
+                priority: None,
             }],
         );
 
@@ -2442,6 +2778,7 @@ mod integration_tests {
             vec![VirtualModelTarget {
                 provider: "omlx-local".to_string(),
                 model: "m".to_string(),
+                priority: None,
             }],
         );
 
@@ -2571,10 +2908,12 @@ mod integration_tests {
                 VirtualModelTarget {
                     provider: "prov-a".to_string(),
                     model: "m".to_string(),
+                    priority: None,
                 },
                 VirtualModelTarget {
                     provider: "prov-b".to_string(),
                     model: "m".to_string(),
+                    priority: None,
                 },
             ],
         );
@@ -2779,10 +3118,12 @@ mod integration_tests {
                 VirtualModelTarget {
                     provider: "p1".into(),
                     model: "model".into(),
+                    priority: None,
                 },
                 VirtualModelTarget {
                     provider: "p2".into(),
                     model: "model".into(),
+                    priority: None,
                 },
             ],
         );
@@ -2926,10 +3267,12 @@ mod integration_tests {
                 VirtualModelTarget {
                     provider: "p1".into(),
                     model: "model".into(),
+                    priority: None,
                 },
                 VirtualModelTarget {
                     provider: "p2".into(),
                     model: "model".into(),
+                    priority: None,
                 },
             ],
         );
@@ -3042,6 +3385,7 @@ mod integration_tests {
             vec![VirtualModelTarget {
                 provider: "resetme".into(),
                 model: "model".into(),
+                priority: None,
             }],
         );
 
@@ -3175,6 +3519,7 @@ mod integration_tests {
             vec![VirtualModelTarget {
                 provider: "emb".into(),
                 model: "model".into(),
+                priority: None,
             }],
         );
 
@@ -3281,6 +3626,7 @@ mod integration_tests {
             vec![VirtualModelTarget {
                 provider: "prov".into(),
                 model: "real-model".into(),
+                priority: None,
             }],
         );
 
@@ -3379,6 +3725,7 @@ mod integration_tests {
             vec![VirtualModelTarget {
                 provider: "target".into(),
                 model: "model".into(),
+                priority: None,
             }],
         );
         let state = Arc::new(AppState {
@@ -3489,6 +3836,7 @@ mod integration_tests {
             vec![VirtualModelTarget {
                 provider: "counter".into(),
                 model: "model".into(),
+                priority: None,
             }],
         );
         let state = Arc::new(AppState {
@@ -3603,6 +3951,7 @@ mod integration_tests {
             vec![VirtualModelTarget {
                 provider: "prov".into(),
                 model: "model".into(),
+                priority: None,
             }],
         );
 
@@ -4524,6 +4873,278 @@ vm2 = [{ provider = "prov-b", model = "m" }]
 
     /// GET /v1/models lists alias names alongside their target models so
     /// clients can discover them.
+    /// The explicit `priority` field orders candidates (lower wins);
+    /// targets without one keep configuration order after all prioritized
+    /// targets. With no priorities anywhere, array order is preserved
+    /// (issue #4).
+    #[test]
+    fn test_priority_field_orders_candidates() {
+        let path = temp_path("priority.toml");
+        std::fs::write(
+            &path,
+            r#"
+[server]
+host = "127.0.0.1"
+port = 18099
+otel_endpoint = "http://127.0.0.1:4318"
+
+[[providers]]
+name = "prov-a"
+enabled = true
+base_url = "http://127.0.0.1:9/v1/"
+api_key = "key"
+models = ["m"]
+
+[virtual_models]
+vm = [
+  { provider = "prov-a", model = "m-first", priority = 5 },
+  { provider = "prov-a", model = "m-best",  priority = 1 },
+  { provider = "prov-a", model = "m-tail" },
+]
+"#,
+        )
+        .unwrap();
+        let config = Config::load_from_file(&path).unwrap();
+        let state = build_app_state(config, None).unwrap();
+
+        let candidates = state.resolve_candidates("vm");
+        let models: Vec<&str> = candidates.iter().map(|(_, m)| m.as_str()).collect();
+        assert_eq!(
+            models,
+            vec!["m-best", "m-first", "m-tail"],
+            "lower priority must win; unprioritized targets must stay in array order at the tail"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Complementary case: with no priority fields set, candidates keep
+    /// the configured array order exactly (today's semantics).
+    #[test]
+    fn test_priority_absent_preserves_array_order() {
+        let path = temp_path("priority-absent.toml");
+        std::fs::write(
+            &path,
+            r#"
+[server]
+host = "127.0.0.1"
+port = 18099
+otel_endpoint = "http://127.0.0.1:4318"
+
+[[providers]]
+name = "prov-a"
+enabled = true
+base_url = "http://127.0.0.1:9/v1/"
+api_key = "key"
+models = ["m"]
+
+[virtual_models]
+vm = [
+  { provider = "prov-a", model = "m-one" },
+  { provider = "prov-a", model = "m-two" },
+  { provider = "prov-a", model = "m-three" },
+]
+"#,
+        )
+        .unwrap();
+        let config = Config::load_from_file(&path).unwrap();
+        let state = build_app_state(config, None).unwrap();
+
+        let candidates = state.resolve_candidates("vm");
+        let models: Vec<&str> = candidates.iter().map(|(_, m)| m.as_str()).collect();
+        assert_eq!(models, vec!["m-one", "m-two", "m-three"]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// POST /v1/systemone routes through the pool like chat: model is
+    /// rewritten to the target's upstream model, the response passes
+    /// through verbatim, usage is accounted, and a failing provider
+    /// cascades to the next (issue #6).
+    #[tokio::test]
+    async fn test_systemone_routes_with_failover() {
+        // First upstream answers 500, second answers with a decision body.
+        let fail = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n".to_string();
+        let decision_body = r#"{"answers":[{"question":"route","choice":"fast"}],"usage":{"input_tokens":42,"output_tokens":0}}"#;
+        let ok = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            decision_body.len(),
+            decision_body
+        );
+        let recorded = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let addr1 = spawn_recording_upstream(vec![fail], recorded.clone()).await;
+        let addr2 = spawn_recording_upstream(vec![ok], recorded.clone()).await;
+
+        let mk = |name: &str, addr: SocketAddr| ProviderState {
+            name: name.to_string(),
+            base_url: Url::parse(&format!("http://{}/v1/", addr)).unwrap(),
+            api_key: "k".to_string(),
+            models: vec!["m".to_string()],
+            upstream_timeout_secs: None,
+            cost_per_mtok: None,
+            circuit: Arc::new(RwLock::new(CircuitState::Closed)),
+            consecutive_failures: Arc::new(RwLock::new(0)),
+            rate_limited_until: Arc::new(RwLock::new(None)),
+            last_attempt_time: Arc::new(RwLock::new(None)),
+            probe_in_flight: Arc::new(AtomicBool::new(false)),
+            manual_disabled: AtomicBool::new(false),
+            requests: AtomicU64::new(0),
+            successes: AtomicU64::new(0),
+            tokens_input: AtomicU64::new(0),
+            tokens_output: AtomicU64::new(0),
+            model_stats: Arc::new(ModelStats::default()),
+        };
+
+        let mut vms = std::collections::HashMap::new();
+        vms.insert(
+            "route-decisions".to_string(),
+            vec![
+                VirtualModelTarget {
+                    provider: "llamacpp-local".to_string(),
+                    model: "Kev-4B-Q4_K_M".to_string(),
+                    priority: None,
+                },
+                VirtualModelTarget {
+                    provider: "hosted-jev".to_string(),
+                    model: "jev".to_string(),
+                    priority: None,
+                },
+            ],
+        );
+        let app_state = Arc::new(AppState {
+            providers: vec![mk("llamacpp-local", addr1), mk("hosted-jev", addr2)],
+            virtual_models: vms,
+            aliases: Default::default(),
+            default_model: None,
+            // Threshold 1 so the failing provider is skipped after its first
+            // 500, keeping the expected attempt count at two.
+            circuit: CircuitConfig {
+                failure_threshold: 1,
+                ..CircuitConfig::default()
+            },
+            route_stats: Arc::new(ModelStats::default()),
+            policies: std::collections::HashMap::new(),
+            routing_calls: AtomicU64::new(0),
+            api_keys: Vec::new(),
+            session_affinity: Arc::new(SessionAffinity::new(
+                std::time::Duration::from_secs(900),
+                1024,
+            )),
+            session_affinity_header: oxllm_core::state::DEFAULT_SESSION_HEADER.to_string(),
+            server: test_server_config(),
+            http_client: reqwest::Client::builder().build().unwrap(),
+            upstream_timeout_secs: 5,
+        });
+
+        let (_ws, wr) = tokio::sync::watch::channel(app_state.clone());
+        let (ttx, _trx) = tokio::sync::mpsc::channel(1024);
+        let rs = ReloadableState {
+            app_state: wr,
+            telemetry: TelemetryClient::new(ttx),
+            start_time: Instant::now(),
+            reloader: Reloader {
+                sender: _ws,
+                config_path: PathBuf::from("."),
+            },
+        };
+        let router = axum::Router::new()
+            .route(
+                "/v1/systemone",
+                axum::routing::post(routes::create_systemone),
+            )
+            .layer(middleware::from_fn(add_request_id))
+            .with_state(rs);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let res = reqwest::Client::new()
+            .post(format!("http://{}/v1/systemone", proxy_addr))
+            .json(&serde_json::json!({
+                "model": "route-decisions",
+                "state": "router",
+                "questions": [{"id": "route", "type": "choice", "options": ["fast", "cheap"]}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200, "must fail over to the second provider");
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(
+            body["answers"][0]["choice"], "fast",
+            "response must pass through verbatim"
+        );
+
+        // Both upstreams saw the request; the second got the rewritten model.
+        let recorded = recorded.lock().await;
+        assert_eq!(recorded.len(), 2, "both providers must have been tried");
+        let (_path, second_body) = &recorded[1];
+        let upstream_json: Value = serde_json::from_str(second_body).unwrap();
+        assert_eq!(upstream_json["model"], "jev");
+
+        // Usage accounted on the provider that served (input only; decisions
+        // decode nothing).
+        assert_eq!(
+            app_state.providers[1]
+                .tokens_input
+                .load(std::sync::atomic::Ordering::Relaxed),
+            42
+        );
+    }
+
+    /// The generated launchd plist carries the resolved binary and config
+    /// paths, KeepAlive, and the log path (issue #2).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_launchd_plist_content() {
+        let plist = launchd_plist(
+            std::path::Path::new("/usr/local/bin/oxllm"),
+            std::path::Path::new("/Users/test/.config/oxllm/config.toml"),
+            std::path::Path::new("/Users/test/Library/Logs/oxllm.log"),
+        );
+        assert!(
+            plist.contains("<string>org.oxllm.proxy</string>"),
+            "{}",
+            plist
+        );
+        assert!(plist.contains("/usr/local/bin/oxllm"));
+        assert!(plist.contains("serve"));
+        assert!(plist.contains("--config"));
+        assert!(plist.contains("/Users/test/.config/oxllm/config.toml"));
+        assert!(plist.contains("<key>KeepAlive</key>"));
+        assert!(plist.contains("<key>RunAtLoad</key>"));
+        assert!(plist.contains("/Users/test/Library/Logs/oxllm.log"));
+    }
+
+    /// Paths with XML-special characters are escaped in the plist.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_launchd_plist_escapes_paths() {
+        let plist = launchd_plist(
+            std::path::Path::new("/opt/a&b/oxllm"),
+            std::path::Path::new("/tmp/config.toml"),
+            std::path::Path::new("/tmp/oxllm.log"),
+        );
+        assert!(plist.contains("/opt/a&amp;b/oxllm"), "{}", plist);
+        assert!(!plist.contains("/opt/a&b/"));
+    }
+
+    /// The generated systemd user unit carries the binary and config paths
+    /// and restarts on failure (issue #2).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_systemd_unit_content() {
+        let unit = systemd_unit(
+            std::path::Path::new("/usr/local/bin/oxllm"),
+            std::path::Path::new("/home/test/.config/oxllm/config.toml"),
+        );
+        assert!(unit.contains(
+            "ExecStart=/usr/local/bin/oxllm serve --config /home/test/.config/oxllm/config.toml"
+        ));
+        assert!(unit.contains("Restart=on-failure"));
+        assert!(unit.contains("WantedBy=default.target"));
+    }
+
     #[tokio::test]
     async fn test_list_models_includes_aliases() {
         let response =

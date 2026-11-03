@@ -238,6 +238,20 @@ OpenAI SDKs (JavaScript, Vercel AI SDK) to call the proxy directly.
 
 ### 5.4. Daemon Configuration (Service Mode)
 
+`oxllm install` automates this as a **user-level** service (launchd agent at
+`~/Library/LaunchAgents/org.oxllm.proxy.plist` on macOS, systemd user unit at
+`~/.config/systemd/user/oxllm.service` on Linux): it validates the config,
+writes the unit pointing at the current binary, loads it, and prints
+verification hints. `oxllm uninstall` stops and removes it. Replacing an
+existing installation requires `--force`. Note that a service does not
+inherit your shell environment, so `${VAR}` config references need
+`launchctl setenv` (macOS) or `Environment=` in the unit (Linux) — `install`
+warns when it detects them.
+
+The hand-written units below remain the reference for system-level installs
+and edge platforms (OpenWrt/musl init scripts) where the subcommand does not
+apply.
+
 #### macOS Lifecycle (`/Library/LaunchDaemons/org.oxllm.plist`)
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>

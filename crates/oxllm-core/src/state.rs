@@ -449,7 +449,11 @@ impl AppState {
         }
     }
 
-    /// Resolves the candidate list for a given virtual model.
+    /// Resolves the candidate list for a given virtual model, ordered by
+    /// the targets' explicit `priority` (lower first). Targets without a
+    /// priority keep their configured order and sort after all prioritized
+    /// ones; with no priorities set anywhere this is exactly the
+    /// configured array order.
     pub fn resolve_candidates(&self, virtual_model: &str) -> Vec<(&ProviderState, String)> {
         let targets = match self.virtual_models.get(virtual_model) {
             Some(t) => t,
@@ -459,10 +463,15 @@ impl AppState {
         let mut candidates = Vec::new();
         for target in targets {
             if let Some(provider) = self.providers.iter().find(|p| p.name == target.provider) {
-                candidates.push((provider, target.model.clone()));
+                candidates.push((provider, target.model.clone(), target.priority));
             }
         }
+        // Stable sort: equal or absent priorities keep configuration order.
+        candidates.sort_by_key(|&(_, _, priority)| priority.unwrap_or(u32::MAX));
         candidates
+            .into_iter()
+            .map(|(provider, model, _)| (provider, model))
+            .collect()
     }
 }
 

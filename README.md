@@ -16,7 +16,8 @@ Built to operate entirely in memory with zero local disk persistence, `oxllm` is
 * **Zero-Disk Dependency**: No SQLite, local caching, or file write operations during routing. State is strictly in memory.
 * **&lt;2ms Routing Overhead**: Lock-free concurrency across routing loop, counters, and probe permits. Verified by CI benchmark.
 * **Adaptive Circuit Breaker**: Strict `HalfOpen` state machine with lock-free `probe_in_flight` atomic check-and-set. Rate limits and server errors trip per-provider circuits with exponential backoff. Idle-based penalty decay automatically rehabilitates providers.
-* **Tiered Failover**: Configure fallback chains across multiple providers. If the primary returns 429 or 5xx, the proxy transparently cascades to the next.
+* **Tiered Failover**: Configure fallback chains across multiple providers. If the primary returns 429 or 5xx, the proxy transparently cascades to the next. Per-target `priority` states the preference explicitly instead of implying it from array order.
+* **Decision-Model Endpoint**: `POST /v1/systemone` routes llama.cpp decision models (typed choice/score questions answered in one forward pass) through the same provider pool — model rewrite, circuit breaking, and failover included.
 * **Routing Policies**: Per-virtual-model `priority` (configuration order), `fastest` (lowest measured time-to-first-byte), or `cheapest` (lowest configured cost) selection among healthy candidates.
 * **Session Affinity**: Requests carrying a session key stay on one provider while it is healthy, keeping upstream prompt-prefix caches warm. Bounded LRU, idle TTL, automatic break-and-re-pin on failure.
 * **Optional Inbound Auth**: `server.api_keys` gates the public `/v1/*` routes behind constant-time `Authorization: Bearer` checks. Admin routes are always localhost-only.
@@ -125,6 +126,13 @@ export GROQ_API_KEY="gsk_..."
 export GOOGLE_API_KEY="AIza..."
 cp config.toml ~/.config/oxllm/config.toml
 oxllm serve
+
+# Or install it as a persistent user service (launchd on macOS,
+# systemd on Linux): starts now, at login, and restarts on failure.
+oxllm install
+oxllm status
+# ...and when you want it gone:
+oxllm uninstall
 ```
 
 
@@ -211,7 +219,7 @@ Each provider requires `name`, `enabled`, `base_url` (with trailing `/v1/`), `ap
 
 ### Virtual Models (Fallback Chains)
 
-Virtual models define the routing order. If a provider returns 429 or 5xx, the proxy transparently tries the next:
+Virtual models define the routing order. If a provider returns 429 or 5xx, the proxy transparently tries the next. An optional per-target `priority` (lower = preferred) states the preference explicitly; targets without one keep their configured order after all prioritized targets, so existing configs behave identically:
 
 ```toml
 [virtual_models]

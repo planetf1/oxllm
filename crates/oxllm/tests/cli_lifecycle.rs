@@ -49,6 +49,41 @@ fn status_exits_nonzero_when_no_daemon_listens() {
     assert!(stdout.contains("not running"), "got: {}", stdout);
 }
 
+/// `oxllm install` must refuse to replace an existing service without
+/// --force, before touching launchctl/systemd (issue #2 acceptance: never
+/// silently overwrite). On a machine where nothing is installed, a dummy
+/// unit file is created first and removed afterwards; the refusal path
+/// exits before any service manager runs.
+#[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn install_refuses_existing_unit_without_force() {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    #[cfg(target_os = "macos")]
+    let unit = std::path::Path::new(&home).join("Library/LaunchAgents/org.oxllm.proxy.plist");
+    #[cfg(target_os = "linux")]
+    let unit = std::path::Path::new(&home).join(".config/systemd/user/oxllm.service");
+
+    let created = if !unit.exists() {
+        std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
+        std::fs::write(&unit, "dummy").unwrap();
+        true
+    } else {
+        false
+    };
+
+    let out = oxllm().arg("install").output().unwrap();
+    assert!(
+        !out.status.success(),
+        "install must refuse an existing unit without --force"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("already installed"), "got: {}", stdout);
+
+    if created {
+        std::fs::remove_file(&unit).unwrap();
+    }
+}
+
 /// SIGTERM drains in-flight requests only until
 /// `server.shutdown_timeout_secs` expires: a request stuck on a hung
 /// upstream must not hold the shutdown hostage. With a 1s deadline and a
