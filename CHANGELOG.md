@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.24] - 2026-11-03
+
 ### Added
 - **Traffic visibility** (issue #12): a bounded in-memory ring of recent
   request records (metadata only — never bodies; capacity via
