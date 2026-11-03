@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.22] - 2026-11-03
+
 ### Fixed
 - **Flaky parallel install tests on CI**: the two install-refusal tests
   both created and deleted a dummy unit file at the same fixed path, and
