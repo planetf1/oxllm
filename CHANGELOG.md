@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.20] - 2026-11-03
+
 ### Added
 - **Service installation** (issue #2): `oxllm install` sets the daemon up
   as a user-level service — launchd agent on macOS (`RunAtLoad` +
