@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Config file watching** (issue #7): the daemon now polls its config
+  file every 2 seconds and hot-reloads when the contents change, so config
+  edits take effect without a manual step. A broken edit is logged once and
+  the previous config keeps serving; fixing the file reloads.
+
+### Changed
+- **`oxllm reload` now drives the daemon over HTTP** (`POST /reload` on
+  `-p/--port`, default 8080, `OXLLM_PORT`) instead of signalling a PID read
+  from `/tmp/oxllm.pid`. The daemon's validation error is printed when the
+  new config is rejected. `--pid <pid>` keeps the direct-SIGHUP escape
+  hatch. **Breaking:** in `reload`, `-p` is now `--port` (it was `--pid`).
+
+### Fixed
+- **A short-lived second `oxllm serve` no longer orphans the daemon**
+  (issue #7): every instance used to overwrite `/tmp/oxllm.pid` and delete
+  it on exit, so `oxllm reload`/`oxllm stop` lost track of the long-running
+  daemon. The PID file is now written only after a successful bind, is
+  never overwritten while it tracks a live process, and is removed on
+  shutdown only if it still records the exiting process's own PID.
+- **`oxllm reload` and `oxllm stop` exit non-zero** when no daemon can be
+  found, so `edit && oxllm reload` chains fail loudly instead of silently
+  succeeding while the daemon keeps serving the old config.
+
 ## [0.1.17] - 2026-10-28
 
 ### Fixed

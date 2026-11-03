@@ -97,10 +97,13 @@ enum Commands {
         #[arg(short, long)]
         width: Option<usize>,
     },
-    /// Triggers hot-reload by sending SIGHUP to the running gateway daemon
+    /// Triggers hot-reload on the running gateway (POST /reload, or SIGHUP via --pid)
     Reload {
-        /// PID of the running oxllm process (optional, reads from /tmp/oxllm.pid by default)
-        #[arg(short, long)]
+        /// Port of the running gateway server
+        #[arg(short, long, default_value_t = 8080, env = "OXLLM_PORT")]
+        port: u16,
+        /// Send SIGHUP to this PID instead of using the HTTP endpoint
+        #[arg(long)]
         pid: Option<u32>,
     },
     /// Gracefully stops the running oxllm daemon (sends SIGTERM)
@@ -264,9 +267,52 @@ fn build_app_state(config: Config) -> Result<AppState, String> {
     })
 }
 
-fn write_pid_file() -> std::io::Result<()> {
+/// Fixed PID file used by `oxllm stop` to locate the daemon.
+const PID_FILE: &str = "/tmp/oxllm.pid";
+
+/// How often the config file watcher polls for changes.
+const CONFIG_WATCH_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Whether a process with the given PID exists (probed with `kill -0`).
+fn process_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Writes our PID to the PID file, but never overwrites a live foreign
+/// process's entry: a second `oxllm serve` (another port, another config)
+/// must not steal the file from the long-running daemon, or `oxllm stop`
+/// loses track of it. Stale PIDs are replaced.
+fn write_pid_file(path: &std::path::Path) -> std::io::Result<()> {
     let pid = std::process::id();
-    std::fs::write("/tmp/oxllm.pid", pid.to_string())
+    if let Ok(existing) = std::fs::read_to_string(path) {
+        if let Ok(existing_pid) = existing.trim().parse::<u32>() {
+            if existing_pid != pid && process_alive(existing_pid) {
+                warn!(
+                    "PID file {} tracks live process {}, not overwriting",
+                    path.display(),
+                    existing_pid
+                );
+                return Ok(());
+            }
+        }
+    }
+    std::fs::write(path, pid.to_string())
+}
+
+/// Removes the PID file on shutdown, but only while it still records our
+/// own PID, so an instance that lost the race for the file cannot delete
+/// the daemon's entry on its way out.
+fn cleanup_pid_file(path: &std::path::Path) {
+    let own = std::process::id().to_string();
+    if let Ok(content) = std::fs::read_to_string(path) {
+        if content.trim() == own {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 fn send_sighup(pid: u32) -> std::io::Result<()> {
@@ -429,100 +475,60 @@ async fn shutdown_signal() {
         },
     }
 
-    // Clean up PID file on shutdown
-    let _ = std::fs::remove_file("/tmp/oxllm.pid");
+    // Clean up PID file on shutdown, but only if it still records our PID
+    cleanup_pid_file(std::path::Path::new(PID_FILE));
+}
+
+/// Loads, validates, and swaps in the config at `config_path`. Shared by
+/// the SIGHUP handler, `POST /reload`, and the config file watcher. On any
+/// failure the previous state stays live and the reason is returned.
+fn reload_config(
+    config_path: &std::path::Path,
+    sender: &tokio::sync::watch::Sender<Arc<AppState>>,
+) -> Result<(), String> {
+    let config =
+        Config::load_from_file(config_path).map_err(|e| format!("Failed to load config: {}", e))?;
+    config
+        .validate()
+        .map_err(|e| format!("Config validation failed: {}", e))?;
+    let new_state = build_app_state(config).map_err(|e| format!("Failed to build state: {}", e))?;
+    sender
+        .send(Arc::new(new_state))
+        .map_err(|e| format!("Failed to update watch channel: {}", e))
+}
+
+fn json_response(status: StatusCode, body: serde_json::Value) -> Response {
+    let bytes = serde_json::to_vec(&body).unwrap();
+    let mut response = Response::new(Body::from(bytes));
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response
 }
 
 async fn handle_http_reload(
     axum::extract::State(reloader): axum::extract::State<Reloader>,
 ) -> impl IntoResponse {
-    let config = match Config::load_from_file(&reloader.config_path) {
-        Ok(c) => c,
-        Err(e) => {
-            let body = serde_json::json!({
+    match reload_config(&reloader.config_path, &reloader.sender) {
+        Ok(()) => {
+            info!("Configuration reloaded via HTTP POST /reload");
+            json_response(
+                StatusCode::OK,
+                serde_json::json!({"message": "Configuration reloaded successfully"}),
+            )
+        },
+        Err(reason) => json_response(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({
                 "error": {
-                    "message": format!("Failed to load config: {}", e),
+                    "message": reason,
                     "type": "invalid_request_error",
                     "code": 400
                 }
-            });
-            let bytes = serde_json::to_vec(&body).unwrap();
-            let mut response = Response::new(Body::from(bytes));
-            *response.status_mut() = StatusCode::BAD_REQUEST;
-            response.headers_mut().insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("application/json"),
-            );
-            return response;
-        },
-    };
-    if let Err(e) = config.validate() {
-        let body = serde_json::json!({
-            "error": {
-                "message": format!("Config validation failed: {}", e),
-                "type": "invalid_request_error",
-                "code": 400
-            }
-        });
-        let bytes = serde_json::to_vec(&body).unwrap();
-        let mut response = Response::new(Body::from(bytes));
-        *response.status_mut() = StatusCode::BAD_REQUEST;
-        response.headers_mut().insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        );
-        return response;
-    }
-    match build_app_state(config) {
-        Ok(new_state) => {
-            if reloader.sender.send(Arc::new(new_state)).is_ok() {
-                info!("Configuration reloaded via HTTP POST /reload");
-                let body = serde_json::json!({
-                    "message": "Configuration reloaded successfully"
-                });
-                let bytes = serde_json::to_vec(&body).unwrap();
-                let mut response = Response::new(Body::from(bytes));
-                *response.status_mut() = StatusCode::OK;
-                response.headers_mut().insert(
-                    header::CONTENT_TYPE,
-                    HeaderValue::from_static("application/json"),
-                );
-                response
-            } else {
-                let body = serde_json::json!({
-                    "error": {
-                        "message": "Failed to send config update",
-                        "type": "internal_error",
-                        "code": 500
-                    }
-                });
-                let bytes = serde_json::to_vec(&body).unwrap();
-                let mut response = Response::new(Body::from(bytes));
-                *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-                response.headers_mut().insert(
-                    header::CONTENT_TYPE,
-                    HeaderValue::from_static("application/json"),
-                );
-                response
-            }
-        },
-        Err(e) => {
-            let body = serde_json::json!({
-                "error": {
-                    "message": format!("Failed to build state: {}", e),
-                    "type": "invalid_request_error",
-                    "code": 400
-                }
-            });
-            let bytes = serde_json::to_vec(&body).unwrap();
-            let mut response = Response::new(Body::from(bytes));
-            *response.status_mut() = StatusCode::BAD_REQUEST;
-            response.headers_mut().insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("application/json"),
-            );
-            response
-        },
+            }),
+        ),
     }
 }
 
@@ -544,29 +550,53 @@ async fn handle_sighup(
         info!("Registered SIGHUP reload listener");
         while sig.recv().await.is_some() {
             info!("SIGHUP received, reloading configuration...");
-            match Config::load_from_file(&config_path) {
-                Ok(new_config) => {
-                    if let Err(e) = new_config.validate() {
-                        error!("Configuration validation failed during hot-reload: {}", e);
-                        continue;
-                    }
-                    match build_app_state(new_config) {
-                        Ok(new_state) => {
-                            if let Err(e) = watch_sender.send(Arc::new(new_state)) {
-                                error!("Failed to update watch channel: {}", e);
-                            } else {
-                                info!("Configuration successfully reloaded!");
-                            }
-                        },
-                        Err(e) => {
-                            error!("Failed to build new app state during hot-reload: {}", e);
-                        },
-                    }
-                },
-                Err(e) => {
-                    error!("Failed to load config file during hot-reload: {}", e);
-                },
+            if let Err(e) = reload_config(&config_path, &watch_sender) {
+                error!(
+                    "Hot-reload via SIGHUP failed, keeping previous config: {}",
+                    e
+                );
             }
+        }
+    }
+}
+
+/// Watches the config file and hot-reloads when its contents change, so
+/// config edits take effect without a manual `oxllm reload`. The file is
+/// small, so polling its bytes every couple of seconds is cheaper and more
+/// portable than a filesystem-event dependency. A reload fires only when
+/// the contents differ from the last attempt (successful or not), so a
+/// broken edit is reported once and the fixed edit reloads.
+async fn watch_config_file(
+    config_path: PathBuf,
+    sender: tokio::sync::watch::Sender<Arc<AppState>>,
+    poll_interval: Duration,
+) {
+    // None until the first successful read, so a file that is briefly
+    // unreadable at startup becomes the baseline instead of a change.
+    let mut last_contents: Option<Vec<u8>> = None;
+    let mut interval = tokio::time::interval(poll_interval);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    info!("Watching config file {:?} for changes", config_path);
+    loop {
+        interval.tick().await;
+        // Transient read failures (file mid-rename) are retried next tick.
+        let Ok(contents) = std::fs::read(&config_path) else {
+            continue;
+        };
+        let is_baseline = last_contents.is_none();
+        if !is_baseline && last_contents.as_ref() == Some(&contents) {
+            continue;
+        }
+        last_contents = Some(contents);
+        if is_baseline {
+            continue;
+        }
+        info!("Config file changed, hot-reloading...");
+        if let Err(e) = reload_config(&config_path, &sender) {
+            error!(
+                "Hot-reload of changed config failed, keeping previous config: {}",
+                e
+            );
         }
     }
 }
@@ -589,9 +619,14 @@ async fn run_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     let otel_endpoint = config.server.otel_endpoint.clone();
     let _worker_handle = TelemetryWorker::spawn(&otel_endpoint, telemetry_rx)?;
 
-    // 5. Spawn SIGHUP listener
+    // 5. Spawn SIGHUP listener and config file watcher
     let config_path_clone = config_path.clone();
     tokio::spawn(handle_sighup(config_path_clone, watch_sender.clone()));
+    tokio::spawn(watch_config_file(
+        config_path.clone(),
+        watch_sender.clone(),
+        CONFIG_WATCH_INTERVAL,
+    ));
 
     // 6. Build Axum Router
     let start_time = Instant::now();
@@ -677,12 +712,9 @@ async fn run_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         )
         .with_state(reloadable_state);
 
-    // Write PID file
-    if let Err(e) = write_pid_file() {
-        warn!("Failed to write PID file: {}", e);
-    }
-
-    // Start listening
+    // Start listening. The PID file is written only after a successful
+    // bind: an instance that fails to start must not claim (or clobber)
+    // the daemon's PID entry.
     let port = config.server.port;
     let listener = match config.server.bind_family.as_str() {
         "ipv6" => {
@@ -727,6 +759,11 @@ async fn run_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             tokio::net::TcpListener::bind(&addr).await?
         },
     };
+
+    // Write PID file (after the bind succeeded; see above)
+    if let Err(e) = write_pid_file(std::path::Path::new(PID_FILE)) {
+        warn!("Failed to write PID file: {}", e);
+    }
 
     axum::serve(
         listener,
@@ -1234,47 +1271,63 @@ async fn run_status(
     Ok(())
 }
 
-fn run_reload(pid_opt: Option<u32>) -> Result<(), Box<dyn std::error::Error>> {
-    let pid = match pid_opt {
-        Some(p) => p,
-        None => match std::fs::read_to_string("/tmp/oxllm.pid") {
-            Ok(content) => match content.trim().parse::<u32>() {
-                Ok(p) => p,
-                Err(_) => {
-                    println!("Invalid PID in /tmp/oxllm.pid");
-                    return Ok(());
-                },
-            },
-            Err(_) => {
-                println!("oxllm is not running (no PID file at /tmp/oxllm.pid)");
-                println!("Start it with: oxllm serve");
-                return Ok(());
-            },
+/// Triggers a hot-reload on the running daemon. The default path is the
+/// daemon's `POST /reload` endpoint, which validates the new config and
+/// reports the reason on failure; `--pid` falls back to signalling the
+/// process directly with SIGHUP. Exits non-zero when the reload did not
+/// happen, so a script chaining `edit && oxllm reload` cannot mistake
+/// failure for success.
+async fn run_reload(port: u16, pid_opt: Option<u32>) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(pid) = pid_opt {
+        if let Err(e) = send_sighup(pid) {
+            println!("Failed to send SIGHUP to process {}: {}", pid, e);
+            std::process::exit(1);
+        }
+        println!(
+            "Successfully sent hot-reload signal (SIGHUP) to process {}",
+            pid
+        );
+        return Ok(());
+    }
+
+    let client = reqwest::Client::new();
+    let url = format!("http://127.0.0.1:{}/reload", port);
+    let res = match client.post(&url).send().await {
+        Ok(r) => r,
+        Err(e) if e.is_connect() => {
+            println!("oxllm is not running on http://127.0.0.1:{}", port);
+            println!("Start it with: oxllm serve");
+            std::process::exit(1);
         },
+        Err(e) => return Err(e.into()),
     };
-    send_sighup(pid)?;
-    println!(
-        "Successfully sent hot-reload signal (SIGHUP) to process {}",
-        pid
-    );
+    let status = res.status();
+    let body = res.text().await?;
+    println!("{}", body);
+    if !status.is_success() {
+        std::process::exit(1);
+    }
     Ok(())
 }
 
+/// Gracefully stops the daemon recorded in the PID file (or `--pid`).
+/// Exits non-zero when no daemon can be found, so scripts cannot mistake
+/// failure for success.
 fn run_stop(pid_opt: Option<u32>) -> Result<(), Box<dyn std::error::Error>> {
     let pid = match pid_opt {
         Some(p) => p,
-        None => match std::fs::read_to_string("/tmp/oxllm.pid") {
+        None => match std::fs::read_to_string(PID_FILE) {
             Ok(content) => match content.trim().parse::<u32>() {
                 Ok(p) => p,
                 Err(_) => {
-                    println!("Invalid PID in /tmp/oxllm.pid");
-                    return Ok(());
+                    println!("Invalid PID in {}", PID_FILE);
+                    std::process::exit(1);
                 },
             },
             Err(_) => {
-                println!("oxllm is not running (no PID file at /tmp/oxllm.pid)");
+                println!("oxllm is not running (no PID file at {})", PID_FILE);
                 println!("Start it with: oxllm serve");
-                return Ok(());
+                std::process::exit(1);
             },
         },
     };
@@ -1286,7 +1339,7 @@ fn run_stop(pid_opt: Option<u32>) -> Result<(), Box<dyn std::error::Error>> {
         Ok(s) => s,
         Err(e) => {
             println!("Failed to send SIGTERM: {}", e);
-            return Ok(());
+            std::process::exit(1);
         },
     };
     if status.success() {
@@ -1296,6 +1349,7 @@ fn run_stop(pid_opt: Option<u32>) -> Result<(), Box<dyn std::error::Error>> {
         );
     } else {
         println!("kill command failed with exit code: {:?}", status.code());
+        std::process::exit(1);
     }
     Ok(())
 }
@@ -1459,8 +1513,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Status { port, json, width } => {
             run_status(port, json, width).await?;
         },
-        Commands::Reload { pid } => {
-            run_reload(pid)?;
+        Commands::Reload { port, pid } => {
+            run_reload(port, pid).await?;
         },
         Commands::Stop { pid } => {
             run_stop(pid)?;
@@ -3751,5 +3805,235 @@ mod integration_tests {
             id_str
         );
         assert_eq!(id_str.len(), 22);
+    }
+
+    // -----------------------------------------------------------------------
+    // Config hot-reload (issue #7): file watcher, HTTP reload, PID file
+    // -----------------------------------------------------------------------
+
+    fn temp_path(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("oxllm-test-{}-{}", std::process::id(), name));
+        path
+    }
+
+    fn test_config_toml(provider: &str) -> String {
+        format!(
+            r#"
+[server]
+host = "127.0.0.1"
+port = 18099
+otel_endpoint = "http://127.0.0.1:4318"
+
+[[providers]]
+name = "{provider}"
+enabled = true
+base_url = "http://127.0.0.1:9/v1/"
+api_key = "key"
+models = ["m"]
+
+[virtual_models]
+vm = [{{ provider = "{provider}", model = "m" }}]
+"#
+        )
+    }
+
+    /// Same shape, but the virtual model targets an undefined provider, so
+    /// `validate()` rejects it.
+    fn test_config_toml_dangling_reference() -> String {
+        r#"
+[server]
+host = "127.0.0.1"
+port = 18099
+otel_endpoint = "http://127.0.0.1:4318"
+
+[[providers]]
+name = "prov-a"
+enabled = true
+base_url = "http://127.0.0.1:9/v1/"
+api_key = "key"
+models = ["m"]
+
+[virtual_models]
+vm = [{ provider = "missing-prov", model = "m" }]
+"#
+        .to_string()
+    }
+
+    /// Spawns and reaps a child to obtain a PID that is guaranteed dead.
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        pid
+    }
+
+    /// Editing the config file takes effect without a manual reload: the
+    /// watcher swaps in the new state through the same path as SIGHUP and
+    /// POST /reload. Regression test for issue #7 ("config changes need a
+    /// manual reload").
+    #[tokio::test]
+    async fn test_config_watcher_hot_reloads_on_file_change() {
+        let path = temp_path("watch-valid.toml");
+        std::fs::write(&path, test_config_toml("prov-a")).unwrap();
+        let config = Config::load_from_file(&path).unwrap();
+        let initial = Arc::new(build_app_state(config).unwrap());
+        let (sender, mut receiver) = tokio::sync::watch::channel(initial);
+
+        tokio::spawn(watch_config_file(
+            path.clone(),
+            sender,
+            Duration::from_millis(50),
+        ));
+
+        // Let the watcher establish its baseline before rewriting. On the
+        // current-thread test runtime the spawned task runs while we sleep,
+        // so 3 poll intervals are ample margin.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        std::fs::write(&path, test_config_toml("prov-b")).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), receiver.changed())
+            .await
+            .expect("watcher must reload after the config file changes")
+            .unwrap();
+        assert_eq!(receiver.borrow_and_update().providers[0].name, "prov-b");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Complementary case: a broken edit (dangling provider reference) is
+    /// rejected, the previous config keeps serving, and fixing the file
+    /// reloads. A failed reload must never swap in broken state.
+    #[tokio::test]
+    async fn test_config_watcher_keeps_old_config_when_new_config_invalid() {
+        let path = temp_path("watch-invalid.toml");
+        std::fs::write(&path, test_config_toml("prov-a")).unwrap();
+        let config = Config::load_from_file(&path).unwrap();
+        let initial = Arc::new(build_app_state(config).unwrap());
+        let (sender, mut receiver) = tokio::sync::watch::channel(initial);
+
+        tokio::spawn(watch_config_file(
+            path.clone(),
+            sender,
+            Duration::from_millis(50),
+        ));
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        std::fs::write(&path, test_config_toml_dangling_reference()).unwrap();
+        let swapped = tokio::time::timeout(Duration::from_millis(300), receiver.changed()).await;
+        assert!(swapped.is_err(), "an invalid config must not be swapped in");
+
+        std::fs::write(&path, test_config_toml("prov-b")).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), receiver.changed())
+            .await
+            .expect("watcher must reload after the config file is fixed")
+            .unwrap();
+        assert_eq!(receiver.borrow_and_update().providers[0].name, "prov-b");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `oxllm reload` drives the daemon through POST /reload and reports
+    /// success only when the new config was actually swapped in.
+    #[tokio::test]
+    async fn test_run_reload_succeeds_via_http_endpoint() {
+        let path = temp_path("reload-ok.toml");
+        std::fs::write(&path, test_config_toml("prov-a")).unwrap();
+        let config = Config::load_from_file(&path).unwrap();
+        let initial = Arc::new(build_app_state(config).unwrap());
+        let (sender, mut receiver) = tokio::sync::watch::channel(initial);
+
+        let router = axum::Router::new()
+            .route("/reload", axum::routing::post(handle_http_reload))
+            .with_state(Reloader {
+                sender,
+                config_path: path.clone(),
+            });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        run_reload(port, None).await.unwrap();
+        receiver.changed().await.unwrap();
+        assert_eq!(receiver.borrow_and_update().providers[0].name, "prov-a");
+
+        std::fs::write(&path, test_config_toml("prov-b")).unwrap();
+        run_reload(port, None).await.unwrap();
+        receiver.changed().await.unwrap();
+        assert_eq!(receiver.borrow_and_update().providers[0].name, "prov-b");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A second `oxllm serve` must not steal the PID file from a live
+    /// daemon (issue #7 reproducer: the daemon becomes unfindable after a
+    /// short-lived second instance exits).
+    #[test]
+    fn test_write_pid_file_preserves_live_foreign_pid() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let path = temp_path("pid-live");
+        std::fs::write(&path, child.id().to_string()).unwrap();
+
+        write_pid_file(&path).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            child.id().to_string(),
+            "a live foreign PID must not be overwritten"
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A stale PID (process gone) must be replaced so a crashed instance
+    /// does not block the next `oxllm serve` from being tracked.
+    #[test]
+    fn test_write_pid_file_overwrites_stale_pid() {
+        let path = temp_path("pid-stale");
+        std::fs::write(&path, dead_pid().to_string()).unwrap();
+
+        write_pid_file(&path).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            std::process::id().to_string(),
+            "a stale PID must be replaced with our own"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Shutdown cleanup removes only our own PID entry: an instance that
+    /// lost the race for the file must not delete the daemon's entry on
+    /// its way out (the second half of the issue #7 reproducer).
+    #[test]
+    fn test_cleanup_pid_file_removes_only_own_pid() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let foreign = temp_path("pid-cleanup-foreign");
+        std::fs::write(&foreign, child.id().to_string()).unwrap();
+        cleanup_pid_file(&foreign);
+        assert!(foreign.exists(), "must not remove a foreign PID entry");
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        let own = temp_path("pid-cleanup-own");
+        std::fs::write(&own, std::process::id().to_string()).unwrap();
+        cleanup_pid_file(&own);
+        assert!(!own.exists(), "must remove our own PID entry");
+    }
+
+    #[test]
+    fn test_process_alive_detects_live_and_dead_pids() {
+        assert!(process_alive(std::process::id()));
+        assert!(!process_alive(dead_pid()));
     }
 }

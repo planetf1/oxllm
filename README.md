@@ -21,7 +21,7 @@ Built to operate entirely in memory with zero local disk persistence, `oxllm` is
 * **Session Affinity**: Requests carrying a session key stay on one provider while it is healthy, keeping upstream prompt-prefix caches warm. Bounded LRU, idle TTL, automatic break-and-re-pin on failure.
 * **Optional Inbound Auth**: `server.api_keys` gates the public `/v1/*` routes behind constant-time `Authorization: Bearer` checks. Admin routes are always localhost-only.
 * **Raw Completions Route**: `POST /v1/completions` (with SSE streaming) for fill-in-the-middle clients such as editor autocomplete.
-* **Hot Config Reloading**: `SIGHUP` signal or `POST /reload` HTTP endpoint — parses updated `config.toml` and hot-swaps the provider pool via `tokio::sync::watch` without dropping connections.
+* **Hot Config Reloading**: the daemon watches `config.toml` and hot-reloads on change (invalid edits are rejected, the old config keeps serving). Also available on demand via `POST /reload` or `SIGHUP` — hot-swaps the provider pool via `tokio::sync::watch` without dropping connections.
 * **Local Stats Dashboard**: Every provider tracks request count, success count, token volumes, and last request time via lock-free atomics. Query via `oxllm status` or `curl /status` — no external collector needed.
 * **OOM-Proof Telemetry**: Bounded OTel event channel (1024 cap) with non-blocking `try_send` drops. If `otelite` is offline, telemetry degrades gracefully and the proxy keeps running.
 * **W3C Trace Context Propagation**: Extracts and injects `traceparent` headers for continuous trace spans.
@@ -298,12 +298,16 @@ oxllm provider offline <name>        # take a provider out of rotation
 oxllm provider online <name>         # re-enable a disabled provider
 oxllm provider reset <name>          # clear circuit breaker, failures, rate limit
 
-# Config hot-reload (SIGHUP)
-oxllm reload
+# Config hot-reload (automatic on file change; manual trigger below)
+oxllm reload                         # POST /reload on -p PORT (default 8080),
+                                     # or --pid <pid> to SIGHUP directly
 
 # Graceful stop (drains in-flight SSE streams)
 oxllm stop
 ```
+
+`oxllm reload` and `oxllm stop` exit non-zero when no daemon can be reached, so
+`edit && oxllm reload` chains fail loudly instead of silently doing nothing.
 
 ### Example `oxllm status` Output (after ~5 hours of real use)
 
