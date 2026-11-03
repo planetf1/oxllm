@@ -18,7 +18,8 @@ use oxllm_core::router::{
     AdaptivePriorityStrategy, LatencyCandidate, RoutingStrategy,
 };
 use oxllm_core::state::{
-    AppState, CircuitState, ModelStats, ProviderState, RouteCandidate, RoutingPolicy,
+    unix_millis, AppState, CircuitState, ModelStats, ProviderState, RequestRecord, RouteCandidate,
+    RoutingPolicy,
 };
 use oxllm_core::telemetry::{TelemetryClient, TelemetryEvent};
 
@@ -131,6 +132,7 @@ pub async fn get_status(
         circuit: String,
         failures: u32,
         rate_limited: bool,
+        admin_disabled: bool,
         requests: u64,
         successes: u64,
         tokens_input: u64,
@@ -159,11 +161,14 @@ pub async fn get_status(
 
     #[derive(Serialize)]
     struct StatusResponse {
+        version: &'static str,
         uptime_secs: u64,
         total_requests: u64,
+        reload: oxllm_core::state::ReloadHealthSnapshot,
         providers: Vec<ProviderStatus>,
         virtual_models: std::collections::HashMap<String, Vec<RouteEntry>>,
         routes: Vec<RouteSummary>,
+        recent_requests: Vec<oxllm_core::state::RequestRecord>,
     }
 
     let mut status_list = Vec::new();
@@ -227,6 +232,9 @@ pub async fn get_status(
             circuit: circuit_str,
             failures,
             rate_limited: is_limited,
+            admin_disabled: provider
+                .manual_disabled
+                .load(std::sync::atomic::Ordering::Relaxed),
             requests,
             successes,
             tokens_input,
@@ -319,12 +327,39 @@ pub async fn get_status(
     routes.sort_by(|a, b| a.route.cmp(&b.route));
 
     Json(StatusResponse {
+        version: env!("CARGO_PKG_VERSION"),
         uptime_secs: start_time.elapsed().as_secs(),
         total_requests,
+        reload: app_state.reload_health.snapshot(),
         providers: status_list,
         virtual_models,
         routes,
+        recent_requests: app_state.request_log.recent(50),
     })
+}
+
+/// GET /admin/tail (localhost-only): live SSE stream of request records as
+/// they complete. Returns a clear error when recording is disabled.
+pub async fn tail_requests(
+    State(app_state): State<Arc<AppState>>,
+) -> axum::response::sse::Sse<
+    impl futures_util::Stream<Item = Result<axum::response::sse::Event, axum::Error>>,
+> {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use futures_util::StreamExt;
+    use tokio_stream::wrappers::BroadcastStream;
+
+    let rx = app_state
+        .request_log
+        .subscribe()
+        .expect("tail_requests route checks enablement");
+    let stream = BroadcastStream::new(rx).filter_map(|item| async move {
+        // Lagged receivers just skip missed records; the ring is the source
+        // of truth for history.
+        item.ok()
+            .map(|rec| Ok(Event::default().json_data(rec).unwrap()))
+    });
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 /// Applies the configured routing policy to a resolved candidate list.
@@ -560,6 +595,7 @@ async fn proxy_request(
     let start_time = Instant::now();
     let mut last_upstream_error = String::new();
     let mut last_failed_provider = String::new();
+    let mut last_failed_model = String::new();
     let mut last_failed_status: u16 = 0;
 
     // Map candidate provider references for select strategy
@@ -662,6 +698,7 @@ async fn proxy_request(
                         selected.name.clone(),
                         selected.is_probe,
                         spec.operation,
+                        route_name.clone(),
                         target_model,
                         telemetry.clone(),
                         trace_id.clone(),
@@ -783,7 +820,7 @@ async fn proxy_request(
                 telemetry.emit(TelemetryEvent::RecordTransaction {
                     operation: spec.operation.to_string(),
                     provider: selected.name.clone(),
-                    model: target_model,
+                    model: target_model.clone(),
                     input_tokens,
                     output_tokens,
                     duration: start_time.elapsed(),
@@ -795,6 +832,22 @@ async fn proxy_request(
                 });
 
                 // Construct clean Axum response copying headers cleanly via bytes
+                app_state.request_log.record(RequestRecord {
+                    ts_ms: unix_millis(),
+                    endpoint: spec.operation.to_string(),
+                    route: route_name.clone(),
+                    model: target_model.clone(),
+                    provider: selected.name.clone(),
+                    status: status_code,
+                    attempts,
+                    latency_ms: start_time.elapsed().as_millis() as u64,
+                    // Non-streaming: the whole response is the first byte.
+                    ttft_ms: Some(start_time.elapsed().as_millis() as u64),
+                    streamed: false,
+                    error: None,
+                    request_id: request_id.clone(),
+                });
+
                 let mut response = Response::new(Body::from(res_body));
                 *response.status_mut() = StatusCode::OK;
                 copy_response_headers(&upstream_headers, response.headers_mut());
@@ -837,6 +890,7 @@ async fn proxy_request(
                 };
                 last_upstream_error = parsed_error;
                 last_failed_provider = selected.name.clone();
+                last_failed_model = target_model.clone();
                 last_failed_status = status_code;
 
                 let target_provider_state = app_state
@@ -865,6 +919,10 @@ async fn proxy_request(
                     spec.operation,
                     selected.name, e
                 );
+                last_upstream_error = e.to_string();
+                last_failed_provider = selected.name.clone();
+                last_failed_model = target_model.clone();
+                last_failed_status = 0;
                 let target_provider_state = app_state
                     .providers
                     .iter()
@@ -898,6 +956,20 @@ async fn proxy_request(
     if let Some(key) = session_key(&app_state, &headers, &payload).as_deref() {
         app_state.session_affinity.unpin(key);
     }
+    app_state.request_log.record(RequestRecord {
+        ts_ms: unix_millis(),
+        endpoint: spec.operation.to_string(),
+        route: route_name.clone(),
+        model: last_failed_model,
+        provider: last_failed_provider,
+        status: StatusCode::BAD_GATEWAY.as_u16(),
+        attempts,
+        latency_ms: start_time.elapsed().as_millis() as u64,
+        ttft_ms: None,
+        streamed: false,
+        error: Some(last_upstream_error),
+        request_id: request_id.clone(),
+    });
     json_error_response(&message, "server_error", StatusCode::BAD_GATEWAY)
 }
 
@@ -1021,6 +1093,7 @@ fn stream_upstream_body(
     provider_name: String,
     is_probe: bool,
     operation: &'static str,
+    route_name: String,
     model_name: String,
     telemetry: TelemetryClient,
     trace_id: Option<String>,
@@ -1086,8 +1159,8 @@ fn stream_upstream_body(
         // Push Telemetry Metrics
         telemetry.emit(TelemetryEvent::RecordTransaction {
             operation: operation.to_string(),
-            provider: provider_name,
-            model: model_name,
+            provider: provider_name.clone(),
+            model: model_name.clone(),
             input_tokens: 0,
             output_tokens: 0,
             duration,
@@ -1099,6 +1172,26 @@ fn stream_upstream_body(
             },
             trace_id,
             parent_span_id,
+            request_id: request_id.clone(),
+        });
+
+        // Record for the recent-request ring and live tails.
+        app_state.request_log.record(RequestRecord {
+            ts_ms: unix_millis(),
+            endpoint: operation.to_string(),
+            route: route_name,
+            model: model_name,
+            provider: provider_name,
+            status: if stream_success { status_code } else { 0 },
+            attempts,
+            latency_ms: duration.as_millis() as u64,
+            ttft_ms: None,
+            streamed: true,
+            error: if stream_success {
+                None
+            } else {
+                Some("stream failed".to_string())
+            },
             request_id,
         });
     });

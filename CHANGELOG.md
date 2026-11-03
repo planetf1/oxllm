@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Traffic visibility** (issue #12): a bounded in-memory ring of recent
+  request records (metadata only — never bodies; capacity via
+  `server.request_log_capacity`, default 256, `0` disables) surfaced three
+  ways: `recent_requests` in `/status`, a compact recent-requests table in
+  `oxllm status`, and `oxllm tail [-n N]` — the last N records followed by
+  a live SSE stream from the localhost-only `/admin/tail`. Records carry
+  endpoint, route, provider, model, status, attempts, latency, TTFT, and
+  terminal error. No new dependencies.
+- **`/status` reports the daemon `version`**, the last reload outcome
+  (`reload.last_error`, `reload.restart_warnings`), and per-provider
+  `admin_disabled` — `oxllm status` shows all three, and admin-offline
+  providers render as "Offline (admin)" in both CLI tables instead of
+  looking healthy while receiving no traffic.
+
 ## [0.1.23] - 2026-11-03
 
 ### Fixed

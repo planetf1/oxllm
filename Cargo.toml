@@ -27,7 +27,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 clap = { version = "4", features = ["derive", "env"] }
 axum = { version = "0.8", features = ["http1", "json", "matched-path"] }
 time = { version = "0.3", features = ["formatting", "parsing"] }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["sync"] }
 futures-util = "0.3"
 hex = "0.4"
 opentelemetry = { version = "0.28", features = ["trace", "metrics"] }

@@ -1,16 +1,169 @@
 use crate::config::{ServerConfig, VirtualModelTarget};
 use reqwest::Url;
-use std::collections::HashMap;
+use serde::Serialize;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
+
+/// Wall-clock milliseconds since the Unix epoch.
+pub fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CircuitState {
     Closed,
     Open { until: Instant },
     HalfOpen,
+}
+
+/// One completed (or terminally failed) client request, for the recent
+/// traffic log and live tail. Metadata only — request and response bodies
+/// are deliberately never captured.
+#[derive(Debug, Clone, Serialize)]
+pub struct RequestRecord {
+    /// Unix epoch milliseconds.
+    pub ts_ms: u64,
+    /// Endpoint family: "chat", "completions", "embeddings", "systemone".
+    pub endpoint: String,
+    /// Virtual model the request was routed through.
+    pub route: String,
+    /// Upstream model on the provider that served (or last failed) it.
+    pub model: String,
+    /// Provider that served the request, or the last one that failed.
+    pub provider: String,
+    /// Response status code; 0 when no response was produced.
+    pub status: u16,
+    /// Provider attempts used, including the successful/last one.
+    pub attempts: u32,
+    pub latency_ms: u64,
+    /// Time to first byte, when measured (non-streaming: full latency).
+    pub ttft_ms: Option<u64>,
+    pub streamed: bool,
+    /// Terminal failure reason, when the request failed.
+    pub error: Option<String>,
+    pub request_id: String,
+}
+
+/// Bounded ring of recent request records plus a live-tail broadcast.
+/// Recording is a short Mutex critical section over tiny, bounded data;
+/// the broadcast costs nothing when nobody is subscribed.
+#[derive(Debug)]
+pub struct RequestLog {
+    capacity: usize,
+    inner: std::sync::Mutex<VecDeque<RequestRecord>>,
+    tail: tokio::sync::broadcast::Sender<RequestRecord>,
+}
+
+impl Default for RequestLog {
+    fn default() -> Self {
+        Self::new(default_request_log_capacity())
+    }
+}
+
+fn default_request_log_capacity() -> usize {
+    256
+}
+
+impl RequestLog {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            inner: std::sync::Mutex::new(VecDeque::with_capacity(capacity.min(1024))),
+            tail: tokio::sync::broadcast::channel(capacity.max(16)).0,
+        }
+    }
+
+    /// A log with recording disabled (`server.request_log_capacity = 0`).
+    pub fn disabled() -> Self {
+        Self::new(0)
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.capacity > 0
+    }
+
+    /// Appends a record to the ring and broadcasts it to live tails.
+    pub fn record(&self, rec: RequestRecord) {
+        if self.capacity == 0 {
+            return;
+        }
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.len() == self.capacity {
+            inner.pop_front();
+        }
+        inner.push_back(rec.clone());
+        // Lagged or absent receivers are fine: the ring is the source of truth.
+        let _ = self.tail.send(rec);
+    }
+
+    /// The most recent `limit` records, oldest first.
+    pub fn recent(&self, limit: usize) -> Vec<RequestRecord> {
+        if self.capacity == 0 || limit == 0 {
+            return Vec::new();
+        }
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let skip = inner.len().saturating_sub(limit);
+        inner.iter().skip(skip).cloned().collect()
+    }
+
+    /// Live tail subscription; `None` when recording is disabled.
+    pub fn subscribe(&self) -> Option<tokio::sync::broadcast::Receiver<RequestRecord>> {
+        (self.capacity > 0).then(|| self.tail.subscribe())
+    }
+}
+
+/// Outcome of the last config reload attempt, for /status: operators need
+/// to see whether an edit applied, was rejected, or still needs a restart.
+#[derive(Debug)]
+pub struct ReloadHealth {
+    inner: std::sync::Mutex<ReloadHealthSnapshot>,
+}
+
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct ReloadHealthSnapshot {
+    /// Unix epoch milliseconds of the last reload attempt.
+    pub last_attempt_ms: Option<u64>,
+    /// Unix epoch milliseconds of the last successful reload.
+    pub last_success_ms: Option<u64>,
+    /// Rejection reason of the last failed reload, if any.
+    pub last_error: Option<String>,
+    /// Restart-required warnings carried by the last successful reload.
+    pub restart_warnings: Vec<String>,
+}
+
+impl Default for ReloadHealth {
+    fn default() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(ReloadHealthSnapshot::default()),
+        }
+    }
+}
+
+impl ReloadHealth {
+    pub fn record_success(&self, restart_warnings: Vec<String>) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let now = unix_millis();
+        inner.last_attempt_ms = Some(now);
+        inner.last_success_ms = Some(now);
+        inner.last_error = None;
+        inner.restart_warnings = restart_warnings;
+    }
+
+    pub fn record_failure(&self, reason: &str) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.last_attempt_ms = Some(unix_millis());
+        inner.last_error = Some(reason.to_string());
+    }
+
+    pub fn snapshot(&self) -> ReloadHealthSnapshot {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
 }
 
 #[derive(Debug)]
@@ -408,6 +561,10 @@ pub struct AppState {
     /// The server section this state was built from. Hot-reload diffs
     /// against it to warn when a change cannot apply without a restart.
     pub server: ServerConfig,
+    /// Outcome of the last reload, surfaced via /status.
+    pub reload_health: Arc<ReloadHealth>,
+    /// Bounded ring of recent requests plus the live-tail broadcast.
+    pub request_log: Arc<RequestLog>,
 }
 
 /// How a virtual model picks among its healthy candidates.

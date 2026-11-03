@@ -25,6 +25,7 @@ Built to operate entirely in memory with zero local disk persistence, `oxllm` is
 * **Hot Config Reloading**: the daemon watches `config.toml` and hot-reloads on change (invalid edits are rejected, the old config keeps serving). Also available on demand via `POST /reload` or `SIGHUP` — hot-swaps the provider pool via `tokio::sync::watch` without dropping connections, preserving circuit state, counters, and session pins for providers that keep their name.
 * **Model Aliases & Default Route**: `[aliases]` maps client-facing names (`gpt-4o = "smart"`) onto virtual models, and `server.default_model` routes unknown names instead of 400 — point unmodified OpenAI clients straight at it.
 * **Local Stats Dashboard**: Every provider tracks request count, success count, token volumes, and last request time via lock-free atomics. Query via `oxllm status` or `curl /status` — no external collector needed.
+* **Traffic Visibility**: a bounded in-memory ring of recent request records (metadata only) plus `oxllm tail` for a live stream — route, provider, attempts, status, latency, TTFT per request, no collector needed.
 * **OOM-Proof Telemetry**: Bounded OTel event channel (1024 cap) with non-blocking `try_send` drops. If `otelite` is offline, telemetry degrades gracefully and the proxy keeps running.
 * **W3C Trace Context Propagation**: Extracts and injects `traceparent` headers for continuous trace spans.
 * **Dual-Stack IPv4/IPv6**: Configurable via `bind_family`: `"ipv4"` (default), `"ipv6"`, or `"dual"` for both.
@@ -208,6 +209,7 @@ oxllm serve --config config-local-test.toml
 | `bind_family` | `"ipv4"` | Address family: `"ipv4"`, `"ipv6"`, or `"dual"` (both) |
 | `shutdown_timeout_secs` | `30` | Graceful-shutdown deadline after SIGTERM/SIGINT: in-flight requests drain until it expires, then the process exits anyway. `0` waits indefinitely. |
 | `watch_config` | `true` | Watch the config file and hot-reload on change. Disable on flash-storage edge targets, or to make reloads strictly manual. |
+| `request_log_capacity` | `256` | Recent request records kept in memory for `oxllm status` / `oxllm tail` (metadata only). `0` disables. Applies at startup. |
 | `circuit_failure_threshold` | `3` | Consecutive failures before a provider's circuit opens. Lower it for twitchy free-tier upstreams. |
 | `circuit_base_cooldown_secs` | `60` | Base circuit-open cooldown; doubles per failure beyond the threshold. |
 | `rate_limit_fallback_secs` | `30` | Rate-limit cooldown when a 429 carries no `Retry-After`. |
@@ -305,6 +307,41 @@ pinned provider's circuit trips, the session re-routes by policy immediately
 and re-pins to whatever serves it. Keyless traffic is unaffected and keeps
 rotating by policy.
 
+### Traffic Visibility
+
+A bounded ring of recent request records (metadata only: timestamp, endpoint,
+route, provider, model, status, attempts, latency, TTFT, error, request id —
+never bodies) is kept in memory (`server.request_log_capacity`, default 256):
+
+- `oxllm status` renders the most recent records, plus the daemon version and
+  the last reload outcome (failures and pending restart-required warnings).
+- `oxllm tail [-n N]` prints the last N records and then follows live traffic
+  over a localhost-only SSE stream; plain lines, so `grep`/`jq` compose.
+- Admin-offline providers show as "Offline (admin)" instead of looking healthy.
+
+### Decision Endpoints (/v1/systemone)
+
+llama.cpp decision models (typed choice/score questions answered in one
+forward pass) route through the provider pool like chat. Point a virtual
+model at decision-capable providers and POST to `/v1/systemone`:
+
+```toml
+[virtual_models]
+route-decisions = [
+  { provider = "llamacpp-local", model = "Kev-4B-Q4_K_M" },
+  { provider = "hosted-jev",     model = "jev" },
+]
+```
+
+```sh
+curl -X POST http://127.0.0.1:8080/v1/systemone \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"route-decisions","state":"router","questions":[...]}'
+```
+
+Model rewrite per target, circuit breaking, and failover all apply; the
+response passes through verbatim.
+
 ### Status & Metrics
 
 `oxllm status` prints per-virtual-model routing tables, a per-route rollup with
@@ -337,7 +374,12 @@ oxllm serve -vv                      # trace: full request/response dump
 oxllm validate                       # checks env vars, provider cross-refs
 
 # Live dashboard (no external collector needed)
-oxllm status                         # virtual model routing table + per-provider counters
+oxllm status                         # version, routing tables, counters, recent requests
+oxllm status --host router.lan       # against a remote daemon (OXLLM_HOST/OXLLM_PORT)
+
+# Watch traffic as it happens (Ctrl-C to stop)
+oxllm tail                           # live stream of request records
+oxllm tail -n 20                     # last 20 records, then follow live traffic
 
 # Manage providers at runtime
 oxllm provider list                  # condensed provider status table

@@ -229,7 +229,7 @@ The binary supports clean POSIX subcommands for daemon management and operationa
 * `oxllm reload` (Asks the running daemon to reload via `POST /reload` on `-p PORT` (default 8080); prints the daemon's error and exits non-zero if the config is rejected or no daemon is running. `--pid <pid>` signals a chosen process with SIGHUP instead)
 
 ### 5.2. Admin Route Protection
-To prevent external network actors from auditing provider credentials or configurations, all administrative endpoints (like `/status`, `/health`, `/reload`, and `/admin/providers/*`) are **localhost-restricted**. The `localhost_only` middleware accepts both IPv4 loopback (`127.0.0.1`) and IPv6-mapped IPv4 addresses (e.g., `::ffff:127.0.0.1`, added in v0.1.8). External callers receive an immediate `403 Forbidden`.
+To prevent external network actors from auditing provider credentials or configurations, all administrative endpoints (like `/status`, `/health`, `/reload`, `/admin/tail`, and `/admin/providers/*`) are **localhost-restricted**. `/admin/tail` streams recent request records (metadata only) over SSE for `oxllm tail`. The `localhost_only` middleware accepts both IPv4 loopback (`127.0.0.1`) and IPv6-mapped IPv4 addresses (e.g., `::ffff:127.0.0.1`, added in v0.1.8). External callers receive an immediate `403 Forbidden`.
 
 ### 5.3. Cross-Origin Resource Sharing (CORS)
 All public endpoints (`/v1/chat/completions`, `/v1/embeddings`, `/v1/models`) return

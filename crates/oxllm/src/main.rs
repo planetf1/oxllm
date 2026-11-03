@@ -20,7 +20,7 @@ use tower_http::cors::{Any, CorsLayer};
 
 use oxllm_core::config::{Config, ServerConfig};
 use oxllm_core::state::{
-    AppState, CircuitConfig, CircuitState, ModelStats, ProviderState, RoutingPolicy,
+    AppState, CircuitConfig, CircuitState, ModelStats, ProviderState, RequestLog, RoutingPolicy,
     SessionAffinity,
 };
 use oxllm_core::telemetry::{TelemetryClient, TelemetryWorker};
@@ -132,6 +132,18 @@ enum Commands {
     },
     /// Stops and removes the installed oxllm service
     Uninstall,
+    /// Streams live request records from the running daemon (Ctrl-C to stop)
+    Tail {
+        /// Host of the running gateway server
+        #[arg(long, default_value = "127.0.0.1", env = "OXLLM_HOST")]
+        host: String,
+        /// Port of the running gateway server
+        #[arg(short, long, default_value_t = 8080, env = "OXLLM_PORT")]
+        port: u16,
+        /// Print the N most recent records before following live traffic
+        #[arg(short, long, default_value_t = 0)]
+        recent: usize,
+    },
     /// Manage providers (list, offline, online, reset)
     #[command(subcommand)]
     Provider(ProviderCommand),
@@ -313,6 +325,7 @@ fn build_app_state(config: Config, previous: Option<&AppState>) -> Result<AppSta
         .collect();
 
     let upstream_timeout_secs = config.server.upstream_timeout_secs;
+    let request_log_capacity = config.server.request_log_capacity;
     Ok(AppState {
         providers,
         virtual_models: config.virtual_models,
@@ -341,6 +354,14 @@ fn build_app_state(config: Config, previous: Option<&AppState>) -> Result<AppSta
             }),
         session_affinity_header: config.server.session_affinity_header.clone(),
         server: config.server,
+        reload_health: previous
+            .map(|p| p.reload_health.clone())
+            .unwrap_or_default(),
+        // The ring carries across reloads (like session affinity); a capacity
+        // change needs a restart and is covered by the restart warnings.
+        request_log: previous
+            .map(|p| p.request_log.clone())
+            .unwrap_or_else(|| Arc::new(RequestLog::new(request_log_capacity))),
         http_client,
         upstream_timeout_secs,
     })
@@ -641,6 +662,12 @@ fn server_config_restart_warnings(old: &ServerConfig, new: &ServerConfig) -> Vec
         old.watch_config.to_string(),
         new.watch_config.to_string(),
     );
+    note(
+        old.request_log_capacity != new.request_log_capacity,
+        "request_log_capacity",
+        old.request_log_capacity.to_string(),
+        new.request_log_capacity.to_string(),
+    );
     warnings
 }
 
@@ -654,17 +681,32 @@ fn reload_config(
     sender: &tokio::sync::watch::Sender<Arc<AppState>>,
 ) -> Result<Vec<String>, String> {
     let previous = sender.borrow().clone();
-    let config =
-        Config::load_from_file(config_path).map_err(|e| format!("Failed to load config: {}", e))?;
-    config
-        .validate()
-        .map_err(|e| format!("Config validation failed: {}", e))?;
+    let config = match Config::load_from_file(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            let reason = format!("Failed to load config: {}", e);
+            previous.reload_health.record_failure(&reason);
+            return Err(reason);
+        },
+    };
+    if let Err(e) = config.validate() {
+        let reason = format!("Config validation failed: {}", e);
+        previous.reload_health.record_failure(&reason);
+        return Err(reason);
+    }
     let warnings = server_config_restart_warnings(&previous.server, &config.server);
-    let new_state = build_app_state(config, Some(&previous))
-        .map_err(|e| format!("Failed to build state: {}", e))?;
+    let new_state = match build_app_state(config, Some(&previous)) {
+        Ok(state) => state,
+        Err(e) => {
+            let reason = format!("Failed to build state: {}", e);
+            previous.reload_health.record_failure(&reason);
+            return Err(reason);
+        },
+    };
     sender
         .send(Arc::new(new_state))
         .map_err(|e| format!("Failed to update watch channel: {}", e))?;
+    previous.reload_health.record_success(warnings.clone());
     Ok(warnings)
 }
 
@@ -895,6 +937,10 @@ async fn run_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         .route(
             "/admin/providers/{name}/reset",
             post(routes::admin_reset).layer(middleware::from_fn(localhost_only)),
+        )
+        .route(
+            "/admin/tail",
+            get(routes::tail_requests).layer(middleware::from_fn(localhost_only)),
         )
         .layer(middleware::from_fn(add_request_id))
         .layer(
@@ -1178,6 +1224,8 @@ async fn run_status(
         circuit: String,
         failures: u32,
         rate_limited: bool,
+        #[serde(default)]
+        admin_disabled: bool,
         requests: u64,
         successes: u64,
         tokens_input: u64,
@@ -1217,25 +1265,52 @@ async fn run_status(
         ttft_p50_ms: Option<u64>,
     }
 
+    #[derive(serde::Deserialize, Default)]
+    struct ReloadHealth {
+        #[serde(default)]
+        last_error: Option<String>,
+        #[serde(default)]
+        restart_warnings: Vec<String>,
+    }
+
     #[derive(serde::Deserialize)]
     struct StatusResponse {
+        #[serde(default)]
+        version: Option<String>,
         uptime_secs: u64,
         total_requests: u64,
+        #[serde(default)]
+        reload: ReloadHealth,
         providers: Vec<ProviderStatus>,
         virtual_models: std::collections::HashMap<String, Vec<RouteEntry>>,
         #[serde(default)]
         routes: Vec<RouteSummary>,
+        #[serde(default)]
+        recent_requests: Vec<serde_json::Value>,
     }
 
     let status: StatusResponse = serde_json::from_str(&body)?;
     let max_width = status_width(width_override);
 
     println!(
-        "\nUptime: {}m {}s  |  Total Requests: {}",
+        "\nDaemon: {}  |  Uptime: {}m {}s  |  Total Requests: {}",
+        status
+            .version
+            .as_deref()
+            .unwrap_or("unknown (daemon older than v0.1.24)"),
         status.uptime_secs / 60,
         status.uptime_secs % 60,
         status.total_requests
     );
+    if let Some(error) = &status.reload.last_error {
+        println!(
+            "Last reload FAILED, previous config still serving: {}",
+            error
+        );
+    }
+    for warning in &status.reload.restart_warnings {
+        println!("Reload warning: {}", warning);
+    }
 
     // Per-virtual-model routing tables. Counters are per (provider, model), so
     // two virtual models backed by different models on one provider no longer
@@ -1415,7 +1490,11 @@ async fn run_status(
             vec![
                 s.name.clone(),
                 s.models.clone(),
-                s.circuit.clone(),
+                if s.admin_disabled {
+                    "Offline (admin)".to_string()
+                } else {
+                    s.circuit.clone()
+                },
                 s.failures.to_string(),
                 if s.rate_limited { "Yes" } else { "No" }.to_string(),
                 s.requests.to_string(),
@@ -1485,6 +1564,13 @@ async fn run_status(
             max_width,
         )
     );
+
+    if !status.recent_requests.is_empty() {
+        println!("\nRecent Requests (last {})", status.recent_requests.len());
+        for rec in status.recent_requests.iter().rev().take(10) {
+            print_request_record(rec);
+        }
+    }
     println!();
 
     Ok(())
@@ -1669,6 +1755,112 @@ fn run_install(config_path: PathBuf, force: bool) -> Result<(), Box<dyn std::err
 
 /// Stops and removes the installed user-level service. Removing nothing
 /// (never installed, or already removed) is a success.
+/// Prints the N most recent request records, then follows the daemon's
+/// live tail (GET /admin/tail, SSE) until interrupted.
+async fn run_tail(host: &str, port: u16, recent: usize) -> Result<(), Box<dyn std::error::Error>> {
+    let client = reqwest::Client::new();
+    let base = cli_base_url(host, port);
+
+    if recent > 0 {
+        let res = client.get(format!("{}/status", base)).send().await?;
+        let body = res.text().await?;
+        let status: serde_json::Value = serde_json::from_str(&body)?;
+        if let Some(records) = status["recent_requests"].as_array() {
+            let skip = records.len().saturating_sub(recent);
+            for rec in records.iter().skip(skip) {
+                print_request_record(rec);
+            }
+        }
+    }
+
+    // Follow the live stream. A disabled request log answers with an error
+    // JSON instead of an SSE stream.
+    let res = match client.get(format!("{}/admin/tail", base)).send().await {
+        Ok(r) => r,
+        Err(e) if e.is_connect() => {
+            println!("oxllm is not running on {}", base);
+            println!("Start it with: oxllm serve");
+            std::process::exit(1);
+        },
+        Err(e) => return Err(e.into()),
+    };
+    let content_type = res
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    if !content_type.starts_with("text/event-stream") {
+        let body = res.text().await?;
+        println!("{}", body);
+        std::process::exit(1);
+    }
+
+    let mut res = res;
+    let mut buf = String::new();
+    while let Some(chunk) = res.chunk().await? {
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+        // SSE events are separated by blank lines; process only complete ones.
+        while let Some(pos) = buf.find("\n\n") {
+            let event: String = buf.drain(..pos + 2).collect();
+            for line in event.lines() {
+                if let Some(data) = line.strip_prefix("data: ") {
+                    if let Ok(rec) = serde_json::from_str::<serde_json::Value>(data) {
+                        print_request_record(&rec);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Renders one request record as a compact single line.
+fn print_request_record(rec: &serde_json::Value) {
+    let ts = rec["ts_ms"].as_u64().unwrap_or(0) / 1000;
+    let (h, m, sec) = ((ts / 3600) % 24, (ts / 60) % 60, ts % 60);
+    let endpoint = rec["endpoint"].as_str().unwrap_or("?");
+    let route = rec["route"].as_str().unwrap_or("?");
+    let provider = rec["provider"].as_str().unwrap_or("-");
+    let status = rec["status"].as_u64().unwrap_or(0);
+    let latency = rec["latency_ms"].as_u64().unwrap_or(0);
+    let attempts = rec["attempts"].as_u64().unwrap_or(1);
+    let ttft = rec["ttft_ms"].as_u64();
+    let error = rec["error"].as_str();
+
+    let mut line = format!(
+        "{:02}:{:02}:{:02}  {:<10} {:<18} {:<18} {:>3} {:>6}ms",
+        h,
+        m,
+        sec,
+        endpoint,
+        truncate_str(route, 18),
+        truncate_str(provider, 18),
+        status,
+        latency
+    );
+    if let Some(ttft) = ttft {
+        line.push_str(&format!("  ttft {}ms", ttft));
+    }
+    if attempts > 1 {
+        line.push_str(&format!("  attempt {}", attempts));
+    }
+    if let Some(error) = error {
+        line.push_str(&format!("  {}", truncate_str(error, 60)));
+    }
+    println!("{}", line);
+}
+
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+        out.push('\u{2026}');
+        out
+    }
+}
+
 fn run_uninstall() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "macos")]
     uninstall_launchd()?;
@@ -1989,8 +2181,17 @@ async fn run_provider_list(
     }
 
     #[derive(serde::Deserialize)]
+    struct ProviderAdminState {
+        name: String,
+        #[serde(default)]
+        admin_disabled: bool,
+    }
+
+    #[derive(serde::Deserialize)]
     struct StatusResponse {
         virtual_models: std::collections::HashMap<String, Vec<RouteEntry>>,
+        #[serde(default)]
+        providers: Vec<ProviderAdminState>,
     }
 
     if json {
@@ -2025,10 +2226,18 @@ async fn run_provider_list(
             } else {
                 '✗'
             };
+            let admin_offline = status
+                .providers
+                .iter()
+                .any(|p| p.name == entry.provider && p.admin_disabled);
             vec![
                 format!("{} {}", icon, entry.provider),
                 entry.model.clone(),
-                entry.circuit.clone(),
+                if admin_offline {
+                    "Offline (admin)".to_string()
+                } else {
+                    entry.circuit.clone()
+                },
                 entry.requests.to_string(),
                 entry.successes.to_string(),
             ]
@@ -2122,6 +2331,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         Commands::Uninstall => {
             run_uninstall()?;
+        },
+        Commands::Tail { host, port, recent } => {
+            run_tail(&host, port, recent).await?;
         },
         Commands::Provider(cmd) => match cmd {
             ProviderCommand::List { host, port, json } => {
@@ -2263,6 +2475,8 @@ mod integration_tests {
             default_model: None,
             circuit: CircuitConfig::default(),
             server: test_server_config(),
+            reload_health: Default::default(),
+            request_log: Default::default(),
             route_stats: Arc::new(ModelStats::default()),
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
@@ -2375,6 +2589,8 @@ mod integration_tests {
             default_model: None,
             circuit: CircuitConfig::default(),
             server: test_server_config(),
+            reload_health: Default::default(),
+            request_log: Default::default(),
             route_stats: Arc::new(ModelStats::default()),
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
@@ -2549,6 +2765,8 @@ mod integration_tests {
             default_model: None,
             circuit: CircuitConfig::default(),
             server: test_server_config(),
+            reload_health: Default::default(),
+            request_log: Default::default(),
             route_stats: Arc::new(ModelStats::default()),
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
@@ -2765,6 +2983,8 @@ mod integration_tests {
             default_model: None,
             circuit: CircuitConfig::default(),
             server: test_server_config(),
+            reload_health: Default::default(),
+            request_log: Default::default(),
             route_stats: Arc::new(ModelStats::default()),
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
@@ -2912,6 +3132,8 @@ mod integration_tests {
             default_model: None,
             circuit: CircuitConfig::default(),
             server: test_server_config(),
+            reload_health: Default::default(),
+            request_log: Default::default(),
             route_stats: Arc::new(ModelStats::default()),
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
@@ -3050,6 +3272,8 @@ mod integration_tests {
             default_model: None,
             circuit: CircuitConfig::default(),
             server: test_server_config(),
+            reload_health: Default::default(),
+            request_log: Default::default(),
             route_stats: Arc::new(ModelStats::default()),
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
@@ -3262,6 +3486,8 @@ mod integration_tests {
             default_model: None,
             circuit: CircuitConfig::default(),
             server: test_server_config(),
+            reload_health: Default::default(),
+            request_log: Default::default(),
             route_stats: Arc::new(ModelStats::default()),
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
@@ -3413,6 +3639,8 @@ mod integration_tests {
             default_model: None,
             circuit: CircuitConfig::default(),
             server: test_server_config(),
+            reload_health: Default::default(),
+            request_log: Default::default(),
             route_stats: Arc::new(ModelStats::default()),
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
@@ -3526,6 +3754,8 @@ mod integration_tests {
             default_model: None,
             circuit: CircuitConfig::default(),
             server: test_server_config(),
+            reload_health: Default::default(),
+            request_log: Default::default(),
             route_stats: Arc::new(ModelStats::default()),
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
@@ -3661,6 +3891,8 @@ mod integration_tests {
             default_model: None,
             circuit: CircuitConfig::default(),
             server: test_server_config(),
+            reload_health: Default::default(),
+            request_log: Default::default(),
             route_stats: Arc::new(ModelStats::default()),
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
@@ -3769,6 +4001,8 @@ mod integration_tests {
             default_model: None,
             circuit: CircuitConfig::default(),
             server: test_server_config(),
+            reload_health: Default::default(),
+            request_log: Default::default(),
             route_stats: Arc::new(ModelStats::default()),
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
@@ -3868,6 +4102,8 @@ mod integration_tests {
             default_model: None,
             circuit: CircuitConfig::default(),
             server: test_server_config(),
+            reload_health: Default::default(),
+            request_log: Default::default(),
             route_stats: Arc::new(ModelStats::default()),
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
@@ -3980,6 +4216,8 @@ mod integration_tests {
             default_model: None,
             circuit: CircuitConfig::default(),
             server: test_server_config(),
+            reload_health: Default::default(),
+            request_log: Default::default(),
             route_stats: Arc::new(ModelStats::default()),
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
@@ -4106,6 +4344,8 @@ mod integration_tests {
             )),
             session_affinity_header: oxllm_core::state::DEFAULT_SESSION_HEADER.to_string(),
             server: test_server_config(),
+            reload_health: Default::default(),
+            request_log: Default::default(),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -4537,6 +4777,7 @@ mod integration_tests {
             rate_limit_fallback_secs: 30,
             shutdown_timeout_secs: 30,
             watch_config: true,
+            request_log_capacity: 256,
             default_model: None,
         }
     }
@@ -5167,6 +5408,8 @@ vm = [
             )),
             session_affinity_header: oxllm_core::state::DEFAULT_SESSION_HEADER.to_string(),
             server: test_server_config(),
+            reload_health: Default::default(),
+            request_log: Default::default(),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -5384,6 +5627,8 @@ vm = [
             )),
             session_affinity_header: "".to_string(),
             server: test_server_config(),
+            reload_health: Default::default(),
+            request_log: Default::default(),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -5513,6 +5758,8 @@ vm = [
             )),
             session_affinity_header: "".to_string(),
             server: test_server_config(),
+            reload_health: Default::default(),
+            request_log: Default::default(),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -5556,6 +5803,226 @@ vm = [
             "the configured-first provider must serve despite being slower"
         );
         assert_eq!(recorded_b.lock().await.len(), 0);
+    }
+
+    /// /status reports the daemon version, the last reload outcome (with
+    /// restart warnings), and the recent-request ring; a proxied request
+    /// lands in the ring with route, provider, attempts, and status
+    /// (issue #12 + status gaps).
+    #[tokio::test]
+    async fn test_status_reports_version_reload_health_and_records() {
+        let path = temp_path("status-rich.toml");
+        std::fs::write(&path, test_config_toml("prov-a")).unwrap();
+        let config = Config::load_from_file(&path).unwrap();
+        let initial = Arc::new(build_app_state(config, None).unwrap());
+        let (sender, receiver) = tokio::sync::watch::channel(initial);
+        let (ttx, _trx) = tokio::sync::mpsc::channel(1024);
+        let rs = ReloadableState {
+            app_state: receiver,
+            telemetry: TelemetryClient::new(ttx),
+            start_time: Instant::now(),
+            reloader: Reloader {
+                sender,
+                config_path: path.clone(),
+            },
+        };
+
+        let router = axum::Router::new()
+            .route("/reload", axum::routing::post(handle_http_reload))
+            .route("/status", axum::routing::get(routes::get_status))
+            .with_state(rs);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+
+        // Version is reported.
+        let status: Value = client
+            .get(format!("{}/status", base))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(status["version"], env!("CARGO_PKG_VERSION"));
+
+        // A failed reload is visible.
+        std::fs::write(&path, test_config_toml_dangling_reference()).unwrap();
+        let res = client
+            .post(format!("{}/reload", base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 400);
+        let status: Value = client
+            .get(format!("{}/status", base))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let error = status["reload"]["last_error"]
+            .as_str()
+            .expect("reload failure must be reported");
+        assert!(error.contains("missing-prov"), "got: {}", error);
+
+        // A successful reload with a restart-only change reports warnings.
+        let changed = test_config_toml("prov-a").replace("port = 18099", "port = 18098");
+        std::fs::write(&path, changed).unwrap();
+        let res = client
+            .post(format!("{}/reload", base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let status: Value = client
+            .get(format!("{}/status", base))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            status["reload"]["last_error"].is_null(),
+            "successful reload must clear the error"
+        );
+        let warnings = status["reload"]["restart_warnings"]
+            .as_array()
+            .expect("restart warnings");
+        assert!(warnings
+            .iter()
+            .any(|w| w.as_str().unwrap_or("").contains("server.port")));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A proxied request lands in the recent-request ring, and the live
+    /// tail SSE stream carries it (issue #12).
+    #[tokio::test]
+    async fn test_request_ring_and_live_tail() {
+        let upstream_body = r#"{\"choices\":[{\"index\":0,\"text\":\"ok\",\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1,\"total_tokens\":4}}\"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            upstream_body.len(),
+            upstream_body
+        );
+        let recorded = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let addr = spawn_recording_upstream(vec![response], recorded).await;
+
+        let (_app_state, rs) = build_test_state(addr);
+        let router = axum::Router::new()
+            .route(
+                "/v1/completions",
+                axum::routing::post(routes::create_completions),
+            )
+            .route("/status", axum::routing::get(routes::get_status))
+            .route("/admin/tail", axum::routing::get(routes::tail_requests))
+            .layer(middleware::from_fn(add_request_id))
+            .with_state(rs);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+
+        // Subscribe to the tail before the request completes.
+        let mut tail = client
+            .get(format!("{}/admin/tail", base))
+            .send()
+            .await
+            .unwrap();
+        assert!(tail
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .starts_with("text/event-stream"));
+
+        let res = client
+            .post(format!("{}/v1/completions", base))
+            .json(&serde_json::json!({"model": "test", "prompt": "x"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+
+        // The ring has the record.
+        let status: Value = client
+            .get(format!("{}/status", base))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let recs = status["recent_requests"].as_array().expect("records");
+        let rec = recs.last().expect("one record");
+        assert_eq!(rec["route"], "test");
+        assert_eq!(rec["provider"], "prov");
+        assert_eq!(rec["status"], 200);
+        assert_eq!(rec["attempts"], 1);
+        assert_eq!(rec["endpoint"], "completions");
+        assert_eq!(rec["model"], "model");
+
+        // The tail stream delivered it as an SSE data event.
+        let mut seen = String::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !seen.contains("\"route\":\"test\"") {
+            match tokio::time::timeout(Duration::from_secs(2), tail.chunk()).await {
+                Ok(Ok(Some(chunk))) => seen.push_str(&String::from_utf8_lossy(&chunk)),
+                Ok(Ok(None)) => break,
+                Ok(Err(e)) => panic!("tail stream error: {}", e),
+                Err(_) => {},
+            }
+        }
+        assert!(
+            seen.contains("\"route\":\"test\""),
+            "tail stream must carry the record, got: {}",
+            seen
+        );
+    }
+
+    /// Admin-offline providers are visible in /status (admin_disabled) —
+    /// previously they looked healthy while receiving no traffic.
+    #[tokio::test]
+    async fn test_status_reports_admin_offline() {
+        let response =
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}";
+        let recorded = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let addr = spawn_recording_upstream(vec![response.to_string()], recorded).await;
+
+        let (app_state, rs) = build_test_state(addr);
+        app_state.providers[0]
+            .manual_disabled
+            .store(true, std::sync::atomic::Ordering::Release);
+        drop(app_state);
+
+        let router = axum::Router::new()
+            .route("/status", axum::routing::get(routes::get_status))
+            .with_state(rs);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let status: Value = reqwest::Client::new()
+            .get(format!("{}/status", base))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(status["providers"][0]["admin_disabled"], true);
     }
 
     #[tokio::test]

@@ -53,6 +53,11 @@ pub struct ServerConfig {
     /// strictly manual (SIGHUP / POST /reload).
     #[serde(default = "default_watch_config")]
     pub watch_config: bool,
+    /// How many recent request records the daemon keeps in memory for
+    /// /status and `oxllm tail` (metadata only, ~200 bytes each). `0`
+    /// disables recording. Applies at startup.
+    #[serde(default = "default_request_log_capacity")]
+    pub request_log_capacity: usize,
     /// Virtual model that serves requests naming an unknown model, instead
     /// of returning 400. `None` (default) keeps unknown models an error.
     #[serde(default)]
@@ -263,6 +268,10 @@ fn default_shutdown_timeout_secs() -> u64 {
 
 fn default_watch_config() -> bool {
     true
+}
+
+fn default_request_log_capacity() -> usize {
+    256
 }
 
 fn default_upstream_timeout() -> u64 {
