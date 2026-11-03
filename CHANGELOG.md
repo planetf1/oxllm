@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.19] - 2026-11-03
+
 ### Added
 - **Model aliases** (`[aliases]` table) and `server.default_model`:
   unmodified OpenAI clients can address virtual models by the names they
