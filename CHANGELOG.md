@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.23] - 2026-11-03
+
 ### Fixed
 - **Critical: the daemon restart-looped every `shutdown_timeout_secs`**:
   the v0.1.19 graceful-shutdown deadline wrapped `tokio::time::timeout`
