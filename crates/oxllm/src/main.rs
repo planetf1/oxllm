@@ -86,8 +86,11 @@ enum Commands {
         #[arg(short, long, default_value = "config.toml", env = "OXLLM_CONFIG")]
         config: PathBuf,
     },
-    /// Fetches and displays the active health and circuit status from localhost
+    /// Fetches and displays the active health and circuit status
     Status {
+        /// Host of the running gateway server
+        #[arg(long, default_value = "127.0.0.1", env = "OXLLM_HOST")]
+        host: String,
         /// Port of the running gateway server
         #[arg(short, long, default_value_t = 8080, env = "OXLLM_PORT")]
         port: u16,
@@ -100,6 +103,9 @@ enum Commands {
     },
     /// Triggers hot-reload on the running gateway (POST /reload, or SIGHUP via --pid)
     Reload {
+        /// Host of the running gateway server
+        #[arg(long, default_value = "127.0.0.1", env = "OXLLM_HOST")]
+        host: String,
         /// Port of the running gateway server
         #[arg(short, long, default_value_t = 8080, env = "OXLLM_PORT")]
         port: u16,
@@ -135,6 +141,9 @@ enum Commands {
 enum ProviderCommand {
     /// List all providers and their circuit state
     List {
+        /// Host of the running gateway server
+        #[arg(long, default_value = "127.0.0.1", env = "OXLLM_HOST")]
+        host: String,
         /// Port of the running gateway server
         #[arg(short, long, default_value_t = 8080, env = "OXLLM_PORT")]
         port: u16,
@@ -146,6 +155,9 @@ enum ProviderCommand {
     Offline {
         /// Name of the provider to take offline
         name: String,
+        /// Host of the running gateway server
+        #[arg(long, default_value = "127.0.0.1", env = "OXLLM_HOST")]
+        host: String,
         /// Port of the running gateway server
         #[arg(short, long, default_value_t = 8080, env = "OXLLM_PORT")]
         port: u16,
@@ -154,6 +166,9 @@ enum ProviderCommand {
     Online {
         /// Name of the provider to bring online
         name: String,
+        /// Host of the running gateway server
+        #[arg(long, default_value = "127.0.0.1", env = "OXLLM_HOST")]
+        host: String,
         /// Port of the running gateway server
         #[arg(short, long, default_value_t = 8080, env = "OXLLM_PORT")]
         port: u16,
@@ -162,6 +177,9 @@ enum ProviderCommand {
     Reset {
         /// Name of the provider to reset
         name: String,
+        /// Host of the running gateway server
+        #[arg(long, default_value = "127.0.0.1", env = "OXLLM_HOST")]
+        host: String,
         /// Port of the running gateway server
         #[arg(short, long, default_value_t = 8080, env = "OXLLM_PORT")]
         port: u16,
@@ -1102,13 +1120,25 @@ fn status_width(override_width: Option<usize>) -> usize {
         .max(40)
 }
 
+/// CLI-side base URL: brackets IPv6 literals so `http://[::1]:8080/...`
+/// is well-formed (issue #9).
+fn cli_base_url(host: &str, port: u16) -> String {
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{}]", host)
+    } else {
+        host.to_string()
+    };
+    format!("http://{}:{}", host, port)
+}
+
 async fn run_status(
+    host: &str,
     port: u16,
     json: bool,
     width_override: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
-    let url = format!("http://127.0.0.1:{}/status", port);
+    let url = format!("{}/status", cli_base_url(host, port));
     let res = match client.get(&url).send().await {
         Ok(r) => r,
         Err(e) if e.is_connect() => {
@@ -1455,7 +1485,11 @@ async fn run_status(
 /// process directly with SIGHUP. Exits non-zero when the reload did not
 /// happen, so a script chaining `edit && oxllm reload` cannot mistake
 /// failure for success.
-async fn run_reload(port: u16, pid_opt: Option<u32>) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_reload(
+    host: &str,
+    port: u16,
+    pid_opt: Option<u32>,
+) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(pid) = pid_opt {
         if let Err(e) = send_sighup(pid) {
             println!("Failed to send SIGHUP to process {}: {}", pid, e);
@@ -1469,7 +1503,7 @@ async fn run_reload(port: u16, pid_opt: Option<u32>) -> Result<(), Box<dyn std::
     }
 
     let client = reqwest::Client::new();
-    let url = format!("http://127.0.0.1:{}/reload", port);
+    let url = format!("{}/reload", cli_base_url(host, port));
     let res = match client.post(&url).send().await {
         Ok(r) => r,
         Err(e) if e.is_connect() => {
@@ -1532,6 +1566,25 @@ fn run_stop(pid_opt: Option<u32>) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Best-effort check whether something already listens on the port the
+/// daemon would bind: installing into an occupied port produces a service
+/// that fails to bind and crash-loops under KeepAlive (issue #8).
+fn port_in_use(server: &ServerConfig) -> bool {
+    let port = server.port;
+    let check = |addr: String| std::net::TcpStream::connect(addr).is_ok();
+    match server.bind_family.as_str() {
+        // IPv6-only bind: nothing would answer on IPv4.
+        "ipv6" => check(format!("[::1]:{}", port)),
+        // Dual-stack accepts both families.
+        "dual" => {
+            check(format!("[::1]:{}", port))
+                || check(format!("127.0.0.1:{}", port))
+                || check(format!("{}:{}", server.host, port))
+        },
+        _ => check(format!("{}:{}", server.host, port)),
+    }
+}
+
 /// Installs oxllm as a user-level service pointing at the current binary
 /// and the resolved config. The config is loaded and validated first, so a
 /// broken config is refused before anything is installed. Installing over
@@ -1552,6 +1605,18 @@ fn run_install(config_path: PathBuf, force: bool) -> Result<(), Box<dyn std::err
     // Preflight: the installed service is only useful if the config works.
     let config = Config::load_from_file(&config_path)?;
     config.validate()?;
+
+    // Preflight: an occupied port would make the installed service
+    // crash-loop on bind failures (issue #8). Checked before anything is
+    // written, so a refusal leaves an existing installation untouched.
+    if port_in_use(&config.server) {
+        println!(
+            "Port {} is already in use — the installed service would fail to bind and crash-loop.",
+            config.server.port
+        );
+        println!("Stop whatever is listening on it (e.g. oxllm stop), or change server.port.");
+        std::process::exit(1);
+    };
 
     // A service manager does not inherit the interactive shell's
     // environment, so `${VAR}` references in the config would fail at
@@ -1804,9 +1869,17 @@ fn uninstall_systemd() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn run_provider_offline(name: &str, port: u16) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_provider_offline(
+    name: &str,
+    host: &str,
+    port: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
-    let url = format!("http://127.0.0.1:{}/admin/providers/{}/offline", port, name);
+    let url = format!(
+        "{}/admin/providers/{}/offline",
+        cli_base_url(host, port),
+        name
+    );
     let res = match client.post(&url).send().await {
         Ok(r) => r,
         Err(e) if e.is_connect() => {
@@ -1821,9 +1894,17 @@ async fn run_provider_offline(name: &str, port: u16) -> Result<(), Box<dyn std::
     Ok(())
 }
 
-async fn run_provider_online(name: &str, port: u16) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_provider_online(
+    name: &str,
+    host: &str,
+    port: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
-    let url = format!("http://127.0.0.1:{}/admin/providers/{}/online", port, name);
+    let url = format!(
+        "{}/admin/providers/{}/online",
+        cli_base_url(host, port),
+        name
+    );
     let res = match client.post(&url).send().await {
         Ok(r) => r,
         Err(e) if e.is_connect() => {
@@ -1838,9 +1919,17 @@ async fn run_provider_online(name: &str, port: u16) -> Result<(), Box<dyn std::e
     Ok(())
 }
 
-async fn run_provider_reset(name: &str, port: u16) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_provider_reset(
+    name: &str,
+    host: &str,
+    port: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
-    let url = format!("http://127.0.0.1:{}/admin/providers/{}/reset", port, name);
+    let url = format!(
+        "{}/admin/providers/{}/reset",
+        cli_base_url(host, port),
+        name
+    );
     let res = match client.post(&url).send().await {
         Ok(r) => r,
         Err(e) if e.is_connect() => {
@@ -1855,9 +1944,13 @@ async fn run_provider_reset(name: &str, port: u16) -> Result<(), Box<dyn std::er
     Ok(())
 }
 
-async fn run_provider_list(port: u16, json: bool) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_provider_list(
+    host: &str,
+    port: u16,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
-    let url = format!("http://127.0.0.1:{}/status", port);
+    let url = format!("{}/status", cli_base_url(host, port));
     let res = match client.get(&url).send().await {
         Ok(r) => r,
         Err(e) if e.is_connect() => {
@@ -1992,11 +2085,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Validate { config } => {
             run_validate(config)?;
         },
-        Commands::Status { port, json, width } => {
-            run_status(port, json, width).await?;
+        Commands::Status {
+            host,
+            port,
+            json,
+            width,
+        } => {
+            run_status(&host, port, json, width).await?;
         },
-        Commands::Reload { port, pid } => {
-            run_reload(port, pid).await?;
+        Commands::Reload { host, port, pid } => {
+            run_reload(&host, port, pid).await?;
         },
         Commands::Stop { pid } => {
             run_stop(pid)?;
@@ -2008,17 +2106,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_uninstall()?;
         },
         Commands::Provider(cmd) => match cmd {
-            ProviderCommand::List { port, json } => {
-                run_provider_list(port, json).await?;
+            ProviderCommand::List { host, port, json } => {
+                run_provider_list(&host, port, json).await?;
             },
-            ProviderCommand::Offline { name, port } => {
-                run_provider_offline(&name, port).await?;
+            ProviderCommand::Offline { name, host, port } => {
+                run_provider_offline(&name, &host, port).await?;
             },
-            ProviderCommand::Online { name, port } => {
-                run_provider_online(&name, port).await?;
+            ProviderCommand::Online { name, host, port } => {
+                run_provider_online(&name, &host, port).await?;
             },
-            ProviderCommand::Reset { name, port } => {
-                run_provider_reset(&name, port).await?;
+            ProviderCommand::Reset { name, host, port } => {
+                run_provider_reset(&name, &host, port).await?;
             },
         },
     }
@@ -2128,11 +2226,13 @@ mod integration_tests {
                     provider: "prov1".to_string(),
                     model: "gpt-4-upstream".to_string(),
                     priority: None,
+                    weight: None,
                 },
                 VirtualModelTarget {
                     provider: "prov2".to_string(),
                     model: "gpt-4-upstream".to_string(),
                     priority: None,
+                    weight: None,
                 },
             ],
         );
@@ -2245,6 +2345,7 @@ mod integration_tests {
                 provider: "prov1".to_string(),
                 model: "gpt-4-upstream".to_string(),
                 priority: None,
+                weight: None,
             }],
         );
 
@@ -2419,6 +2520,7 @@ mod integration_tests {
                 provider: "omlx-local".to_string(),
                 model: "granite-4.1-3b-4bit".to_string(),
                 priority: None,
+                weight: None,
             }],
         );
 
@@ -2625,6 +2727,7 @@ mod integration_tests {
                 provider: "omlx-local".to_string(),
                 model: "small".to_string(),
                 priority: None,
+                weight: None,
             }],
         );
         virtual_models.insert(
@@ -2633,6 +2736,7 @@ mod integration_tests {
                 provider: "omlx-local".to_string(),
                 model: "big".to_string(),
                 priority: None,
+                weight: None,
             }],
         );
 
@@ -2779,6 +2883,7 @@ mod integration_tests {
                 provider: "omlx-local".to_string(),
                 model: "m".to_string(),
                 priority: None,
+                weight: None,
             }],
         );
 
@@ -2909,11 +3014,13 @@ mod integration_tests {
                     provider: "prov-a".to_string(),
                     model: "m".to_string(),
                     priority: None,
+                    weight: None,
                 },
                 VirtualModelTarget {
                     provider: "prov-b".to_string(),
                     model: "m".to_string(),
                     priority: None,
+                    weight: None,
                 },
             ],
         );
@@ -3119,11 +3226,13 @@ mod integration_tests {
                     provider: "p1".into(),
                     model: "model".into(),
                     priority: None,
+                    weight: None,
                 },
                 VirtualModelTarget {
                     provider: "p2".into(),
                     model: "model".into(),
                     priority: None,
+                    weight: None,
                 },
             ],
         );
@@ -3268,11 +3377,13 @@ mod integration_tests {
                     provider: "p1".into(),
                     model: "model".into(),
                     priority: None,
+                    weight: None,
                 },
                 VirtualModelTarget {
                     provider: "p2".into(),
                     model: "model".into(),
                     priority: None,
+                    weight: None,
                 },
             ],
         );
@@ -3386,6 +3497,7 @@ mod integration_tests {
                 provider: "resetme".into(),
                 model: "model".into(),
                 priority: None,
+                weight: None,
             }],
         );
 
@@ -3520,6 +3632,7 @@ mod integration_tests {
                 provider: "emb".into(),
                 model: "model".into(),
                 priority: None,
+                weight: None,
             }],
         );
 
@@ -3627,6 +3740,7 @@ mod integration_tests {
                 provider: "prov".into(),
                 model: "real-model".into(),
                 priority: None,
+                weight: None,
             }],
         );
 
@@ -3726,6 +3840,7 @@ mod integration_tests {
                 provider: "target".into(),
                 model: "model".into(),
                 priority: None,
+                weight: None,
             }],
         );
         let state = Arc::new(AppState {
@@ -3837,6 +3952,7 @@ mod integration_tests {
                 provider: "counter".into(),
                 model: "model".into(),
                 priority: None,
+                weight: None,
             }],
         );
         let state = Arc::new(AppState {
@@ -3952,6 +4068,7 @@ mod integration_tests {
                 provider: "prov".into(),
                 model: "model".into(),
                 priority: None,
+                weight: None,
             }],
         );
 
@@ -4552,12 +4669,12 @@ vm = [{ provider = "missing-prov", model = "m" }]
             axum::serve(listener, router).await.unwrap();
         });
 
-        run_reload(port, None).await.unwrap();
+        run_reload("127.0.0.1", port, None).await.unwrap();
         receiver.changed().await.unwrap();
         assert_eq!(receiver.borrow_and_update().providers[0].name, "prov-a");
 
         std::fs::write(&path, test_config_toml("prov-b")).unwrap();
-        run_reload(port, None).await.unwrap();
+        run_reload("127.0.0.1", port, None).await.unwrap();
         receiver.changed().await.unwrap();
         assert_eq!(receiver.borrow_and_update().providers[0].name, "prov-b");
         let _ = std::fs::remove_file(&path);
@@ -4908,7 +5025,7 @@ vm = [
         let state = build_app_state(config, None).unwrap();
 
         let candidates = state.resolve_candidates("vm");
-        let models: Vec<&str> = candidates.iter().map(|(_, m)| m.as_str()).collect();
+        let models: Vec<&str> = candidates.iter().map(|c| c.model.as_str()).collect();
         assert_eq!(
             models,
             vec!["m-best", "m-first", "m-tail"],
@@ -4950,7 +5067,7 @@ vm = [
         let state = build_app_state(config, None).unwrap();
 
         let candidates = state.resolve_candidates("vm");
-        let models: Vec<&str> = candidates.iter().map(|(_, m)| m.as_str()).collect();
+        let models: Vec<&str> = candidates.iter().map(|c| c.model.as_str()).collect();
         assert_eq!(models, vec!["m-one", "m-two", "m-three"]);
         let _ = std::fs::remove_file(&path);
     }
@@ -5001,11 +5118,13 @@ vm = [
                     provider: "llamacpp-local".to_string(),
                     model: "Kev-4B-Q4_K_M".to_string(),
                     priority: None,
+                    weight: None,
                 },
                 VirtualModelTarget {
                     provider: "hosted-jev".to_string(),
                     model: "jev".to_string(),
                     priority: None,
+                    weight: None,
                 },
             ],
         );
@@ -5143,6 +5262,282 @@ vm = [
         ));
         assert!(unit.contains("Restart=on-failure"));
         assert!(unit.contains("WantedBy=default.target"));
+    }
+
+    /// IPv6 host literals render bracketed in CLI URLs, IPv4 and hostnames
+    /// unchanged (issue #9).
+    #[test]
+    fn test_cli_base_url_brackets_ipv6() {
+        assert_eq!(cli_base_url("127.0.0.1", 8080), "http://127.0.0.1:8080");
+        assert_eq!(cli_base_url("::1", 8080), "http://[::1]:8080");
+        assert_eq!(cli_base_url("[::1]", 8080), "http://[::1]:8080");
+        assert_eq!(cli_base_url("router.lan", 8080), "http://router.lan:8080");
+    }
+
+    /// `oxllm status --host ::1` reaches a daemon bound to IPv6 loopback
+    /// (issue #9): the old hardcoded 127.0.0.1 could not.
+    #[tokio::test]
+    async fn test_status_reaches_ipv6_loopback_daemon() {
+        let response =
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}";
+        let recorded = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let addr = spawn_recording_upstream(vec![response.to_string()], recorded).await;
+        let (_app_state, rs) = build_test_state(addr);
+
+        let router = axum::Router::new()
+            .route("/status", axum::routing::get(routes::get_status))
+            .with_state(rs);
+        let listener = TcpListener::bind("[::1]:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        run_status("::1", port, true, None)
+            .await
+            .expect("status must reach the IPv6-bound daemon");
+    }
+
+    /// Per-target weights share load among healthy candidates: with 3:1
+    /// weights and no session keys, traffic splits roughly 75/25 instead
+    /// of the first healthy target taking everything (issue #10).
+    #[tokio::test]
+    async fn test_weight_shares_load_among_healthy_candidates() {
+        let response =
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}";
+        let recorded_a = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let recorded_b = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let addr_a =
+            spawn_recording_upstream(vec![response.to_string(); 200], recorded_a.clone()).await;
+        let addr_b =
+            spawn_recording_upstream(vec![response.to_string(); 200], recorded_b.clone()).await;
+
+        let mk = |name: &str, addr: SocketAddr| ProviderState {
+            name: name.to_string(),
+            base_url: Url::parse(&format!("http://{}/v1/", addr)).unwrap(),
+            api_key: "k".to_string(),
+            models: vec!["m".to_string()],
+            upstream_timeout_secs: None,
+            cost_per_mtok: None,
+            circuit: Arc::new(RwLock::new(CircuitState::Closed)),
+            consecutive_failures: Arc::new(RwLock::new(0)),
+            rate_limited_until: Arc::new(RwLock::new(None)),
+            last_attempt_time: Arc::new(RwLock::new(None)),
+            probe_in_flight: Arc::new(AtomicBool::new(false)),
+            manual_disabled: AtomicBool::new(false),
+            requests: AtomicU64::new(0),
+            successes: AtomicU64::new(0),
+            tokens_input: AtomicU64::new(0),
+            tokens_output: AtomicU64::new(0),
+            model_stats: Arc::new(ModelStats::default()),
+        };
+
+        let mut vms = std::collections::HashMap::new();
+        vms.insert(
+            "spread".to_string(),
+            vec![
+                VirtualModelTarget {
+                    provider: "heavy".to_string(),
+                    model: "m".to_string(),
+                    priority: None,
+                    weight: Some(3),
+                },
+                VirtualModelTarget {
+                    provider: "light".to_string(),
+                    model: "m".to_string(),
+                    priority: None,
+                    weight: Some(1),
+                },
+            ],
+        );
+        let app_state = Arc::new(AppState {
+            providers: vec![mk("heavy", addr_a), mk("light", addr_b)],
+            virtual_models: vms,
+            aliases: Default::default(),
+            default_model: None,
+            circuit: CircuitConfig::default(),
+            route_stats: Arc::new(ModelStats::default()),
+            policies: std::collections::HashMap::new(),
+            routing_calls: AtomicU64::new(0),
+            api_keys: Vec::new(),
+            session_affinity: Arc::new(SessionAffinity::new(
+                std::time::Duration::from_secs(900),
+                1024,
+            )),
+            session_affinity_header: "".to_string(),
+            server: test_server_config(),
+            http_client: reqwest::Client::builder().build().unwrap(),
+            upstream_timeout_secs: 5,
+        });
+
+        let (_ws, wr) = tokio::sync::watch::channel(app_state.clone());
+        let (ttx, _trx) = tokio::sync::mpsc::channel(1024);
+        let rs = ReloadableState {
+            app_state: wr,
+            telemetry: TelemetryClient::new(ttx),
+            start_time: Instant::now(),
+            reloader: Reloader {
+                sender: _ws,
+                config_path: PathBuf::from("."),
+            },
+        };
+        let router = axum::Router::new()
+            .route(
+                "/v1/completions",
+                axum::routing::post(routes::create_completions),
+            )
+            .layer(middleware::from_fn(add_request_id))
+            .with_state(rs);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        for _ in 0..120 {
+            let res = client
+                .post(format!("http://{}/v1/completions", proxy_addr))
+                .json(&serde_json::json!({"model": "spread", "prompt": "x"}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), 200);
+        }
+
+        let heavy = recorded_a.lock().await.len();
+        let light = recorded_b.lock().await.len();
+        assert_eq!(heavy + light, 120);
+        let ratio = heavy as f64 / 120.0;
+        assert!(
+            (0.60..=0.90).contains(&ratio),
+            "expected ~0.75 of traffic on the weight-3 target, got {}",
+            ratio
+        );
+    }
+
+    /// An explicit `policies.<vm> = "priority"` must mean strict configured
+    /// order — it previously fell into the latency-ordering arm and behaved
+    /// like `fastest`.
+    #[tokio::test]
+    async fn test_explicit_priority_policy_keeps_configured_order() {
+        let response =
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}";
+        let recorded_a = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let recorded_b = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let addr_a =
+            spawn_recording_upstream(vec![response.to_string(); 4], recorded_a.clone()).await;
+        let addr_b =
+            spawn_recording_upstream(vec![response.to_string(); 4], recorded_b.clone()).await;
+
+        let mk = |name: &str, addr: SocketAddr, ttft_us: u64| {
+            let p = ProviderState {
+                name: name.to_string(),
+                base_url: Url::parse(&format!("http://{}/v1/", addr)).unwrap(),
+                api_key: "k".to_string(),
+                models: vec!["m".to_string()],
+                upstream_timeout_secs: None,
+                cost_per_mtok: None,
+                circuit: Arc::new(RwLock::new(CircuitState::Closed)),
+                consecutive_failures: Arc::new(RwLock::new(0)),
+                rate_limited_until: Arc::new(RwLock::new(None)),
+                last_attempt_time: Arc::new(RwLock::new(None)),
+                probe_in_flight: Arc::new(AtomicBool::new(false)),
+                manual_disabled: AtomicBool::new(false),
+                requests: AtomicU64::new(0),
+                successes: AtomicU64::new(0),
+                tokens_input: AtomicU64::new(0),
+                tokens_output: AtomicU64::new(0),
+                model_stats: Arc::new(ModelStats::default()),
+            };
+            p.model_stats
+                .counters(&ModelStats::key(name, "m"))
+                .record_ttft(ttft_us);
+            p
+        };
+
+        let mut vms = std::collections::HashMap::new();
+        vms.insert(
+            "vm".to_string(),
+            vec![
+                VirtualModelTarget {
+                    provider: "configured-first-but-slow".to_string(),
+                    model: "m".to_string(),
+                    priority: None,
+                    weight: None,
+                },
+                VirtualModelTarget {
+                    provider: "configured-second-but-fast".to_string(),
+                    model: "m".to_string(),
+                    priority: None,
+                    weight: None,
+                },
+            ],
+        );
+        let mut policies = std::collections::HashMap::new();
+        policies.insert("vm".to_string(), RoutingPolicy::Priority);
+        let app_state = Arc::new(AppState {
+            providers: vec![
+                mk("configured-first-but-slow", addr_a, 900_000),
+                mk("configured-second-but-fast", addr_b, 100_000),
+            ],
+            virtual_models: vms,
+            aliases: Default::default(),
+            default_model: None,
+            circuit: CircuitConfig::default(),
+            route_stats: Arc::new(ModelStats::default()),
+            policies,
+            routing_calls: AtomicU64::new(0),
+            api_keys: Vec::new(),
+            session_affinity: Arc::new(SessionAffinity::new(
+                std::time::Duration::from_secs(900),
+                1024,
+            )),
+            session_affinity_header: "".to_string(),
+            server: test_server_config(),
+            http_client: reqwest::Client::builder().build().unwrap(),
+            upstream_timeout_secs: 5,
+        });
+
+        let (_ws, wr) = tokio::sync::watch::channel(app_state.clone());
+        let (ttx, _trx) = tokio::sync::mpsc::channel(1024);
+        let rs = ReloadableState {
+            app_state: wr,
+            telemetry: TelemetryClient::new(ttx),
+            start_time: Instant::now(),
+            reloader: Reloader {
+                sender: _ws,
+                config_path: PathBuf::from("."),
+            },
+        };
+        let router = axum::Router::new()
+            .route(
+                "/v1/completions",
+                axum::routing::post(routes::create_completions),
+            )
+            .layer(middleware::from_fn(add_request_id))
+            .with_state(rs);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let res = client
+            .post(format!("http://{}/v1/completions", proxy_addr))
+            .json(&serde_json::json!({"model": "vm", "prompt": "x"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+
+        assert_eq!(
+            recorded_a.lock().await.len(),
+            1,
+            "the configured-first provider must serve despite being slower"
+        );
+        assert_eq!(recorded_b.lock().await.len(), 0);
     }
 
     #[tokio::test]

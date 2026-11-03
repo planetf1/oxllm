@@ -219,7 +219,12 @@ Each provider requires `name`, `enabled`, `base_url` (with trailing `/v1/`), `ap
 
 ### Virtual Models (Fallback Chains)
 
-Virtual models define the routing order. If a provider returns 429 or 5xx, the proxy transparently tries the next. An optional per-target `priority` (lower = preferred) states the preference explicitly; targets without one keep their configured order after all prioritized targets, so existing configs behave identically:
+Virtual models define the routing order. If a provider returns 429 or 5xx, the proxy transparently tries the next. Optional per-target fields state the routing intent explicitly:
+
+- `priority` (lower = preferred): targets without one keep their configured order after all prioritized targets.
+- `weight` (default policy only): proportional sharing among healthy targets in the same priority tier — `{ weight = 3 }` and `{ weight = 1 }` split traffic ~75/25 per request via a weighted lottery, instead of the first healthy target taking everything. Ignored by `fastest`/`cheapest`.
+
+Configs that set neither behave exactly as before:
 
 ```toml
 [virtual_models]

@@ -331,9 +331,42 @@ pub fn order_by_latency(
     indices
 }
 
+/// Draws indices in weighted-lottery order without replacement: each draw
+/// picks a remaining index with probability proportional to its weight.
+/// Zero-weight entries are never drawn while any positive weight remains
+/// and keep their original relative order at the tail. Used for
+/// proportional load sharing among healthy candidates (per-target
+/// `weight`, default policy only).
+pub fn weighted_lottery(weights: &[u64], rng: &mut impl rand::Rng) -> Vec<usize> {
+    let mut remaining: Vec<(usize, u64)> = weights.iter().copied().enumerate().collect();
+    let mut total: u64 = remaining.iter().map(|(_, w)| w).sum();
+    let mut order = Vec::with_capacity(weights.len());
+    while !remaining.is_empty() {
+        if total == 0 {
+            // Only zero-weight entries are left: configured order.
+            order.extend(remaining.iter().map(|(i, _)| *i));
+            break;
+        }
+        let mut pick = rng.random_range(0..total);
+        let mut chosen = remaining.len() - 1;
+        for (pos, (_, w)) in remaining.iter().enumerate() {
+            if pick < *w {
+                chosen = pos;
+                break;
+            }
+            pick -= *w;
+        }
+        let (index, weight) = remaining.remove(chosen);
+        total -= weight;
+        order.push(index);
+    }
+    order
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::SeedableRng;
     use reqwest::Url;
     use std::sync::atomic::{AtomicBool, AtomicU64};
     use std::sync::Arc;
@@ -625,6 +658,49 @@ mod tests {
         assert_eq!(*p.consecutive_failures.read().await, 2);
     }
 
+    /// Weighted lottery: zero weights keep configured order; with a seeded
+    /// RNG the draw is deterministic; zero-weight entries always sort after
+    /// positive ones; and over many draws the distribution tracks the
+    /// weights (issue #10).
+    #[test]
+    fn test_weighted_lottery_zero_weights_keep_order() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        assert_eq!(weighted_lottery(&[0, 0, 0], &mut rng), vec![0, 1, 2]);
+        assert_eq!(weighted_lottery(&[], &mut rng), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn test_weighted_lottery_zero_weight_sorts_last() {
+        // 100 draws: the zero-weight entry must never precede a weighted one.
+        for seed in 0..100u64 {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+            let order = weighted_lottery(&[3, 0, 1], &mut rng);
+            assert_eq!(order.len(), 3);
+            assert_ne!(order[0], 1, "zero weight drawn first: {:?}", order);
+            assert!(
+                order.iter().position(|&i| i == 1).unwrap() == 2,
+                "zero weight not last: {:?}",
+                order
+            );
+        }
+    }
+
+    #[test]
+    fn test_weighted_lottery_distribution_tracks_weights() {
+        // 3:1 weights over 2000 first-draws should land near 75%.
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let mut firsts = [0usize; 2];
+        for _ in 0..2000 {
+            let order = weighted_lottery(&[3, 1], &mut rng);
+            firsts[order[0]] += 1;
+        }
+        let ratio = firsts[0] as f64 / 2000.0;
+        assert!(
+            (0.70..=0.80).contains(&ratio),
+            "expected ~0.75, got {}",
+            ratio
+        );
+    }
     /// A configured threshold of 1 opens the circuit on the first failure
     /// (twitchy free-tier upstream), while the default still needs three.
     #[tokio::test]

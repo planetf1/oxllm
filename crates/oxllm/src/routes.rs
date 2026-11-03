@@ -14,10 +14,12 @@ use std::time::{Duration, Instant};
 use tracing::{debug, error, warn};
 
 use oxllm_core::router::{
-    latency_band, order_by_cost, order_by_latency, rotate_within_band, AdaptivePriorityStrategy,
-    LatencyCandidate, RoutingStrategy,
+    latency_band, order_by_cost, order_by_latency, rotate_within_band, weighted_lottery,
+    AdaptivePriorityStrategy, LatencyCandidate, RoutingStrategy,
 };
-use oxllm_core::state::{AppState, CircuitState, ModelStats, ProviderState, RoutingPolicy};
+use oxllm_core::state::{
+    AppState, CircuitState, ModelStats, ProviderState, RouteCandidate, RoutingPolicy,
+};
 use oxllm_core::telemetry::{TelemetryClient, TelemetryEvent};
 
 /// Every Nth request ignores measured latency for one routing decision, so a
@@ -358,9 +360,9 @@ fn ordered_candidates<'a>(
     app_state: &AppState,
     route_name: &str,
     session_key: Option<&str>,
-    candidates: &[(&'a ProviderState, String)],
-) -> Vec<(&'a ProviderState, String)> {
-    let mut ordered: Vec<(&'a ProviderState, String)> = candidates.to_vec();
+    candidates: &[RouteCandidate<'a>],
+) -> Vec<RouteCandidate<'a>> {
+    let mut ordered: Vec<RouteCandidate<'a>> = candidates.to_vec();
     if ordered.len() < 2 {
         return ordered;
     }
@@ -370,8 +372,12 @@ fn ordered_candidates<'a>(
     // keyless traffic and sessions whose pin is unhealthy or expired.
     if let Some(key) = session_key {
         if let Some(pinned) = app_state.session_affinity.pinned_provider(key) {
-            if let Some(pos) = ordered.iter().position(|(p, _)| {
-                p.name == pinned && !p.manual_disabled.load(std::sync::atomic::Ordering::Relaxed)
+            if let Some(pos) = ordered.iter().position(|c| {
+                c.provider.name == pinned
+                    && !c
+                        .provider
+                        .manual_disabled
+                        .load(std::sync::atomic::Ordering::Relaxed)
             }) {
                 let chosen = ordered.remove(pos);
                 ordered.insert(0, chosen);
@@ -381,7 +387,10 @@ fn ordered_candidates<'a>(
     }
 
     let policy = app_state.policies.get(route_name).copied();
-    if policy.is_none() {
+    if matches!(policy, None | Some(RoutingPolicy::Priority)) {
+        // Strict order (priority-sorted, session-pinned), plus optional
+        // weighted sharing within priority tiers.
+        apply_weighted_sharing(&mut ordered);
         return ordered;
     }
 
@@ -391,11 +400,14 @@ fn ordered_candidates<'a>(
 
     let described: Vec<LatencyCandidate> = ordered
         .iter()
-        .map(|(provider, model)| LatencyCandidate {
-            provider: provider.name.clone(),
-            model: model.clone(),
-            ewma_ttft_ms: provider.model_stats.ewma_ttft_ms(&provider.name, model),
-            cost_per_mtok: provider.cost_per_mtok,
+        .map(|c| LatencyCandidate {
+            provider: c.provider.name.clone(),
+            model: c.model.clone(),
+            ewma_ttft_ms: c
+                .provider
+                .model_stats
+                .ewma_ttft_ms(&c.provider.name, &c.model),
+            cost_per_mtok: c.provider.cost_per_mtok,
         })
         .collect();
 
@@ -415,13 +427,80 @@ fn ordered_candidates<'a>(
     order.into_iter().map(|i| ordered[i].clone()).collect()
 }
 
-/// POST /v1/embeddings
-pub async fn create_embeddings(
-    State((app_state, telemetry)): State<(Arc<AppState>, TelemetryClient)>,
-    Extension(request_id): Extension<String>,
+/// Proportional load sharing under the default (priority) policy: within
+/// each priority tier, candidates carrying a `weight` are drawn per request
+/// as a lottery with probability proportional to it, so healthy targets
+/// share traffic instead of the first one taking everything. Unweighted
+/// candidates keep their configured order after them, and tiers with no
+/// weights at all are untouched — no weights anywhere means today's strict
+/// order. The `fastest` and `cheapest` policies never call this.
+fn apply_weighted_sharing(ordered: &mut [RouteCandidate<'_>]) {
+    if !ordered.iter().any(|c| c.weight.is_some()) {
+        return;
+    }
+    let mut rng = rand::rng();
+    let mut result: Vec<usize> = Vec::with_capacity(ordered.len());
+    // Candidates arrive priority-sorted from resolve_candidates; tiers are
+    // maximal runs of equal effective priority.
+    let mut start = 0;
+    while start < ordered.len() {
+        let tier_priority = ordered[start].priority;
+        let mut end = start + 1;
+        while end < ordered.len() && ordered[end].priority == tier_priority {
+            end += 1;
+        }
+        if ordered[start..end].iter().any(|c| c.weight.is_some()) {
+            let weights: Vec<u64> = ordered[start..end]
+                .iter()
+                .map(|c| c.weight.unwrap_or(0) as u64)
+                .collect();
+            result.extend(
+                weighted_lottery(&weights, &mut rng)
+                    .into_iter()
+                    .map(|i| start + i),
+            );
+        } else {
+            result.extend(start..end);
+        }
+        start = end;
+    }
+    // Apply the permutation in place.
+    let source: Vec<RouteCandidate<'_>> = ordered.to_vec();
+    for (dest, src) in result.into_iter().enumerate() {
+        ordered[dest] = source[src].clone();
+    }
+}
+
+/// Per-endpoint configuration for the shared proxy loop.
+struct EndpointSpec {
+    /// Path appended to the provider base URL ("embeddings",
+    /// "chat/completions", ...).
+    path: &'static str,
+    /// Telemetry operation name and log label.
+    operation: &'static str,
+    /// Noun used in the terminal 502 message ("chat completions",
+    /// "embeddings", ...).
+    failure_noun: &'static str,
+    /// Whether `stream: true` requests forward as SSE.
+    streaming: bool,
+}
+
+/// The shared proxy loop behind every public endpoint (issue #11): JSON
+/// parse, model resolution (aliases, default model), trace-context
+/// extraction, policy-ordered candidates, then the failover loop — model
+/// rewrite per target, per-provider circuit breaking and feedback, usage
+/// accounting, session affinity — ending in a terminal 502. Streaming
+/// endpoints delegate to `stream_upstream_body`; everything else passes
+/// the response through verbatim.
+#[allow(clippy::too_many_arguments)]
+async fn proxy_request(
+    spec: &EndpointSpec,
+    app_state: Arc<AppState>,
+    telemetry: TelemetryClient,
+    request_id: String,
     headers: HeaderMap,
-    body: Bytes, // Bounded ref-counted bytes for zero-cost routing retries
-) -> impl IntoResponse {
+    body: Bytes,
+) -> Response {
     let mut payload: Value = match serde_json::from_slice(&body) {
         Ok(p) => p,
         Err(e) => {
@@ -469,6 +548,11 @@ pub async fn create_embeddings(
     // Extract W3C traceparent headers if present for tracing
     let (trace_id, parent_span_id) = extract_traceparent(&headers);
 
+    let is_streaming = payload
+        .get("stream")
+        .and_then(|s| s.as_bool())
+        .unwrap_or(false);
+
     let strategy = AdaptivePriorityStrategy {
         circuit: app_state.circuit,
     };
@@ -485,7 +569,7 @@ pub async fn create_embeddings(
         session_key(&app_state, &headers, &payload).as_deref(),
         &candidates,
     );
-    let candidate_states: Vec<&ProviderState> = candidates.iter().map(|(p, _)| *p).collect();
+    let candidate_states: Vec<&ProviderState> = candidates.iter().map(|c| c.provider).collect();
 
     // Route-level counters: one row per virtual model, one request each,
     // regardless of how many provider attempts it takes.
@@ -498,14 +582,14 @@ pub async fn create_embeddings(
         attempts += 1;
         let target_model = match candidates
             .iter()
-            .find(|(p, _)| p.name == selected.name)
-            .map(|(_, m)| m.clone())
+            .find(|c| c.provider.name == selected.name)
+            .map(|c| c.model.clone())
         {
             Some(m) => m,
             None => {
                 warn!(
                     request_id = %request_id,
-                    "Provider {} removed from candidates during embeddings routing",
+                    "Provider {} removed from candidates during routing",
                     selected.name
                 );
                 continue;
@@ -517,7 +601,7 @@ pub async fn create_embeddings(
         let rewritten_body = Bytes::from(serde_json::to_vec(&payload).unwrap());
 
         // 2. Safely parse base URL and join embeddings path (Url::joinTrailingSlashes mitigation)
-        let endpoint_url = match selected.base_url.join("embeddings") {
+        let endpoint_url = match selected.base_url.join(spec.path) {
             Ok(url) => url,
             Err(e) => {
                 error!("Invalid base URL path join for {}: {}", selected.name, e);
@@ -544,8 +628,8 @@ pub async fn create_embeddings(
         }
 
         debug!(
-            "Embedding request routing to {} (attempt {})",
-            selected.name, attempts
+            "{} request routing to {} (attempt {})",
+            spec.operation, selected.name, attempts
         );
 
         // Increment request counter
@@ -566,6 +650,29 @@ pub async fn create_embeddings(
             Ok(res) if res.status().is_success() => {
                 let status_code = res.status().as_u16();
                 let upstream_headers = res.headers().clone();
+
+                // Streaming endpoints forward the upstream SSE body as it
+                // arrives, never buffered.
+                if spec.streaming && is_streaming {
+                    return stream_upstream_body(
+                        res,
+                        upstream_headers,
+                        status_code,
+                        app_state.clone(),
+                        selected.name.clone(),
+                        selected.is_probe,
+                        spec.operation,
+                        target_model,
+                        telemetry.clone(),
+                        trace_id.clone(),
+                        parent_span_id.clone(),
+                        request_id.clone(),
+                        start_time,
+                        attempts,
+                    )
+                    .into_response();
+                }
+
                 let res_body = match res.bytes().await {
                     Ok(b) => b,
                     Err(e) => {
@@ -596,16 +703,21 @@ pub async fn create_embeddings(
                     },
                 };
 
-                // Parse token counts from upstream response
+                // Parse token counts from the upstream response. Field names
+                // differ by endpoint family: OpenAI-style prompt/completion
+                // tokens, or systemone's input/output tokens.
                 let (input_tokens, output_tokens) = serde_json::from_slice::<Value>(&res_body)
                     .map(|v| {
                         let usage = v.get("usage");
                         let input = usage
-                            .and_then(|u| u.get("prompt_tokens"))
+                            .and_then(|u| u.get("prompt_tokens").or_else(|| u.get("input_tokens")))
                             .and_then(|t| t.as_u64())
                             .unwrap_or(0);
                         let output = usage
-                            .and_then(|u| u.get("completion_tokens"))
+                            .and_then(|u| {
+                                u.get("completion_tokens")
+                                    .or_else(|| u.get("output_tokens"))
+                            })
                             .and_then(|t| t.as_u64())
                             .unwrap_or(0);
                         (input, output)
@@ -669,7 +781,7 @@ pub async fn create_embeddings(
 
                 // Push Telemetry Metrics
                 telemetry.emit(TelemetryEvent::RecordTransaction {
-                    operation: "embeddings".to_string(),
+                    operation: spec.operation.to_string(),
                     provider: selected.name.clone(),
                     model: target_model,
                     input_tokens,
@@ -692,7 +804,8 @@ pub async fn create_embeddings(
                 let status_code = res.status().as_u16();
                 warn!(
                     request_id = %request_id,
-                    "Embedding request upstream {} failed with status {}",
+                    "{} request upstream {} failed with status {}",
+                    spec.operation,
                     selected.name, status_code
                 );
 
@@ -748,7 +861,8 @@ pub async fn create_embeddings(
             Err(e) => {
                 warn!(
                     request_id = %request_id,
-                    "Embedding request upstream {} connection failed: {}",
+                    "{} request upstream {} connection failed: {}",
+                    spec.operation,
                     selected.name, e
                 );
                 let target_provider_state = app_state
@@ -769,11 +883,14 @@ pub async fn create_embeddings(
 
     let message = if !last_upstream_error.is_empty() {
         format!(
-            "All upstream embeddings providers failed or are rate-limited. Last error from {} ({}): {}",
-            last_failed_provider, last_failed_status, last_upstream_error
+            "All upstream {} providers failed or are rate-limited. Last error from {} ({}): {}",
+            spec.failure_noun, last_failed_provider, last_failed_status, last_upstream_error
         )
     } else {
-        "All upstream embeddings providers failed or are rate-limited".to_string()
+        format!(
+            "All upstream {} providers failed or are rate-limited",
+            spec.failure_noun
+        )
     };
     route_counters
         .failures
@@ -783,6 +900,41 @@ pub async fn create_embeddings(
     }
     json_error_response(&message, "server_error", StatusCode::BAD_GATEWAY)
 }
+
+const EMBEDDINGS_SPEC: EndpointSpec = EndpointSpec {
+    path: "embeddings",
+    operation: "embeddings",
+    failure_noun: "embeddings",
+    streaming: false,
+};
+
+/// POST /v1/embeddings
+///
+/// OpenAI-compatible embeddings, routed through the provider pool with
+/// failover and usage accounting.
+pub async fn create_embeddings(
+    State((app_state, telemetry)): State<(Arc<AppState>, TelemetryClient)>,
+    Extension(request_id): Extension<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    proxy_request(
+        &EMBEDDINGS_SPEC,
+        app_state,
+        telemetry,
+        request_id,
+        headers,
+        body,
+    )
+    .await
+}
+
+const SYSTEMONE_SPEC: EndpointSpec = EndpointSpec {
+    path: "systemone",
+    operation: "systemone",
+    failure_noun: "systemone",
+    streaming: false,
+};
 
 /// POST /v1/systemone
 ///
@@ -797,1132 +949,65 @@ pub async fn create_systemone(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    let mut payload: Value = match serde_json::from_slice(&body) {
-        Ok(p) => p,
-        Err(e) => {
-            return json_error_response(
-                &format!("Invalid JSON payload: {}", e),
-                "invalid_request_error",
-                StatusCode::BAD_REQUEST,
-            )
-        },
-    };
-
-    let requested_model = match payload.get("model").and_then(|m| m.as_str()) {
-        Some(m) => m,
-        None => {
-            return json_error_response(
-                "Missing required 'model' field",
-                "invalid_request_error",
-                StatusCode::BAD_REQUEST,
-            )
-        },
-    };
-
-    let route_name = match app_state.resolve_route(requested_model) {
-        Some(route) => route.to_string(),
-        None => {
-            return json_error_response(
-                &format!("Invalid or unmapped virtual model: {}", requested_model),
-                "invalid_request_error",
-                StatusCode::BAD_REQUEST,
-            )
-        },
-    };
-    let candidates = app_state.resolve_candidates(&route_name);
-    if candidates.is_empty() {
-        return json_error_response(
-            &format!("Invalid or unmapped virtual model: {}", requested_model),
-            "invalid_request_error",
-            StatusCode::BAD_REQUEST,
-        );
-    }
-
-    let (trace_id, parent_span_id) = extract_traceparent(&headers);
-
-    let strategy = AdaptivePriorityStrategy {
-        circuit: app_state.circuit,
-    };
-    let mut attempts = 0;
-    let start_time = Instant::now();
-    let mut last_upstream_error = String::new();
-    let mut last_failed_provider = String::new();
-    let mut last_failed_status: u16 = 0;
-
-    let candidates = ordered_candidates(
-        &app_state,
-        &route_name,
-        session_key(&app_state, &headers, &payload).as_deref(),
-        &candidates,
-    );
-    let candidate_states: Vec<&ProviderState> = candidates.iter().map(|(p, _)| *p).collect();
-
-    let route_counters = app_state.route_stats.counters(&route_name);
-    route_counters
-        .requests
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-    while let Some(selected) = strategy.select(&candidate_states).await {
-        attempts += 1;
-        let target_model = match candidates
-            .iter()
-            .find(|(p, _)| p.name == selected.name)
-            .map(|(_, m)| m.clone())
-        {
-            Some(m) => m,
-            None => {
-                warn!(
-                    request_id = %request_id,
-                    "Provider {} removed from candidates during systemone routing",
-                    selected.name
-                );
-                continue;
-            },
-        };
-
-        // 1. Rewrite model field in JSON body
-        payload["model"] = Value::String(target_model.clone());
-        let rewritten_body = Bytes::from(serde_json::to_vec(&payload).unwrap());
-
-        // 2. Join the decision endpoint path
-        let endpoint_url = match selected.base_url.join("systemone") {
-            Ok(url) => url,
-            Err(e) => {
-                error!("Invalid base URL path join for {}: {}", selected.name, e);
-                continue;
-            },
-        };
-
-        // 3. Construct upstream request
-        let mut req = app_state
-            .http_client
-            .post(endpoint_url.as_str())
-            .body(rewritten_body)
-            .timeout(Duration::from_secs(
-                selected
-                    .upstream_timeout_secs
-                    .unwrap_or(app_state.upstream_timeout_secs),
-            ))
-            .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {}", selected.api_key));
-
-        if let Some(traceparent) = headers.get("traceparent") {
-            req = req.header("traceparent", traceparent);
-        }
-
-        debug!(
-            "Systemone request routing to {} (attempt {})",
-            selected.name, attempts
-        );
-
-        if let Some(target) = app_state.providers.iter().find(|p| p.name == selected.name) {
-            target
-                .requests
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            target
-                .model_stats
-                .counters(&ModelStats::key(&selected.name, &target_model))
-                .requests
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-
-        let res = req.send().await;
-
-        match res {
-            Ok(res) if res.status().is_success() => {
-                let status_code = res.status().as_u16();
-                let upstream_headers = res.headers().clone();
-                let res_body = match res.bytes().await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        warn!(
-                            request_id = %request_id,
-                            "Failed to read success response body from {}: {}",
-                            selected.name, e
-                        );
-                        let target_provider_state = app_state
-                            .providers
-                            .iter()
-                            .find(|p| p.name == selected.name)
-                            .unwrap();
-                        strategy
-                            .feedback(
-                                target_provider_state,
-                                false,
-                                selected.is_probe,
-                                Some(status_code),
-                                None,
-                            )
-                            .await;
-                        telemetry.emit(TelemetryEvent::UpdateStatus {
-                            provider: selected.name.clone(),
-                            status: circuit_status(target_provider_state).await,
-                        });
-                        continue;
-                    },
-                };
-
-                // Parse token counts. Decision models run no decode loop, so
-                // usage.output_tokens is typically 0; accept both the
-                // OpenAI-style and the systemone field names.
-                let (input_tokens, output_tokens) = serde_json::from_slice::<Value>(&res_body)
-                    .map(|v| {
-                        let usage = v.get("usage");
-                        let input = usage
-                            .and_then(|u| u.get("prompt_tokens").or_else(|| u.get("input_tokens")))
-                            .and_then(|t| t.as_u64())
-                            .unwrap_or(0);
-                        let output = usage
-                            .and_then(|u| {
-                                u.get("completion_tokens")
-                                    .or_else(|| u.get("output_tokens"))
-                            })
-                            .and_then(|t| t.as_u64())
-                            .unwrap_or(0);
-                        (input, output)
-                    })
-                    .unwrap_or((0, 0));
-
-                let target_provider_state = app_state
-                    .providers
-                    .iter()
-                    .find(|p| p.name == selected.name)
-                    .unwrap();
-                strategy
-                    .feedback(
-                        target_provider_state,
-                        true,
-                        selected.is_probe,
-                        Some(status_code),
-                        None,
-                    )
-                    .await;
-                telemetry.emit(TelemetryEvent::UpdateStatus {
-                    provider: selected.name.clone(),
-                    status: circuit_status(target_provider_state).await,
-                });
-
-                target_provider_state
-                    .successes
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                target_provider_state
-                    .tokens_input
-                    .fetch_add(input_tokens, std::sync::atomic::Ordering::Relaxed);
-                target_provider_state
-                    .tokens_output
-                    .fetch_add(output_tokens, std::sync::atomic::Ordering::Relaxed);
-                {
-                    let elapsed_ms = start_time.elapsed().as_millis() as u64;
-                    let model_counters = target_provider_state
-                        .model_stats
-                        .counters(&ModelStats::key(&selected.name, &target_model));
-                    if let Some(key) = session_key(&app_state, &headers, &payload).as_deref() {
-                        app_state.session_affinity.pin(key, &selected.name);
-                    }
-                    for counters in [&model_counters, &route_counters] {
-                        counters
-                            .successes
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        counters
-                            .tokens_input
-                            .fetch_add(input_tokens, std::sync::atomic::Ordering::Relaxed);
-                        counters
-                            .tokens_output
-                            .fetch_add(output_tokens, std::sync::atomic::Ordering::Relaxed);
-                        counters.latency.record(elapsed_ms);
-                        counters.record_ttft(elapsed_ms * 1000);
-                    }
-                }
-
-                telemetry.emit(TelemetryEvent::RecordTransaction {
-                    operation: "systemone".to_string(),
-                    provider: selected.name.clone(),
-                    model: target_model,
-                    input_tokens,
-                    output_tokens,
-                    duration: start_time.elapsed(),
-                    attempts,
-                    failure_reason: None,
-                    trace_id: trace_id.clone(),
-                    parent_span_id: parent_span_id.clone(),
-                    request_id: request_id.clone(),
-                });
-
-                let mut response = Response::new(Body::from(res_body));
-                *response.status_mut() = StatusCode::OK;
-                copy_response_headers(&upstream_headers, response.headers_mut());
-                return response.into_response();
-            },
-            Ok(res) => {
-                let status_code = res.status().as_u16();
-                warn!(
-                    request_id = %request_id,
-                    "Systemone request upstream {} failed with status {}",
-                    selected.name, status_code
-                );
-
-                let retry_after = extract_retry_after(res.headers());
-
-                let error_body = match res.bytes().await {
-                    Ok(b) => String::from_utf8_lossy(&b).to_string(),
-                    Err(e) => {
-                        warn!(
-                            request_id = %request_id,
-                            "Failed to read error body from {}: {}", selected.name, e
-                        );
-                        String::new()
-                    },
-                };
-                let parsed_error = if !error_body.is_empty() {
-                    serde_json::from_str::<Value>(&error_body)
-                        .ok()
-                        .and_then(|v| {
-                            v.get("error")
-                                .and_then(|e| e.get("message"))
-                                .and_then(|m| m.as_str().map(String::from))
-                        })
-                        .unwrap_or(error_body)
-                } else {
-                    String::new()
-                };
-                last_upstream_error = parsed_error;
-                last_failed_provider = selected.name.clone();
-                last_failed_status = status_code;
-
-                let target_provider_state = app_state
-                    .providers
-                    .iter()
-                    .find(|p| p.name == selected.name)
-                    .unwrap();
-                strategy
-                    .feedback(
-                        target_provider_state,
-                        false,
-                        selected.is_probe,
-                        Some(status_code),
-                        retry_after,
-                    )
-                    .await;
-                telemetry.emit(TelemetryEvent::UpdateStatus {
-                    provider: selected.name.clone(),
-                    status: circuit_status(target_provider_state).await,
-                });
-            },
-            Err(e) => {
-                warn!(
-                    request_id = %request_id,
-                    "Systemone request upstream {} failed: {}",
-                    selected.name, e
-                );
-                last_upstream_error = e.to_string();
-                last_failed_provider = selected.name.clone();
-                last_failed_status = 0;
-
-                let target_provider_state = app_state
-                    .providers
-                    .iter()
-                    .find(|p| p.name == selected.name)
-                    .unwrap();
-                strategy
-                    .feedback(target_provider_state, false, selected.is_probe, None, None)
-                    .await;
-                telemetry.emit(TelemetryEvent::UpdateStatus {
-                    provider: selected.name.clone(),
-                    status: circuit_status(target_provider_state).await,
-                });
-            },
-        }
-    }
-
-    let message = if !last_upstream_error.is_empty() {
-        format!(
-            "All upstream systemone providers failed or are rate-limited. Last error from {} ({}): {}",
-            last_failed_provider, last_failed_status, last_upstream_error
-        )
-    } else {
-        "All upstream systemone providers failed or are rate-limited".to_string()
-    };
-    route_counters
-        .failures
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if let Some(key) = session_key(&app_state, &headers, &payload).as_deref() {
-        app_state.session_affinity.unpin(key);
-    }
-    json_error_response(&message, "server_error", StatusCode::BAD_GATEWAY)
+    proxy_request(
+        &SYSTEMONE_SPEC,
+        app_state,
+        telemetry,
+        request_id,
+        headers,
+        body,
+    )
+    .await
 }
+
+const COMPLETIONS_SPEC: EndpointSpec = EndpointSpec {
+    path: "completions",
+    operation: "completions",
+    failure_noun: "completions",
+    streaming: true,
+};
 
 /// POST /v1/completions
 ///
 /// Raw (non-chat) completions, used by fill-in-the-middle clients such as
 /// editor autocomplete. Adds no buffering: streaming requests are forwarded
-/// chunk-by-chunk exactly as /v1/chat/completions does.
+/// as SSE, non-streaming responses pass through verbatim.
 pub async fn create_completions(
     State((app_state, telemetry)): State<(Arc<AppState>, TelemetryClient)>,
     Extension(request_id): Extension<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    let mut payload: Value = match serde_json::from_slice(&body) {
-        Ok(p) => p,
-        Err(e) => {
-            return json_error_response(
-                &format!("Invalid JSON payload: {}", e),
-                "invalid_request_error",
-                StatusCode::BAD_REQUEST,
-            )
-        },
-    };
-
-    let requested_model = match payload.get("model").and_then(|m| m.as_str()) {
-        Some(m) => m,
-        None => {
-            return json_error_response(
-                "Missing required 'model' field",
-                "invalid_request_error",
-                StatusCode::BAD_REQUEST,
-            )
-        },
-    };
-
-    // Owned copy: `payload` is mutated per attempt, so the &str borrow cannot
-    // live across the routing loop. Names resolve through aliases and the
-    // configured default model before being rejected.
-    let route_name = match app_state.resolve_route(requested_model) {
-        Some(route) => route.to_string(),
-        None => {
-            return json_error_response(
-                &format!("Invalid or unmapped virtual model: {}", requested_model),
-                "invalid_request_error",
-                StatusCode::BAD_REQUEST,
-            )
-        },
-    };
-    let candidates = app_state.resolve_candidates(&route_name);
-    if candidates.is_empty() {
-        return json_error_response(
-            &format!("Invalid or unmapped virtual model: {}", requested_model),
-            "invalid_request_error",
-            StatusCode::BAD_REQUEST,
-        );
-    }
-
-    let is_streaming = payload
-        .get("stream")
-        .and_then(|s| s.as_bool())
-        .unwrap_or(false);
-    let (trace_id, parent_span_id) = extract_traceparent(&headers);
-
-    let strategy = AdaptivePriorityStrategy {
-        circuit: app_state.circuit,
-    };
-    let mut attempts = 0;
-    let start_time = Instant::now();
-    let mut last_upstream_error = String::new();
-    let mut last_failed_provider = String::new();
-    let mut last_failed_status: u16 = 0;
-
-    let candidates = ordered_candidates(
-        &app_state,
-        &route_name,
-        session_key(&app_state, &headers, &payload).as_deref(),
-        &candidates,
-    );
-    let candidate_states: Vec<&ProviderState> = candidates.iter().map(|(p, _)| *p).collect();
-
-    // Route-level counters: one row per virtual model, one request each,
-    // regardless of how many provider attempts it takes.
-    let route_counters = app_state.route_stats.counters(&route_name);
-    route_counters
-        .requests
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-    while let Some(selected) = strategy.select(&candidate_states).await {
-        attempts += 1;
-        let target_model = match candidates
-            .iter()
-            .find(|(p, _)| p.name == selected.name)
-            .map(|(_, m)| m.clone())
-        {
-            Some(m) => m,
-            None => {
-                warn!(
-                    request_id = %request_id,
-                    "Provider {} removed from candidates during completions routing",
-                    selected.name
-                );
-                continue;
-            },
-        };
-
-        payload["model"] = Value::String(target_model.clone());
-        let rewritten_body = Bytes::from(serde_json::to_vec(&payload).unwrap());
-
-        let endpoint_url = match selected.base_url.join("completions") {
-            Ok(url) => url,
-            Err(e) => {
-                error!("Invalid base URL path join for {}: {}", selected.name, e);
-                continue;
-            },
-        };
-
-        let mut req = app_state
-            .http_client
-            .post(endpoint_url.as_str())
-            .body(rewritten_body)
-            .timeout(Duration::from_secs(
-                selected
-                    .upstream_timeout_secs
-                    .unwrap_or(app_state.upstream_timeout_secs),
-            ))
-            .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {}", selected.api_key));
-
-        if let Some(traceparent) = headers.get("traceparent") {
-            req = req.header("traceparent", traceparent);
-        }
-
-        debug!(
-            "Completion request routing to {} (attempt {})",
-            selected.name, attempts
-        );
-
-        if let Some(target) = app_state.providers.iter().find(|p| p.name == selected.name) {
-            target
-                .requests
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            target
-                .model_stats
-                .counters(&ModelStats::key(&selected.name, &target_model))
-                .requests
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-
-        let res = req.send().await;
-
-        match res {
-            Ok(res) if res.status().is_success() => {
-                let status_code = res.status().as_u16();
-                let upstream_headers = res.headers().clone();
-
-                if is_streaming {
-                    return stream_upstream_body(
-                        res,
-                        upstream_headers,
-                        status_code,
-                        app_state.clone(),
-                        selected.name.clone(),
-                        selected.is_probe,
-                        "completions",
-                        target_model,
-                        telemetry.clone(),
-                        trace_id.clone(),
-                        parent_span_id.clone(),
-                        request_id.clone(),
-                        start_time,
-                        attempts,
-                    )
-                    .into_response();
-                }
-
-                let target_provider_state = app_state
-                    .providers
-                    .iter()
-                    .find(|p| p.name == selected.name)
-                    .unwrap();
-
-                let res_body = match res.bytes().await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        warn!(
-                            request_id = %request_id,
-                            "Failed to read success response body from {}: {}",
-                            selected.name, e
-                        );
-                        strategy
-                            .feedback(
-                                target_provider_state,
-                                false,
-                                selected.is_probe,
-                                Some(status_code),
-                                None,
-                            )
-                            .await;
-                        telemetry.emit(TelemetryEvent::UpdateStatus {
-                            provider: selected.name.clone(),
-                            status: circuit_status(target_provider_state).await,
-                        });
-                        continue;
-                    },
-                };
-
-                let (input_tokens, output_tokens) = serde_json::from_slice::<Value>(&res_body)
-                    .map(|v| {
-                        let usage = v.get("usage");
-                        let input = usage
-                            .and_then(|u| u.get("prompt_tokens"))
-                            .and_then(|t| t.as_u64())
-                            .unwrap_or(0);
-                        let output = usage
-                            .and_then(|u| u.get("completion_tokens"))
-                            .and_then(|t| t.as_u64())
-                            .unwrap_or(0);
-                        (input, output)
-                    })
-                    .unwrap_or((0, 0));
-
-                strategy
-                    .feedback(
-                        target_provider_state,
-                        true,
-                        selected.is_probe,
-                        Some(status_code),
-                        None,
-                    )
-                    .await;
-                telemetry.emit(TelemetryEvent::UpdateStatus {
-                    provider: selected.name.clone(),
-                    status: circuit_status(target_provider_state).await,
-                });
-
-                target_provider_state
-                    .successes
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                target_provider_state
-                    .tokens_input
-                    .fetch_add(input_tokens, std::sync::atomic::Ordering::Relaxed);
-                target_provider_state
-                    .tokens_output
-                    .fetch_add(output_tokens, std::sync::atomic::Ordering::Relaxed);
-                {
-                    let elapsed_ms = start_time.elapsed().as_millis() as u64;
-                    let model_counters = target_provider_state
-                        .model_stats
-                        .counters(&ModelStats::key(&selected.name, &target_model));
-                    if let Some(key) = session_key(&app_state, &headers, &payload).as_deref() {
-                        app_state.session_affinity.pin(key, &selected.name);
-                    }
-                    for counters in [&model_counters, &route_counters] {
-                        counters
-                            .successes
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        counters
-                            .tokens_input
-                            .fetch_add(input_tokens, std::sync::atomic::Ordering::Relaxed);
-                        counters
-                            .tokens_output
-                            .fetch_add(output_tokens, std::sync::atomic::Ordering::Relaxed);
-                        counters.latency.record(elapsed_ms);
-                        // Non-streaming: first byte is indistinguishable from the
-                        // whole response, so total latency is the TTFT sample.
-                        counters.record_ttft(elapsed_ms * 1000);
-                    }
-                }
-
-                telemetry.emit(TelemetryEvent::RecordTransaction {
-                    operation: "completions".to_string(),
-                    provider: selected.name.clone(),
-                    model: target_model,
-                    input_tokens,
-                    output_tokens,
-                    duration: start_time.elapsed(),
-                    attempts,
-                    failure_reason: None,
-                    trace_id: trace_id.clone(),
-                    parent_span_id: parent_span_id.clone(),
-                    request_id: request_id.clone(),
-                });
-
-                let mut response = Response::new(Body::from(res_body));
-                *response.status_mut() = StatusCode::OK;
-                copy_response_headers(&upstream_headers, response.headers_mut());
-                return response.into_response();
-            },
-            Ok(res) => {
-                let status_code = res.status().as_u16();
-                warn!(
-                    request_id = %request_id,
-                    "Completions upstream {} failed with status {}",
-                    selected.name, status_code
-                );
-
-                let retry_after = extract_retry_after(res.headers());
-
-                let error_body = match res.bytes().await {
-                    Ok(b) => String::from_utf8_lossy(&b).to_string(),
-                    Err(e) => {
-                        warn!(
-                            request_id = %request_id,
-                            "Failed to read error body from {}: {}", selected.name, e
-                        );
-                        String::new()
-                    },
-                };
-                let parsed_error = if !error_body.is_empty() {
-                    serde_json::from_str::<Value>(&error_body)
-                        .ok()
-                        .and_then(|v| {
-                            v.get("error")
-                                .and_then(|e| e.get("message"))
-                                .and_then(|m| m.as_str().map(String::from))
-                        })
-                        .unwrap_or(error_body)
-                } else {
-                    String::new()
-                };
-                last_upstream_error = parsed_error;
-                last_failed_provider = selected.name.clone();
-                last_failed_status = status_code;
-
-                let target_provider_state = app_state
-                    .providers
-                    .iter()
-                    .find(|p| p.name == selected.name)
-                    .unwrap();
-                strategy
-                    .feedback(
-                        target_provider_state,
-                        false,
-                        selected.is_probe,
-                        Some(status_code),
-                        retry_after,
-                    )
-                    .await;
-                telemetry.emit(TelemetryEvent::UpdateStatus {
-                    provider: selected.name.clone(),
-                    status: circuit_status(target_provider_state).await,
-                });
-            },
-            Err(e) => {
-                warn!(
-                    request_id = %request_id,
-                    "Completions upstream {} connection failed: {}",
-                    selected.name, e
-                );
-                let target_provider_state = app_state
-                    .providers
-                    .iter()
-                    .find(|p| p.name == selected.name)
-                    .unwrap();
-                strategy
-                    .feedback(target_provider_state, false, selected.is_probe, None, None)
-                    .await;
-                telemetry.emit(TelemetryEvent::UpdateStatus {
-                    provider: selected.name.clone(),
-                    status: circuit_status(target_provider_state).await,
-                });
-            },
-        }
-    }
-
-    let message = if !last_upstream_error.is_empty() {
-        format!(
-            "All upstream completions providers failed or are rate-limited. Last error from {} ({}): {}",
-            last_failed_provider, last_failed_status, last_upstream_error
-        )
-    } else {
-        "All upstream completions providers failed or are rate-limited".to_string()
-    };
-    route_counters
-        .failures
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if let Some(key) = session_key(&app_state, &headers, &payload).as_deref() {
-        app_state.session_affinity.unpin(key);
-    }
-    json_error_response(&message, "server_error", StatusCode::BAD_GATEWAY)
+    proxy_request(
+        &COMPLETIONS_SPEC,
+        app_state,
+        telemetry,
+        request_id,
+        headers,
+        body,
+    )
+    .await
 }
 
+const CHAT_SPEC: EndpointSpec = EndpointSpec {
+    path: "chat/completions",
+    operation: "chat",
+    failure_noun: "chat completions",
+    streaming: true,
+};
+
 /// POST /v1/chat/completions
+///
+/// OpenAI-compatible chat completions with SSE streaming passthrough,
+/// routed through the provider pool with failover and usage accounting.
 pub async fn create_chat_completions(
     State((app_state, telemetry)): State<(Arc<AppState>, TelemetryClient)>,
     Extension(request_id): Extension<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    let mut payload: Value = match serde_json::from_slice(&body) {
-        Ok(p) => p,
-        Err(e) => {
-            return json_error_response(
-                &format!("Invalid JSON payload: {}", e),
-                "invalid_request_error",
-                StatusCode::BAD_REQUEST,
-            )
-        },
-    };
-
-    let requested_model = match payload.get("model").and_then(|m| m.as_str()) {
-        Some(m) => m,
-        None => {
-            return json_error_response(
-                "Missing required 'model' field",
-                "invalid_request_error",
-                StatusCode::BAD_REQUEST,
-            )
-        },
-    };
-
-    // Owned copy: `payload` is mutated per attempt, so the &str borrow cannot
-    // live across the routing loop. Names resolve through aliases and the
-    // configured default model before being rejected.
-    let route_name = match app_state.resolve_route(requested_model) {
-        Some(route) => route.to_string(),
-        None => {
-            return json_error_response(
-                &format!("Invalid or unmapped virtual model: {}", requested_model),
-                "invalid_request_error",
-                StatusCode::BAD_REQUEST,
-            )
-        },
-    };
-    let candidates = app_state.resolve_candidates(&route_name);
-    if candidates.is_empty() {
-        return json_error_response(
-            &format!("Invalid or unmapped virtual model: {}", requested_model),
-            "invalid_request_error",
-            StatusCode::BAD_REQUEST,
-        );
-    }
-
-    let is_streaming = payload
-        .get("stream")
-        .and_then(|s| s.as_bool())
-        .unwrap_or(false);
-    let (trace_id, parent_span_id) = extract_traceparent(&headers);
-
-    let strategy = AdaptivePriorityStrategy {
-        circuit: app_state.circuit,
-    };
-    let mut attempts = 0;
-    let start_time = Instant::now();
-    let mut last_upstream_error = String::new();
-    let mut last_failed_provider = String::new();
-    let mut last_failed_status: u16 = 0;
-
-    let candidates = ordered_candidates(
-        &app_state,
-        &route_name,
-        session_key(&app_state, &headers, &payload).as_deref(),
-        &candidates,
-    );
-    let candidate_states: Vec<&ProviderState> = candidates.iter().map(|(p, _)| *p).collect();
-
-    // Route-level counters: one row per virtual model, one request each,
-    // regardless of how many provider attempts it takes.
-    let route_counters = app_state.route_stats.counters(&route_name);
-    route_counters
-        .requests
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-    while let Some(selected) = strategy.select(&candidate_states).await {
-        attempts += 1;
-        let target_model = match candidates
-            .iter()
-            .find(|(p, _)| p.name == selected.name)
-            .map(|(_, m)| m.clone())
-        {
-            Some(m) => m,
-            None => {
-                warn!(
-                    request_id = %request_id,
-                    "Provider {} removed from candidates during chat routing",
-                    selected.name
-                );
-                continue;
-            },
-        };
-
-        payload["model"] = Value::String(target_model.clone());
-        let rewritten_body = Bytes::from(serde_json::to_vec(&payload).unwrap());
-
-        let endpoint_url = match selected.base_url.join("chat/completions") {
-            Ok(url) => url,
-            Err(e) => {
-                error!("Invalid base URL path join for {}: {}", selected.name, e);
-                continue;
-            },
-        };
-
-        let mut req = app_state
-            .http_client
-            .post(endpoint_url.as_str())
-            .body(rewritten_body)
-            .timeout(Duration::from_secs(
-                selected
-                    .upstream_timeout_secs
-                    .unwrap_or(app_state.upstream_timeout_secs),
-            ))
-            .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {}", selected.api_key));
-
-        if let Some(traceparent) = headers.get("traceparent") {
-            req = req.header("traceparent", traceparent);
-        }
-
-        debug!(
-            "Chat request routing to {} (attempt {})",
-            selected.name, attempts
-        );
-
-        // Increment request counter
-        if let Some(target) = app_state.providers.iter().find(|p| p.name == selected.name) {
-            target
-                .requests
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            target
-                .model_stats
-                .counters(&ModelStats::key(&selected.name, &target_model))
-                .requests
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-
-        let res = req.send().await;
-
-        match res {
-            Ok(res) if res.status().is_success() => {
-                let status_code = res.status().as_u16();
-                let upstream_headers = res.headers().clone();
-                let target_provider_state = app_state
-                    .providers
-                    .iter()
-                    .find(|p| p.name == selected.name)
-                    .unwrap();
-
-                if is_streaming {
-                    return stream_upstream_body(
-                        res,
-                        upstream_headers,
-                        status_code,
-                        app_state.clone(),
-                        selected.name.clone(),
-                        selected.is_probe,
-                        "chat",
-                        target_model,
-                        telemetry.clone(),
-                        trace_id.clone(),
-                        parent_span_id.clone(),
-                        request_id.clone(),
-                        start_time,
-                        attempts,
-                    )
-                    .into_response();
-                } else {
-                    // Report Success feedback (non-streaming: immediate, as before)
-                    strategy
-                        .feedback(
-                            target_provider_state,
-                            true,
-                            selected.is_probe,
-                            Some(status_code),
-                            None,
-                        )
-                        .await;
-                    telemetry.emit(TelemetryEvent::UpdateStatus {
-                        provider: selected.name.clone(),
-                        status: circuit_status(target_provider_state).await,
-                    });
-
-                    let res_body = match res.bytes().await {
-                        Ok(b) => b,
-                        Err(e) => {
-                            warn!(
-                                request_id = %request_id,
-                                "Failed to read success response body from {}: {}",
-                                selected.name, e
-                            );
-                            strategy
-                                .feedback(
-                                    target_provider_state,
-                                    false,
-                                    selected.is_probe,
-                                    Some(status_code),
-                                    None,
-                                )
-                                .await;
-                            telemetry.emit(TelemetryEvent::UpdateStatus {
-                                provider: selected.name.clone(),
-                                status: circuit_status(target_provider_state).await,
-                            });
-                            continue;
-                        },
-                    };
-
-                    // Parse token counts from upstream response
-                    let (input_tokens, output_tokens, cached_tokens) =
-                        serde_json::from_slice::<Value>(&res_body)
-                            .map(|v| {
-                                let usage = v.get("usage");
-                                let input = usage
-                                    .and_then(|u| u.get("prompt_tokens"))
-                                    .and_then(|t| t.as_u64())
-                                    .unwrap_or(0);
-                                let output = usage
-                                    .and_then(|u| u.get("completion_tokens"))
-                                    .and_then(|t| t.as_u64())
-                                    .unwrap_or(0);
-                                let cached = usage
-                                    .and_then(|u| u.get("prompt_tokens_details"))
-                                    .and_then(|d| d.get("cached_tokens"))
-                                    .and_then(|t| t.as_u64())
-                                    .unwrap_or(0);
-                                (input, output, cached)
-                            })
-                            .unwrap_or((0, 0, 0));
-
-                    // Increment local counters
-                    target_provider_state
-                        .successes
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    target_provider_state
-                        .tokens_input
-                        .fetch_add(input_tokens, std::sync::atomic::Ordering::Relaxed);
-                    target_provider_state
-                        .tokens_output
-                        .fetch_add(output_tokens, std::sync::atomic::Ordering::Relaxed);
-                    {
-                        let elapsed_ms = start_time.elapsed().as_millis() as u64;
-                        let model_counters = target_provider_state
-                            .model_stats
-                            .counters(&ModelStats::key(&selected.name, &target_model));
-                        if let Some(key) = session_key(&app_state, &headers, &payload).as_deref() {
-                            app_state.session_affinity.pin(key, &selected.name);
-                        }
-                        for counters in [&model_counters, &route_counters] {
-                            counters
-                                .successes
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            counters
-                                .tokens_input
-                                .fetch_add(input_tokens, std::sync::atomic::Ordering::Relaxed);
-                            counters
-                                .tokens_output
-                                .fetch_add(output_tokens, std::sync::atomic::Ordering::Relaxed);
-                            counters.latency.record(elapsed_ms);
-                            // Non-streaming: first byte is indistinguishable from the
-                            // whole response, so total latency is the TTFT sample.
-                            counters.record_ttft(elapsed_ms * 1000);
-                            counters
-                                .cached_tokens
-                                .fetch_add(cached_tokens, std::sync::atomic::Ordering::Relaxed);
-                        }
-                    }
-
-                    // Push Telemetry Metrics
-                    telemetry.emit(TelemetryEvent::RecordTransaction {
-                        operation: "chat".to_string(),
-                        provider: selected.name.clone(),
-                        model: target_model,
-                        input_tokens,
-                        output_tokens,
-                        duration: start_time.elapsed(),
-                        attempts,
-                        failure_reason: None,
-                        trace_id: trace_id.clone(),
-                        parent_span_id: parent_span_id.clone(),
-                        request_id: request_id.clone(),
-                    });
-
-                    let mut response = Response::new(Body::from(res_body));
-                    *response.status_mut() = StatusCode::OK;
-                    copy_response_headers(&upstream_headers, response.headers_mut());
-                    return response.into_response();
-                }
-            },
-            Ok(res) => {
-                let status_code = res.status().as_u16();
-                warn!(
-                    request_id = %request_id,
-                    "Chat completions upstream {} failed with status {}",
-                    selected.name, status_code
-                );
-
-                // Extract Retry-After before consuming the response body
-                let retry_after = extract_retry_after(res.headers());
-
-                // Best-effort: read upstream error body for final 502 response
-                let error_body = match res.bytes().await {
-                    Ok(b) => String::from_utf8_lossy(&b).to_string(),
-                    Err(e) => {
-                        warn!(
-                            request_id = %request_id,
-                            "Failed to read error body from {}: {}", selected.name, e
-                        );
-                        String::new()
-                    },
-                };
-                let parsed_error = if !error_body.is_empty() {
-                    serde_json::from_str::<Value>(&error_body)
-                        .ok()
-                        .and_then(|v| {
-                            v.get("error")
-                                .and_then(|e| e.get("message"))
-                                .and_then(|m| m.as_str().map(String::from))
-                        })
-                        .unwrap_or(error_body)
-                } else {
-                    String::new()
-                };
-                last_upstream_error = parsed_error;
-                last_failed_provider = selected.name.clone();
-                last_failed_status = status_code;
-
-                let target_provider_state = app_state
-                    .providers
-                    .iter()
-                    .find(|p| p.name == selected.name)
-                    .unwrap();
-                strategy
-                    .feedback(
-                        target_provider_state,
-                        false,
-                        selected.is_probe,
-                        Some(status_code),
-                        retry_after,
-                    )
-                    .await;
-                telemetry.emit(TelemetryEvent::UpdateStatus {
-                    provider: selected.name.clone(),
-                    status: circuit_status(target_provider_state).await,
-                });
-            },
-            Err(e) => {
-                warn!(
-                    request_id = %request_id,
-                    "Chat completions upstream {} connection failed: {}",
-                    selected.name, e
-                );
-                let target_provider_state = app_state
-                    .providers
-                    .iter()
-                    .find(|p| p.name == selected.name)
-                    .unwrap();
-                strategy
-                    .feedback(target_provider_state, false, selected.is_probe, None, None)
-                    .await;
-                telemetry.emit(TelemetryEvent::UpdateStatus {
-                    provider: selected.name.clone(),
-                    status: circuit_status(target_provider_state).await,
-                });
-            },
-        }
-    }
-
-    let message = if !last_upstream_error.is_empty() {
-        format!(
-            "All upstream chat completions providers failed or are rate-limited. Last error from {} ({}): {}",
-            last_failed_provider, last_failed_status, last_upstream_error
-        )
-    } else {
-        "All upstream chat completions providers failed or are rate-limited".to_string()
-    };
-    route_counters
-        .failures
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if let Some(key) = session_key(&app_state, &headers, &payload).as_deref() {
-        app_state.session_affinity.unpin(key);
-    }
-    json_error_response(&message, "server_error", StatusCode::BAD_GATEWAY)
+    proxy_request(&CHAT_SPEC, app_state, telemetry, request_id, headers, body).await
 }
-
-/// Reads the current circuit and rate-limit state to produce a status code
 /// for telemetry: 0 = Healthy, 1 = Cooldown, 2 = Tripped.
 /// Forwards an upstream SSE body to the client chunk-by-chunk (never buffered),
 /// and defers circuit-breaker feedback until the stream ends so that a failure

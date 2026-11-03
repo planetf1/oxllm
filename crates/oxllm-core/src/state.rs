@@ -422,6 +422,19 @@ pub enum RoutingPolicy {
     Cheapest,
 }
 
+/// One routable candidate for a virtual model: the provider, the upstream
+/// model name, and the target's tuning fields.
+#[derive(Clone)]
+pub struct RouteCandidate<'a> {
+    pub provider: &'a ProviderState,
+    pub model: String,
+    /// Explicit priority (lower = preferred); `None` sorts after all
+    /// prioritized targets.
+    pub priority: Option<u32>,
+    /// Proportional-sharing weight within the candidate's priority tier.
+    pub weight: Option<u32>,
+}
+
 impl AppState {
     /// Virtual model names known from configuration, sorted for stable output.
     pub fn route_stats_keys(&self) -> Vec<String> {
@@ -453,25 +466,27 @@ impl AppState {
     /// the targets' explicit `priority` (lower first). Targets without a
     /// priority keep their configured order and sort after all prioritized
     /// ones; with no priorities set anywhere this is exactly the
-    /// configured array order.
-    pub fn resolve_candidates(&self, virtual_model: &str) -> Vec<(&ProviderState, String)> {
+    /// configured array order. Weights ride along for the routing policies.
+    pub fn resolve_candidates(&self, virtual_model: &str) -> Vec<RouteCandidate<'_>> {
         let targets = match self.virtual_models.get(virtual_model) {
             Some(t) => t,
             None => return Vec::new(),
         };
 
-        let mut candidates = Vec::new();
+        let mut candidates: Vec<RouteCandidate> = Vec::new();
         for target in targets {
             if let Some(provider) = self.providers.iter().find(|p| p.name == target.provider) {
-                candidates.push((provider, target.model.clone(), target.priority));
+                candidates.push(RouteCandidate {
+                    provider,
+                    model: target.model.clone(),
+                    priority: target.priority,
+                    weight: target.weight,
+                });
             }
         }
         // Stable sort: equal or absent priorities keep configuration order.
-        candidates.sort_by_key(|&(_, _, priority)| priority.unwrap_or(u32::MAX));
+        candidates.sort_by_key(|c| c.priority.unwrap_or(u32::MAX));
         candidates
-            .into_iter()
-            .map(|(provider, model, _)| (provider, model))
-            .collect()
     }
 }
 

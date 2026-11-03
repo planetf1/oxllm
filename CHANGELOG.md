@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Per-target `weight` for proportional load sharing** (issue #10):
+  under the default policy, candidates carrying a `weight` share traffic
+  via a per-request weighted lottery within their priority tier
+  (probability proportional to weight; healthy candidates only, since
+  circuit/rate-limit checks still gate the chain). Ignored by `fastest`
+  and `cheapest`; no weights set preserves strict order.
+- **`--host` flag** (env `OXLLM_HOST`, default `127.0.0.1`) on `status`,
+  `reload`, and the `provider` subcommands (issue #9): CLI commands can
+  now reach a remote daemon or one bound to IPv6 loopback (`--host ::1`,
+  bracketed automatically in URLs) instead of hardcoding 127.0.0.1.
+
+### Fixed
+- **`oxllm install` refuses an occupied port** (issue #8): installing
+  while something already listens on the configured port used to produce
+  a service that crash-looped on bind failures under KeepAlive. The
+  preflight check runs before anything is written, so a refusal leaves
+  an existing installation untouched.
+- **An explicit `policies.<vm> = "priority"` behaved like `fastest`**: the
+  policy match fell through to latency ordering. Explicit `priority` now
+  means strict configured order, same as omitting the policy.
+
+### Changed
+- **The four proxy handlers share one routing loop** (issue #11):
+  chat, completions, embeddings, and systemone were four ~300-line copies
+  of the same parse/resolve/failover/feedback skeleton. They are now thin
+  endpoint specs over a single `proxy_request` loop (routes.rs drops by
+  ~960 lines); usage parsing accepts both OpenAI-style and systemone
+  token fields. All existing endpoint tests (SSE streaming, failover,
+  usage accounting, 502s) pass unchanged.
+
 ## [0.1.20] - 2026-11-03
 
 ### Added

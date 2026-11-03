@@ -87,6 +87,12 @@ pub struct VirtualModelTarget {
     /// strict array-order semantics.
     #[serde(default)]
     pub priority: Option<u32>,
+    /// Proportional load sharing within one priority tier under the default
+    /// policy: per request, candidates carrying a weight are drawn as a
+    /// lottery with probability proportional to it. Ignored by the
+    /// `fastest` and `cheapest` policies.
+    #[serde(default)]
+    pub weight: Option<u32>,
 }
 
 /// Routing policy for one virtual model. Omitted virtual models keep strict
@@ -208,6 +214,19 @@ impl Config {
             return Err(OxllmError::ConfigLoad(
                 "server.circuit_failure_threshold must be at least 1".into(),
             ));
+        }
+
+        // 6. Weights must be positive
+        for (vm_name, targets) in &self.virtual_models {
+            for target in targets {
+                if target.weight == Some(0) {
+                    return Err(OxllmError::ConfigLoad(format!(
+                        "Virtual model '{}' target for provider '{}' has weight 0; \
+                         weights must be at least 1",
+                        vm_name, target.provider
+                    )));
+                }
+            }
         }
 
         Ok(())
@@ -395,6 +414,21 @@ vm = [{ provider = "p", model = "m" }]
             .aliases
             .insert("gpt-4o".to_string(), "vm".to_string());
         config.server.default_model = Some("vm".to_string());
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_weight() {
+        let mut config = minimal_config();
+        config.virtual_models.get_mut("vm").unwrap()[0].weight = Some(0);
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("weight"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_validate_accepts_positive_weight() {
+        let mut config = minimal_config();
+        config.virtual_models.get_mut("vm").unwrap()[0].weight = Some(3);
         config.validate().unwrap();
     }
 

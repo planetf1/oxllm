@@ -224,7 +224,7 @@ Every routed transaction generates an OpenTelemetry Span containing the official
 The binary supports clean POSIX subcommands for daemon management and operational debugging:
 * `oxllm serve --config /path/to/config.toml` (Starts the proxy. Use `-v` for per-request routing info, `-vv` for full trace.)
 * `oxllm validate --config /path/to/config.toml` (Parses configuration syntax, resolves environment variables, checks upstream network paths, then exits)
-* `oxllm status` (Queries the running daemon locally over loopback and prints the virtual model routing table plus per-provider counters)
+* `oxllm status` (Queries the running daemon over `--host`/`-p PORT` — default `127.0.0.1:8080`, `OXLLM_HOST`/`OXLLM_PORT` — and prints the virtual model routing table plus per-provider counters)
 * `oxllm stop` (Gracefully stops the daemon via SIGTERM — drains in-flight SSE streams before exiting)
 * `oxllm reload` (Asks the running daemon to reload via `POST /reload` on `-p PORT` (default 8080); prints the daemon's error and exits non-zero if the config is rejected or no daemon is running. `--pid <pid>` signals a chosen process with SIGHUP instead)
 

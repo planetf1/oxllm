@@ -24,3 +24,4 @@ opentelemetry_sdk = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 opentelemetry-semantic-conventions = { workspace = true }
 socket2 = { workspace = true }
+rand = { workspace = true }

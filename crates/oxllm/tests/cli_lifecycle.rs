@@ -84,6 +84,74 @@ fn install_refuses_existing_unit_without_force() {
     }
 }
 
+/// `oxllm install` must refuse an occupied port before writing anything:
+/// installing into a port conflict would produce a crash-looping service,
+/// and the refusal must leave an existing installation untouched (issue #8).
+#[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn install_refuses_occupied_port() {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    #[cfg(target_os = "macos")]
+    let unit = std::path::Path::new(&home).join("Library/LaunchAgents/org.oxllm.proxy.plist");
+    #[cfg(target_os = "linux")]
+    let unit = std::path::Path::new(&home).join(".config/systemd/user/oxllm.service");
+
+    // Occupy a port and point a config at it.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let dir = std::env::temp_dir().join(format!("oxllm-port-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = dir.join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+[server]
+host = "127.0.0.1"
+port = {port}
+otel_endpoint = "http://127.0.0.1:4318"
+
+[[providers]]
+name = "p"
+enabled = true
+base_url = "http://127.0.0.1:9/v1/"
+api_key = "k"
+models = ["m"]
+
+[virtual_models]
+vm = [{{ provider = "p", model = "m" }}]
+"#
+        ),
+    )
+    .unwrap();
+
+    let before = std::fs::read(&unit).ok();
+    let out = oxllm()
+        .args(["install", "--force", "--config", config.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "install must refuse an occupied port"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("already in use"), "got: {}", stdout);
+
+    // An existing installation must be byte-identical after the refusal
+    // (only checkable where one exists; on CI nothing must have been
+    // created).
+    let after = std::fs::read(&unit).ok();
+    match (&before, &after) {
+        (Some(b), Some(a)) => assert_eq!(b, a, "refusal must not modify the installed unit"),
+        (None, None) => {},
+        (None, Some(_)) => panic!("install wrote a unit despite refusing the port"),
+        (Some(_), None) => panic!("install removed the unit despite refusing the port"),
+    }
+
+    let _ = std::fs::remove_file(&config);
+    let _ = std::fs::remove_dir(&dir);
+}
+
 /// SIGTERM drains in-flight requests only until
 /// `server.shutdown_timeout_secs` expires: a request stuck on a hung
 /// upstream must not hold the shutdown hostage. With a 1s deadline and a
