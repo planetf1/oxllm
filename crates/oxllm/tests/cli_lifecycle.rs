@@ -48,12 +48,12 @@ fn status_exits_nonzero_when_no_daemon_listens() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("not running"), "got: {}", stdout);
 }
-
 /// `oxllm install` must refuse to replace an existing service without
 /// --force, before touching launchctl/systemd (issue #2 acceptance: never
 /// silently overwrite). On a machine where nothing is installed, a dummy
-/// unit file is created first and removed afterwards; the refusal path
-/// exits before any service manager runs.
+/// unit file is created first and deliberately left behind: nextest runs
+/// tests as separate processes, so a parallel test deleting this path is a
+/// race, and the file is harmless on an ephemeral CI runner.
 #[test]
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn install_refuses_existing_unit_without_force() {
@@ -63,13 +63,10 @@ fn install_refuses_existing_unit_without_force() {
     #[cfg(target_os = "linux")]
     let unit = std::path::Path::new(&home).join(".config/systemd/user/oxllm.service");
 
-    let created = if !unit.exists() {
+    if !unit.exists() {
         std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
         std::fs::write(&unit, "dummy").unwrap();
-        true
-    } else {
-        false
-    };
+    }
 
     let out = oxllm().arg("install").output().unwrap();
     assert!(
@@ -78,15 +75,13 @@ fn install_refuses_existing_unit_without_force() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("already installed"), "got: {}", stdout);
-
-    if created {
-        std::fs::remove_file(&unit).unwrap();
-    }
 }
-
 /// `oxllm install` must refuse an occupied port before writing anything:
 /// installing into a port conflict would produce a crash-looping service,
 /// and the refusal must leave an existing installation untouched (issue #8).
+/// The byte-identity check runs only where a real installation pre-exists;
+/// the unit path may also be a parallel test's fixture, whose lifecycle is
+/// not this test's to assert about.
 #[test]
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn install_refuses_occupied_port() {
@@ -125,6 +120,8 @@ vm = [{{ provider = "p", model = "m" }}]
     )
     .unwrap();
 
+    // A pre-existing real installation must be byte-identical afterwards;
+    // the refusal runs before anything is written.
     let before = std::fs::read(&unit).ok();
     let out = oxllm()
         .args(["install", "--force", "--config", config.to_str().unwrap()])
@@ -136,16 +133,13 @@ vm = [{{ provider = "p", model = "m" }}]
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("already in use"), "got: {}", stdout);
-
-    // An existing installation must be byte-identical after the refusal
-    // (only checkable where one exists; on CI nothing must have been
-    // created).
-    let after = std::fs::read(&unit).ok();
-    match (&before, &after) {
-        (Some(b), Some(a)) => assert_eq!(b, a, "refusal must not modify the installed unit"),
-        (None, None) => {},
-        (None, Some(_)) => panic!("install wrote a unit despite refusing the port"),
-        (Some(_), None) => panic!("install removed the unit despite refusing the port"),
+    if let Some(before) = before {
+        let after = std::fs::read(&unit).ok();
+        assert_eq!(
+            Some(before),
+            after,
+            "refusal must not modify an existing installation"
+        );
     }
 
     let _ = std::fs::remove_file(&config);

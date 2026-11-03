@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bracketed automatically in URLs) instead of hardcoding 127.0.0.1.
 
 ### Fixed
+- **Flaky parallel install tests on CI**: the two install-refusal tests
+  both created and deleted a dummy unit file at the same fixed path, and
+  nextest runs tests as separate processes — one test's cleanup deleted
+  the other's fixture mid-assertion on runners without a real
+  installation (green locally against a real install, red on CI). The
+  dummy is now created once and left behind, and the byte-identity check
+  only runs where a real installation pre-exists.
 - **`oxllm install` refuses an occupied port** (issue #8): installing
   while something already listens on the configured port used to produce
   a service that crash-looped on bind failures under KeepAlive. The
