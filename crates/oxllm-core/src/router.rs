@@ -1,4 +1,4 @@
-use crate::state::{CircuitState, ProviderState, SelectedProvider};
+use crate::state::{CircuitConfig, CircuitState, ProviderState, SelectedProvider};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tracing::info;
@@ -23,7 +23,21 @@ pub trait RoutingStrategy: Send + Sync {
 
 /// The default routing strategy: orders by priority, failover with exponential backoffs,
 /// strict HalfOpen single-probe guards, and dynamic idle-based penalty decay.
-pub struct AdaptivePriorityStrategy;
+/// Circuit sensitivity comes from the carried [`CircuitConfig`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AdaptivePriorityStrategy {
+    pub circuit: CircuitConfig,
+}
+
+impl AdaptivePriorityStrategy {
+    /// Exponential circuit cooldown: base cooldown doubling for each
+    /// failure beyond the threshold.
+    fn open_cooldown(&self, failures: u32) -> Duration {
+        let exponent = failures.saturating_sub(self.circuit.failure_threshold);
+        let multiplier = 2u64.pow(exponent);
+        Duration::from_secs(self.circuit.base_cooldown_secs * multiplier)
+    }
+}
 
 impl RoutingStrategy for AdaptivePriorityStrategy {
     async fn select(&self, candidates: &[&ProviderState]) -> Option<SelectedProvider> {
@@ -48,8 +62,8 @@ impl RoutingStrategy for AdaptivePriorityStrategy {
                             *last_attempt =
                                 Some(last_time + Duration::from_secs(decay_steps * 300));
 
-                            // If failures age below 3, rehabilitate open circuits
-                            if *failures < 3 {
+                            // If failures age below the threshold, rehabilitate open circuits
+                            if *failures < self.circuit.failure_threshold {
                                 let mut circ = provider.circuit.write().await;
                                 if let CircuitState::Open { .. } = *circ {
                                     *circ = CircuitState::Closed;
@@ -183,7 +197,8 @@ impl RoutingStrategy for AdaptivePriorityStrategy {
             // Handle Failures
             if status_code == Some(429) {
                 // Rate-limited: extract or apply default backoff
-                let cooldown = retry_after.unwrap_or_else(|| Duration::from_secs(30)); // 30s default fallback
+                let cooldown = retry_after
+                    .unwrap_or_else(|| Duration::from_secs(self.circuit.rate_limit_fallback_secs));
                 let mut rl = provider.rate_limited_until.write().await;
                 *rl = Some(now + cooldown);
                 info!(
@@ -191,11 +206,9 @@ impl RoutingStrategy for AdaptivePriorityStrategy {
                     "Rate-limited {} for {}s",
                     provider.name, cooldown.as_secs()
                 );
-            } else if *failures >= 3 || is_probe {
+            } else if *failures >= self.circuit.failure_threshold || is_probe {
                 // Tripped or failed probe: trigger exponential circuit cooldown
-                let exponent = failures.saturating_sub(3) as u32;
-                let multiplier = 2u64.pow(exponent);
-                let cooldown = Duration::from_secs(60 * multiplier);
+                let cooldown = self.open_cooldown(*failures);
 
                 let mut state = provider.circuit.write().await;
                 *state = CircuitState::Open {
@@ -354,7 +367,7 @@ mod tests {
         let p2 = setup_provider("prov2");
         let candidates = vec![&p1, &p2];
 
-        let strategy = AdaptivePriorityStrategy;
+        let strategy = AdaptivePriorityStrategy::default();
         let selected = strategy.select(&candidates).await.unwrap();
 
         assert_eq!(selected.name, "prov1");
@@ -373,7 +386,7 @@ mod tests {
             };
         }
 
-        let strategy = AdaptivePriorityStrategy;
+        let strategy = AdaptivePriorityStrategy::default();
         strategy.feedback(&p, true, false, Some(200), None).await;
 
         assert_eq!(*p.consecutive_failures.read().await, 0);
@@ -383,7 +396,7 @@ mod tests {
     #[tokio::test]
     async fn test_router_feedback_failure_trips_circuit() {
         let p = setup_provider("prov1");
-        let strategy = AdaptivePriorityStrategy;
+        let strategy = AdaptivePriorityStrategy::default();
 
         // First failure
         strategy.feedback(&p, false, false, Some(500), None).await;
@@ -407,7 +420,7 @@ mod tests {
     #[tokio::test]
     async fn test_router_feedback_rate_limited() {
         let p = setup_provider("prov1");
-        let strategy = AdaptivePriorityStrategy;
+        let strategy = AdaptivePriorityStrategy::default();
 
         strategy
             .feedback(&p, false, false, Some(429), Some(Duration::from_secs(10)))
@@ -429,7 +442,7 @@ mod tests {
             };
         }
 
-        let strategy = AdaptivePriorityStrategy;
+        let strategy = AdaptivePriorityStrategy::default();
         let candidates = vec![&p];
 
         // First request should get a probe
@@ -602,7 +615,7 @@ mod tests {
             *last_attempt = Some(Instant::now() - Duration::from_secs(660));
         }
 
-        let strategy = AdaptivePriorityStrategy;
+        let strategy = AdaptivePriorityStrategy::default();
         let candidates = vec![&p];
 
         // Select triggers decay check
@@ -610,5 +623,79 @@ mod tests {
 
         // Should decay by 2 failures (660s / 300s = 2)
         assert_eq!(*p.consecutive_failures.read().await, 2);
+    }
+
+    /// A configured threshold of 1 opens the circuit on the first failure
+    /// (twitchy free-tier upstream), while the default still needs three.
+    #[tokio::test]
+    async fn test_circuit_threshold_is_configurable() {
+        let twitchy = setup_provider("twitchy");
+        let strategy = AdaptivePriorityStrategy {
+            circuit: CircuitConfig {
+                failure_threshold: 1,
+                ..CircuitConfig::default()
+            },
+        };
+        strategy
+            .feedback(&twitchy, false, false, Some(500), None)
+            .await;
+        assert!(
+            matches!(*twitchy.circuit.read().await, CircuitState::Open { .. }),
+            "threshold=1 must open on the first failure"
+        );
+
+        let patient = setup_provider("patient");
+        let default_strategy = AdaptivePriorityStrategy::default();
+        default_strategy
+            .feedback(&patient, false, false, Some(500), None)
+            .await;
+        assert_eq!(*patient.circuit.read().await, CircuitState::Closed);
+    }
+
+    /// The open-circuit cooldown scales from the configured base, not the
+    /// hardcoded 60s, and a 429 without Retry-After uses the configured
+    /// fallback instead of 30s.
+    #[tokio::test]
+    async fn test_circuit_cooldown_and_rate_limit_fallback_are_configurable() {
+        let p = setup_provider("prov1");
+        {
+            let mut failures = p.consecutive_failures.write().await;
+            *failures = 3;
+        }
+        let strategy = AdaptivePriorityStrategy {
+            circuit: CircuitConfig {
+                base_cooldown_secs: 10,
+                rate_limit_fallback_secs: 5,
+                ..CircuitConfig::default()
+            },
+        };
+        strategy.feedback(&p, false, false, Some(500), None).await;
+        let state = *p.circuit.read().await;
+        match state {
+            CircuitState::Open { until } => {
+                let cooldown = until.saturating_duration_since(Instant::now());
+                assert!(
+                    cooldown >= Duration::from_secs(9),
+                    "cooldown should start from the 10s base, got {:?}",
+                    cooldown
+                );
+            },
+            state => panic!("Expected Open circuit state, got {:?}", state),
+        }
+
+        let q = setup_provider("prov2");
+        strategy.feedback(&q, false, false, Some(429), None).await;
+        let rl = *q.rate_limited_until.read().await;
+        match rl {
+            Some(until) => {
+                let backoff = until.saturating_duration_since(Instant::now());
+                assert!(
+                    backoff >= Duration::from_secs(4),
+                    "no-Retry-After 429 should use the 5s fallback, got {:?}",
+                    backoff
+                );
+            },
+            None => panic!("expected a rate-limit window"),
+        }
     }
 }

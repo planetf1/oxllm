@@ -22,3 +22,9 @@ target
 .antigravitycli/
 
 config-local-test.toml
+
+# Local embedding-model caches from experiments (274MB, re-downloadable)
+.fastembed_cache/
+
+# Agent session working state
+STATE.md

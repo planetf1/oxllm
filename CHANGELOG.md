@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Model aliases** (`[aliases]` table) and `server.default_model`:
+  unmodified OpenAI clients can address virtual models by the names they
+  were built with (`gpt-4o = "smart"`), any unknown model name can route
+  to a default instead of 400, and `GET /v1/models` lists the aliases.
+- **Circuit-breaker tuning** in `[server]`: `circuit_failure_threshold`
+  (default 3), `circuit_base_cooldown_secs` (default 60), and
+  `rate_limit_fallback_secs` (default 30) — tune sensitivity per deployment
+  instead of the hardcoded values.
+- **Graceful-shutdown deadline**: `server.shutdown_timeout_secs`
+  (default 30, `0` = wait forever) bounds the post-SIGTERM drain, so a
+  request stuck on a hung upstream can no longer hold shutdown hostage.
+- **Config-watcher toggle**: `server.watch_config = false` disables the
+  config file watcher (edge/flash targets, or strictly manual reloads).
+
+### Changed
+- **Hot-reload preserves runtime state**: providers that keep their name
+  carry their circuit-breaker position, failure/rate-limit windows,
+  request/token counters, admin offline overrides, and session-affinity
+  pins across a reload. A config edit mid-incident no longer re-enables a
+  provider taken offline or resets failover history. Server fields that
+  cannot be hot-swapped (`port`, `host`, `bind_family`, `otel_endpoint`,
+  affinity TTL/capacity, `shutdown_timeout_secs`, `watch_config`) now
+  produce explicit "restart required" warnings in the `POST /reload`
+  response and logs.
+- **`oxllm status` and the `oxllm provider` subcommands exit non-zero**
+  when no daemon can be found, matching `reload` and `stop`.
+
 ## [0.1.18] - 2026-11-03
 
 ### Added

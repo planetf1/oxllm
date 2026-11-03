@@ -21,7 +21,8 @@ Built to operate entirely in memory with zero local disk persistence, `oxllm` is
 * **Session Affinity**: Requests carrying a session key stay on one provider while it is healthy, keeping upstream prompt-prefix caches warm. Bounded LRU, idle TTL, automatic break-and-re-pin on failure.
 * **Optional Inbound Auth**: `server.api_keys` gates the public `/v1/*` routes behind constant-time `Authorization: Bearer` checks. Admin routes are always localhost-only.
 * **Raw Completions Route**: `POST /v1/completions` (with SSE streaming) for fill-in-the-middle clients such as editor autocomplete.
-* **Hot Config Reloading**: the daemon watches `config.toml` and hot-reloads on change (invalid edits are rejected, the old config keeps serving). Also available on demand via `POST /reload` or `SIGHUP` — hot-swaps the provider pool via `tokio::sync::watch` without dropping connections.
+* **Hot Config Reloading**: the daemon watches `config.toml` and hot-reloads on change (invalid edits are rejected, the old config keeps serving). Also available on demand via `POST /reload` or `SIGHUP` — hot-swaps the provider pool via `tokio::sync::watch` without dropping connections, preserving circuit state, counters, and session pins for providers that keep their name.
+* **Model Aliases & Default Route**: `[aliases]` maps client-facing names (`gpt-4o = "smart"`) onto virtual models, and `server.default_model` routes unknown names instead of 400 — point unmodified OpenAI clients straight at it.
 * **Local Stats Dashboard**: Every provider tracks request count, success count, token volumes, and last request time via lock-free atomics. Query via `oxllm status` or `curl /status` — no external collector needed.
 * **OOM-Proof Telemetry**: Bounded OTel event channel (1024 cap) with non-blocking `try_send` drops. If `otelite` is offline, telemetry degrades gracefully and the proxy keeps running.
 * **W3C Trace Context Propagation**: Extracts and injects `traceparent` headers for continuous trace spans.
@@ -197,6 +198,12 @@ oxllm serve --config config-local-test.toml
 | `otel_endpoint` | — | OTLP HTTP endpoint (e.g. `http://127.0.0.1:4318`). If unreachable, proxy starts without telemetry. Records spans with GenAI semantic attributes, 3 metrics (provider status gauge, request duration histogram, token counter), and W3C trace context propagation. See [architecture docs](docs/architecture.md#4-telemetry-layer--trace-context-propagation). |
 | `upstream_timeout_secs` | `5` | Upstream request timeout in seconds |
 | `bind_family` | `"ipv4"` | Address family: `"ipv4"`, `"ipv6"`, or `"dual"` (both) |
+| `shutdown_timeout_secs` | `30` | Graceful-shutdown deadline after SIGTERM/SIGINT: in-flight requests drain until it expires, then the process exits anyway. `0` waits indefinitely. |
+| `watch_config` | `true` | Watch the config file and hot-reload on change. Disable on flash-storage edge targets, or to make reloads strictly manual. |
+| `circuit_failure_threshold` | `3` | Consecutive failures before a provider's circuit opens. Lower it for twitchy free-tier upstreams. |
+| `circuit_base_cooldown_secs` | `60` | Base circuit-open cooldown; doubles per failure beyond the threshold. |
+| `rate_limit_fallback_secs` | `30` | Rate-limit cooldown when a 429 carries no `Retry-After`. |
+| `default_model` | — | Virtual model that serves requests naming an unknown model, instead of returning 400. |
 
 ### Provider Definition
 
@@ -221,8 +228,8 @@ smart = [
 2. For each provider, it checks: **circuit breaker state** (Closed? Open? HalfOpen?), **rate-limit window** (cooling down?), **manual override** (admin-disabled?).
 3. The first healthy provider is selected for the request.
 4. On success: circuit resets to Closed, failure count drops to 0.
-5. On 429 (rate limit): sets a cooldown timer based on `retry-after` header (default 30s). After 3 failures, circuit opens.
-6. On 5xx: increments failure counter. After 3 failures, circuit opens for **60 × 2^(failures-3)** seconds.
+5. On 429 (rate limit): sets a cooldown timer based on `retry-after` header (default `rate_limit_fallback_secs`, 30s). After `circuit_failure_threshold` failures, circuit opens.
+6. On 5xx: increments failure counter. After `circuit_failure_threshold` (default 3) failures, circuit opens for **`circuit_base_cooldown_secs` × 2^(failures−threshold)** seconds (default 60s base).
 7. **HalfOpen probes**: After cooldown expires, a single probe request is allowed. Only one concurrent probe — others bypass via atomic `compare_exchange`.
 8. **Idle decay**: Every 5 minutes without a request, failure count decreases by 1. Below 3 failures, Open circuits automatically rehabilitate to Closed.
 
@@ -244,6 +251,33 @@ noise. Every 20th request rotates the order so a demoted provider is still
 sampled, and unmeasured providers sort first so a newly added one is tried
 immediately rather than starved. Health checks (circuit breaker, rate limits,
 manual overrides) apply before ordering in all cases.
+
+### Model Aliases
+
+Point unmodified OpenAI clients at oxllm without editing their model lists:
+requests for an alias name route to its target virtual model, and `GET
+/v1/models` lists the aliases alongside their targets.
+
+```toml
+[aliases]
+gpt-4o = "smart"
+gpt-4o-mini = "fast"
+```
+
+`server.default_model` goes one step further and routes *any* unknown model
+name to a chosen virtual model instead of returning 400 — useful for clients
+whose model names you do not control.
+
+### Hot-Reload State Preservation
+
+A reload (config-file change, `oxllm reload`, or SIGHUP) keeps runtime state
+for every provider that keeps its name: circuit-breaker position, failure and
+rate-limit windows, request/token counters, admin offline overrides, and
+session-affinity pins. Editing the config mid-incident no longer re-enables a
+provider you took offline or resets failover history. Server-level fields
+that cannot be hot-swapped (`port`, `host`, `bind_family`, `otel_endpoint`,
+affinity TTL/capacity, `shutdown_timeout_secs`, `watch_config`) produce an
+explicit "restart required" warning in the reload response and logs.
 
 ### Session Affinity
 

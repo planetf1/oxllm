@@ -33,7 +33,7 @@ async fn test_routing_loop_latency_performance() {
     }
 
     let candidate_refs: Vec<&ProviderState> = candidates.iter().collect();
-    let strategy = AdaptivePriorityStrategy;
+    let strategy = AdaptivePriorityStrategy::default();
 
     // 2. Warm up the CPU caches
     for _ in 0..100 {

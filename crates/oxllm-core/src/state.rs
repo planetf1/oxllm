@@ -1,4 +1,4 @@
-use crate::config::VirtualModelTarget;
+use crate::config::{ServerConfig, VirtualModelTarget};
 use reqwest::Url;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -347,6 +347,30 @@ impl ModelStats {
     }
 }
 
+/// Circuit-breaker tuning, resolved from `[server]` config. Defaults
+/// preserve the historical behaviour: trip after 3 consecutive failures,
+/// 60s base cooldown doubling per failure beyond the threshold, 30s
+/// rate-limit cooldown when a 429 carries no Retry-After.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CircuitConfig {
+    /// Consecutive failures before the circuit opens.
+    pub failure_threshold: u32,
+    /// Base cooldown (seconds) when the circuit opens.
+    pub base_cooldown_secs: u64,
+    /// Rate-limit cooldown (seconds) without a Retry-After header.
+    pub rate_limit_fallback_secs: u64,
+}
+
+impl Default for CircuitConfig {
+    fn default() -> Self {
+        Self {
+            failure_threshold: 3,
+            base_cooldown_secs: 60,
+            rate_limit_fallback_secs: 30,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct SelectedProvider {
     pub name: String,
@@ -359,6 +383,12 @@ pub struct SelectedProvider {
 pub struct AppState {
     pub providers: Vec<ProviderState>,
     pub virtual_models: HashMap<String, Vec<VirtualModelTarget>>,
+    /// Client-facing alias -> virtual model (validated at config time).
+    pub aliases: HashMap<String, String>,
+    /// Virtual model serving requests that name an unknown model.
+    pub default_model: Option<String>,
+    /// Circuit-breaker tuning applied by the routing strategy.
+    pub circuit: CircuitConfig,
     /// Per-virtual-model counters (one entry per route, independent of how
     /// many providers back it).
     pub route_stats: Arc<ModelStats>,
@@ -375,6 +405,9 @@ pub struct AppState {
     pub session_affinity_header: String,
     pub http_client: reqwest::Client,
     pub upstream_timeout_secs: u64,
+    /// The server section this state was built from. Hot-reload diffs
+    /// against it to warn when a change cannot apply without a restart.
+    pub server: ServerConfig,
 }
 
 /// How a virtual model picks among its healthy candidates.
@@ -395,6 +428,25 @@ impl AppState {
         let mut names: Vec<String> = self.virtual_models.keys().cloned().collect();
         names.sort();
         names
+    }
+
+    /// Maps a client-requested model name onto the virtual model that
+    /// serves it: exact match first, then `[aliases]`, then
+    /// `server.default_model` for any unknown name. `None` means the
+    /// request must fail with 400.
+    pub fn resolve_route<'a>(&'a self, requested: &'a str) -> Option<&'a str> {
+        if self.virtual_models.contains_key(requested) {
+            return Some(requested);
+        }
+        if let Some(vm) = self.aliases.get(requested) {
+            return Some(vm);
+        }
+        match &self.default_model {
+            // Guarded at config-validation time; the filter keeps a stale
+            // default from turning into a panic if state diverges.
+            Some(default) if self.virtual_models.contains_key(default) => Some(default),
+            _ => None,
+        }
     }
 
     /// Resolves the candidate list for a given virtual model.

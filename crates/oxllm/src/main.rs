@@ -18,9 +18,10 @@ use axum::{
 };
 use tower_http::cors::{Any, CorsLayer};
 
-use oxllm_core::config::Config;
+use oxllm_core::config::{Config, ServerConfig};
 use oxllm_core::state::{
-    AppState, CircuitState, ModelStats, ProviderState, RoutingPolicy, SessionAffinity,
+    AppState, CircuitConfig, CircuitState, ModelStats, ProviderState, RoutingPolicy,
+    SessionAffinity,
 };
 use oxllm_core::telemetry::{TelemetryClient, TelemetryWorker};
 use reqwest::Url;
@@ -198,7 +199,13 @@ impl axum::extract::FromRef<ReloadableState> for Reloader {
     }
 }
 
-fn build_app_state(config: Config) -> Result<AppState, String> {
+/// Builds a fresh AppState from a config. When `previous` is given (a
+/// reload), runtime state carries across for every provider that keeps its
+/// name: circuit position, failure/rate-limit windows, counters, admin
+/// overrides, and session-affinity pins all survive a config edit, so an
+/// edit mid-incident no longer re-enables a provider taken offline or
+/// resets failover history.
+fn build_app_state(config: Config, previous: Option<&AppState>) -> Result<AppState, String> {
     let mut providers = Vec::new();
     for p in config.providers {
         if !p.enabled {
@@ -211,7 +218,7 @@ fn build_app_state(config: Config) -> Result<AppState, String> {
             )
         })?;
 
-        providers.push(ProviderState {
+        let mut state = ProviderState {
             name: p.name,
             base_url: url,
             api_key: p.api_key,
@@ -229,7 +236,31 @@ fn build_app_state(config: Config) -> Result<AppState, String> {
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
             model_stats: Arc::new(ModelStats::default()),
-        });
+        };
+
+        if let Some(old) =
+            previous.and_then(|prev| prev.providers.iter().find(|o| o.name == state.name))
+        {
+            state.circuit = old.circuit.clone();
+            state.consecutive_failures = old.consecutive_failures.clone();
+            state.rate_limited_until = old.rate_limited_until.clone();
+            state.last_attempt_time = old.last_attempt_time.clone();
+            state.probe_in_flight = old.probe_in_flight.clone();
+            state.manual_disabled = AtomicBool::new(
+                old.manual_disabled
+                    .load(std::sync::atomic::Ordering::Acquire),
+            );
+            state.requests =
+                AtomicU64::new(old.requests.load(std::sync::atomic::Ordering::Relaxed));
+            state.successes =
+                AtomicU64::new(old.successes.load(std::sync::atomic::Ordering::Relaxed));
+            state.tokens_input =
+                AtomicU64::new(old.tokens_input.load(std::sync::atomic::Ordering::Relaxed));
+            state.tokens_output =
+                AtomicU64::new(old.tokens_output.load(std::sync::atomic::Ordering::Relaxed));
+            state.model_stats = old.model_stats.clone();
+        }
+        providers.push(state);
     }
 
     let http_client = reqwest::Client::builder()
@@ -250,20 +281,37 @@ fn build_app_state(config: Config) -> Result<AppState, String> {
         })
         .collect();
 
+    let upstream_timeout_secs = config.server.upstream_timeout_secs;
     Ok(AppState {
         providers,
         virtual_models: config.virtual_models,
-        route_stats: Arc::new(ModelStats::default()),
+        aliases: config.aliases,
+        default_model: config.server.default_model.clone(),
+        circuit: CircuitConfig {
+            failure_threshold: config.server.circuit_failure_threshold,
+            base_cooldown_secs: config.server.circuit_base_cooldown_secs,
+            rate_limit_fallback_secs: config.server.rate_limit_fallback_secs,
+        },
+        route_stats: previous.map(|p| p.route_stats.clone()).unwrap_or_default(),
         policies,
-        routing_calls: AtomicU64::new(0),
-        api_keys: config.server.api_keys,
-        session_affinity: Arc::new(SessionAffinity::new(
-            std::time::Duration::from_secs(config.server.session_affinity_ttl_secs),
-            config.server.session_affinity_capacity,
-        )),
-        session_affinity_header: config.server.session_affinity_header,
+        routing_calls: AtomicU64::new(
+            previous
+                .map(|p| p.routing_calls.load(std::sync::atomic::Ordering::Relaxed))
+                .unwrap_or(0),
+        ),
+        api_keys: config.server.api_keys.clone(),
+        session_affinity: previous
+            .map(|p| p.session_affinity.clone())
+            .unwrap_or_else(|| {
+                Arc::new(SessionAffinity::new(
+                    std::time::Duration::from_secs(config.server.session_affinity_ttl_secs),
+                    config.server.session_affinity_capacity,
+                ))
+            }),
+        session_affinity_header: config.server.session_affinity_header.clone(),
+        server: config.server,
         http_client,
-        upstream_timeout_secs: config.server.upstream_timeout_secs,
+        upstream_timeout_secs,
     })
 }
 
@@ -482,19 +530,92 @@ async fn shutdown_signal() {
 /// Loads, validates, and swaps in the config at `config_path`. Shared by
 /// the SIGHUP handler, `POST /reload`, and the config file watcher. On any
 /// failure the previous state stays live and the reason is returned.
+/// Server-level settings that only take effect at startup: a hot-reload
+/// accepts the new config, swaps the routing state, and returns one of
+/// these per changed field so the operator knows a restart is needed.
+fn server_config_restart_warnings(old: &ServerConfig, new: &ServerConfig) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let mut note = |changed: bool, key: &str, from: String, to: String| {
+        if changed {
+            warnings.push(format!(
+                "server.{} changed from {} to {} — restart required to apply",
+                key, from, to
+            ));
+        }
+    };
+    note(
+        old.port != new.port,
+        "port",
+        old.port.to_string(),
+        new.port.to_string(),
+    );
+    note(
+        old.host != new.host,
+        "host",
+        old.host.clone(),
+        new.host.clone(),
+    );
+    note(
+        old.bind_family != new.bind_family,
+        "bind_family",
+        old.bind_family.clone(),
+        new.bind_family.clone(),
+    );
+    note(
+        old.otel_endpoint != new.otel_endpoint,
+        "otel_endpoint",
+        old.otel_endpoint.clone(),
+        new.otel_endpoint.clone(),
+    );
+    note(
+        old.session_affinity_ttl_secs != new.session_affinity_ttl_secs,
+        "session_affinity_ttl_secs",
+        old.session_affinity_ttl_secs.to_string(),
+        new.session_affinity_ttl_secs.to_string(),
+    );
+    note(
+        old.session_affinity_capacity != new.session_affinity_capacity,
+        "session_affinity_capacity",
+        old.session_affinity_capacity.to_string(),
+        new.session_affinity_capacity.to_string(),
+    );
+    note(
+        old.shutdown_timeout_secs != new.shutdown_timeout_secs,
+        "shutdown_timeout_secs",
+        old.shutdown_timeout_secs.to_string(),
+        new.shutdown_timeout_secs.to_string(),
+    );
+    note(
+        old.watch_config != new.watch_config,
+        "watch_config",
+        old.watch_config.to_string(),
+        new.watch_config.to_string(),
+    );
+    warnings
+}
+
+/// Loads, validates, and swaps in the config at `config_path`. Shared by
+/// the SIGHUP handler, `POST /reload`, and the config file watcher. On any
+/// failure the previous state stays live and the reason is returned. On
+/// success, returns the restart-required warnings for server fields that
+/// cannot be hot-swapped.
 fn reload_config(
     config_path: &std::path::Path,
     sender: &tokio::sync::watch::Sender<Arc<AppState>>,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
+    let previous = sender.borrow().clone();
     let config =
         Config::load_from_file(config_path).map_err(|e| format!("Failed to load config: {}", e))?;
     config
         .validate()
         .map_err(|e| format!("Config validation failed: {}", e))?;
-    let new_state = build_app_state(config).map_err(|e| format!("Failed to build state: {}", e))?;
+    let warnings = server_config_restart_warnings(&previous.server, &config.server);
+    let new_state = build_app_state(config, Some(&previous))
+        .map_err(|e| format!("Failed to build state: {}", e))?;
     sender
         .send(Arc::new(new_state))
-        .map_err(|e| format!("Failed to update watch channel: {}", e))
+        .map_err(|e| format!("Failed to update watch channel: {}", e))?;
+    Ok(warnings)
 }
 
 fn json_response(status: StatusCode, body: serde_json::Value) -> Response {
@@ -512,12 +633,13 @@ async fn handle_http_reload(
     axum::extract::State(reloader): axum::extract::State<Reloader>,
 ) -> impl IntoResponse {
     match reload_config(&reloader.config_path, &reloader.sender) {
-        Ok(()) => {
+        Ok(warnings) => {
             info!("Configuration reloaded via HTTP POST /reload");
-            json_response(
-                StatusCode::OK,
-                serde_json::json!({"message": "Configuration reloaded successfully"}),
-            )
+            let mut body = serde_json::json!({"message": "Configuration reloaded successfully"});
+            if !warnings.is_empty() {
+                body["warnings"] = serde_json::json!(warnings);
+            }
+            json_response(StatusCode::OK, body)
         },
         Err(reason) => json_response(
             StatusCode::BAD_REQUEST,
@@ -550,11 +672,18 @@ async fn handle_sighup(
         info!("Registered SIGHUP reload listener");
         while sig.recv().await.is_some() {
             info!("SIGHUP received, reloading configuration...");
-            if let Err(e) = reload_config(&config_path, &watch_sender) {
-                error!(
-                    "Hot-reload via SIGHUP failed, keeping previous config: {}",
-                    e
-                );
+            match reload_config(&config_path, &watch_sender) {
+                Ok(warnings) => {
+                    for warning in warnings {
+                        warn!("{}", warning);
+                    }
+                },
+                Err(e) => {
+                    error!(
+                        "Hot-reload via SIGHUP failed, keeping previous config: {}",
+                        e
+                    );
+                },
             }
         }
     }
@@ -592,11 +721,18 @@ async fn watch_config_file(
             continue;
         }
         info!("Config file changed, hot-reloading...");
-        if let Err(e) = reload_config(&config_path, &sender) {
-            error!(
-                "Hot-reload of changed config failed, keeping previous config: {}",
-                e
-            );
+        match reload_config(&config_path, &sender) {
+            Ok(warnings) => {
+                for warning in warnings {
+                    warn!("{}", warning);
+                }
+            },
+            Err(e) => {
+                error!(
+                    "Hot-reload of changed config failed, keeping previous config: {}",
+                    e
+                );
+            },
         }
     }
 }
@@ -608,7 +744,7 @@ async fn run_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     config.validate()?;
 
     // 2. Build initial AppState
-    let app_state = Arc::new(build_app_state(config.clone())?);
+    let app_state = Arc::new(build_app_state(config.clone(), None)?);
 
     // 3. Initialize watch channel
     let (watch_sender, watch_receiver) = tokio::sync::watch::channel(app_state.clone());
@@ -619,14 +755,18 @@ async fn run_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     let otel_endpoint = config.server.otel_endpoint.clone();
     let _worker_handle = TelemetryWorker::spawn(&otel_endpoint, telemetry_rx)?;
 
-    // 5. Spawn SIGHUP listener and config file watcher
+    // 5. Spawn SIGHUP listener and (unless disabled) the config file watcher
     let config_path_clone = config_path.clone();
     tokio::spawn(handle_sighup(config_path_clone, watch_sender.clone()));
-    tokio::spawn(watch_config_file(
-        config_path.clone(),
-        watch_sender.clone(),
-        CONFIG_WATCH_INTERVAL,
-    ));
+    if config.server.watch_config {
+        tokio::spawn(watch_config_file(
+            config_path.clone(),
+            watch_sender.clone(),
+            CONFIG_WATCH_INTERVAL,
+        ));
+    } else {
+        info!("Config file watching disabled (server.watch_config = false)");
+    }
 
     // 6. Build Axum Router
     let start_time = Instant::now();
@@ -716,6 +856,7 @@ async fn run_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     // bind: an instance that fails to start must not claim (or clobber)
     // the daemon's PID entry.
     let port = config.server.port;
+    let shutdown_timeout_secs = config.server.shutdown_timeout_secs;
     let listener = match config.server.bind_family.as_str() {
         "ipv6" => {
             let addr = format!("[::]:{}", port);
@@ -765,12 +906,29 @@ async fn run_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         warn!("Failed to write PID file: {}", e);
     }
 
-    axum::serve(
+    let serve = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
-    .await?;
+    .with_graceful_shutdown(shutdown_signal());
+
+    // Drain in-flight requests after SIGTERM/SIGINT, but only until the
+    // configured deadline: a stuck upstream must not hold the shutdown
+    // hostage (launchd would eventually SIGKILL, losing the clean exit).
+    // `shutdown_timeout_secs = 0` restores the old wait-forever behaviour.
+    if shutdown_timeout_secs == 0 {
+        serve.await?;
+    } else {
+        match tokio::time::timeout(Duration::from_secs(shutdown_timeout_secs), serve).await {
+            Ok(result) => result?,
+            Err(_) => {
+                warn!(
+                    "Graceful shutdown exceeded the {}s deadline (server.shutdown_timeout_secs); exiting with in-flight requests dropped",
+                    shutdown_timeout_secs
+                );
+            },
+        }
+    }
 
     Ok(())
 }
@@ -936,7 +1094,7 @@ async fn run_status(
         Err(e) if e.is_connect() => {
             println!("oxllm is not running on http://127.0.0.1:{}", port);
             println!("Start it with: oxllm serve");
-            return Ok(());
+            std::process::exit(1);
         },
         Err(e) => return Err(e.into()),
     };
@@ -1362,7 +1520,7 @@ async fn run_provider_offline(name: &str, port: u16) -> Result<(), Box<dyn std::
         Err(e) if e.is_connect() => {
             println!("oxllm is not running on http://127.0.0.1:{}", port);
             println!("Start it with: oxllm serve");
-            return Ok(());
+            std::process::exit(1);
         },
         Err(e) => return Err(e.into()),
     };
@@ -1379,7 +1537,7 @@ async fn run_provider_online(name: &str, port: u16) -> Result<(), Box<dyn std::e
         Err(e) if e.is_connect() => {
             println!("oxllm is not running on http://127.0.0.1:{}", port);
             println!("Start it with: oxllm serve");
-            return Ok(());
+            std::process::exit(1);
         },
         Err(e) => return Err(e.into()),
     };
@@ -1396,7 +1554,7 @@ async fn run_provider_reset(name: &str, port: u16) -> Result<(), Box<dyn std::er
         Err(e) if e.is_connect() => {
             println!("oxllm is not running on http://127.0.0.1:{}", port);
             println!("Start it with: oxllm serve");
-            return Ok(());
+            std::process::exit(1);
         },
         Err(e) => return Err(e.into()),
     };
@@ -1413,7 +1571,7 @@ async fn run_provider_list(port: u16, json: bool) -> Result<(), Box<dyn std::err
         Err(e) if e.is_connect() => {
             println!("oxllm is not running on http://127.0.0.1:{}", port);
             println!("Start it with: oxllm serve");
-            return Ok(());
+            std::process::exit(1);
         },
         Err(e) => return Err(e.into()),
     };
@@ -1651,6 +1809,10 @@ mod integration_tests {
         let app_state = Arc::new(AppState {
             providers: vec![p1, p2],
             virtual_models,
+            aliases: Default::default(),
+            default_model: None,
+            circuit: CircuitConfig::default(),
+            server: test_server_config(),
             route_stats: Arc::new(ModelStats::default()),
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
@@ -1757,6 +1919,10 @@ mod integration_tests {
         let app_state = Arc::new(AppState {
             providers: vec![p],
             virtual_models,
+            aliases: Default::default(),
+            default_model: None,
+            circuit: CircuitConfig::default(),
+            server: test_server_config(),
             route_stats: Arc::new(ModelStats::default()),
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
@@ -1925,6 +2091,10 @@ mod integration_tests {
         Arc::new(AppState {
             providers: vec![provider],
             virtual_models,
+            aliases: Default::default(),
+            default_model: None,
+            circuit: CircuitConfig::default(),
+            server: test_server_config(),
             route_stats: Arc::new(ModelStats::default()),
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
@@ -2133,6 +2303,10 @@ mod integration_tests {
         let app_state = Arc::new(AppState {
             providers: vec![provider],
             virtual_models,
+            aliases: Default::default(),
+            default_model: None,
+            circuit: CircuitConfig::default(),
+            server: test_server_config(),
             route_stats: Arc::new(ModelStats::default()),
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
@@ -2274,6 +2448,10 @@ mod integration_tests {
         let app_state = Arc::new(AppState {
             providers: vec![provider],
             virtual_models,
+            aliases: Default::default(),
+            default_model: None,
+            circuit: CircuitConfig::default(),
+            server: test_server_config(),
             route_stats: Arc::new(ModelStats::default()),
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
@@ -2404,6 +2582,10 @@ mod integration_tests {
         let app_state = Arc::new(AppState {
             providers: vec![mk("prov-a"), mk("prov-b")],
             virtual_models,
+            aliases: Default::default(),
+            default_model: None,
+            circuit: CircuitConfig::default(),
+            server: test_server_config(),
             route_stats: Arc::new(ModelStats::default()),
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
@@ -2530,7 +2712,7 @@ mod integration_tests {
             model_stats: Arc::new(ModelStats::default()),
         };
 
-        let strategy = AdaptivePriorityStrategy;
+        let strategy = AdaptivePriorityStrategy::default();
         let candidates = vec![&p1, &p2];
 
         // Initially selects primary
@@ -2608,6 +2790,10 @@ mod integration_tests {
         let app_state = Arc::new(AppState {
             providers: vec![p1, p2],
             virtual_models,
+            aliases: Default::default(),
+            default_model: None,
+            circuit: CircuitConfig::default(),
+            server: test_server_config(),
             route_stats: Arc::new(ModelStats::default()),
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
@@ -2751,6 +2937,10 @@ mod integration_tests {
         let app_state = Arc::new(AppState {
             providers: vec![p1, p2],
             virtual_models,
+            aliases: Default::default(),
+            default_model: None,
+            circuit: CircuitConfig::default(),
+            server: test_server_config(),
             route_stats: Arc::new(ModelStats::default()),
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
@@ -2858,6 +3048,10 @@ mod integration_tests {
         let app_state = Arc::new(AppState {
             providers: vec![p],
             virtual_models,
+            aliases: Default::default(),
+            default_model: None,
+            circuit: CircuitConfig::default(),
+            server: test_server_config(),
             route_stats: Arc::new(ModelStats::default()),
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
@@ -2987,6 +3181,10 @@ mod integration_tests {
         let app_state = Arc::new(AppState {
             providers: vec![p],
             virtual_models,
+            aliases: Default::default(),
+            default_model: None,
+            circuit: CircuitConfig::default(),
+            server: test_server_config(),
             route_stats: Arc::new(ModelStats::default()),
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
@@ -3089,6 +3287,10 @@ mod integration_tests {
         let state = Arc::new(AppState {
             providers: vec![p],
             virtual_models: vm,
+            aliases: Default::default(),
+            default_model: None,
+            circuit: CircuitConfig::default(),
+            server: test_server_config(),
             route_stats: Arc::new(ModelStats::default()),
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
@@ -3182,6 +3384,10 @@ mod integration_tests {
         let state = Arc::new(AppState {
             providers: vec![p],
             virtual_models: vms,
+            aliases: Default::default(),
+            default_model: None,
+            circuit: CircuitConfig::default(),
+            server: test_server_config(),
             route_stats: Arc::new(ModelStats::default()),
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
@@ -3288,6 +3494,10 @@ mod integration_tests {
         let state = Arc::new(AppState {
             providers: vec![p],
             virtual_models: vms,
+            aliases: Default::default(),
+            default_model: None,
+            circuit: CircuitConfig::default(),
+            server: test_server_config(),
             route_stats: Arc::new(ModelStats::default()),
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
@@ -3361,8 +3571,13 @@ mod integration_tests {
     // -----------------------------------------------------------------------
 
     /// Builds a minimal test AppState + ReloadableState with one provider
-    /// pointing at the given upstream address.
-    fn build_test_state(upstream_addr: SocketAddr) -> (Arc<AppState>, ReloadableState) {
+    /// pointing at the given upstream address, plus alias/default-model
+    /// routing configuration.
+    fn build_test_state_with(
+        upstream_addr: SocketAddr,
+        aliases: std::collections::HashMap<String, String>,
+        default_model: Option<String>,
+    ) -> (Arc<AppState>, ReloadableState) {
         let p = ProviderState {
             name: "prov".into(),
             base_url: Url::parse(&format!("http://{}/v1/", upstream_addr)).unwrap(),
@@ -3394,6 +3609,9 @@ mod integration_tests {
         let app_state = Arc::new(AppState {
             providers: vec![p],
             virtual_models: vm,
+            aliases,
+            default_model,
+            circuit: CircuitConfig::default(),
             route_stats: Arc::new(ModelStats::default()),
             policies: std::collections::HashMap::new(),
             routing_calls: AtomicU64::new(0),
@@ -3403,6 +3621,7 @@ mod integration_tests {
                 1024,
             )),
             session_affinity_header: oxllm_core::state::DEFAULT_SESSION_HEADER.to_string(),
+            server: test_server_config(),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -3418,6 +3637,12 @@ mod integration_tests {
             },
         };
         (app_state, rs)
+    }
+
+    /// Builds a minimal test AppState + ReloadableState with one provider
+    /// pointing at the given upstream address.
+    fn build_test_state(upstream_addr: SocketAddr) -> (Arc<AppState>, ReloadableState) {
+        build_test_state_with(upstream_addr, Default::default(), None)
     }
 
     /// Builds a test router with all middleware layers (request-id, CORS).
@@ -3811,6 +4036,27 @@ mod integration_tests {
     // Config hot-reload (issue #7): file watcher, HTTP reload, PID file
     // -----------------------------------------------------------------------
 
+    /// Minimal ServerConfig for test AppState literals.
+    fn test_server_config() -> oxllm_core::config::ServerConfig {
+        oxllm_core::config::ServerConfig {
+            host: "127.0.0.1".to_string(),
+            port: 18099,
+            otel_endpoint: "http://127.0.0.1:4318".to_string(),
+            upstream_timeout_secs: 5,
+            bind_family: "ipv4".to_string(),
+            api_keys: vec![],
+            session_affinity_header: "x-session-id".to_string(),
+            session_affinity_ttl_secs: 900,
+            session_affinity_capacity: 1024,
+            circuit_failure_threshold: 3,
+            circuit_base_cooldown_secs: 60,
+            rate_limit_fallback_secs: 30,
+            shutdown_timeout_secs: 30,
+            watch_config: true,
+            default_model: None,
+        }
+    }
+
     fn temp_path(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
         path.push(format!("oxllm-test-{}-{}", std::process::id(), name));
@@ -3881,7 +4127,7 @@ vm = [{ provider = "missing-prov", model = "m" }]
         let path = temp_path("watch-valid.toml");
         std::fs::write(&path, test_config_toml("prov-a")).unwrap();
         let config = Config::load_from_file(&path).unwrap();
-        let initial = Arc::new(build_app_state(config).unwrap());
+        let initial = Arc::new(build_app_state(config, None).unwrap());
         let (sender, mut receiver) = tokio::sync::watch::channel(initial);
 
         tokio::spawn(watch_config_file(
@@ -3912,7 +4158,7 @@ vm = [{ provider = "missing-prov", model = "m" }]
         let path = temp_path("watch-invalid.toml");
         std::fs::write(&path, test_config_toml("prov-a")).unwrap();
         let config = Config::load_from_file(&path).unwrap();
-        let initial = Arc::new(build_app_state(config).unwrap());
+        let initial = Arc::new(build_app_state(config, None).unwrap());
         let (sender, mut receiver) = tokio::sync::watch::channel(initial);
 
         tokio::spawn(watch_config_file(
@@ -3942,7 +4188,7 @@ vm = [{ provider = "missing-prov", model = "m" }]
         let path = temp_path("reload-ok.toml");
         std::fs::write(&path, test_config_toml("prov-a")).unwrap();
         let config = Config::load_from_file(&path).unwrap();
-        let initial = Arc::new(build_app_state(config).unwrap());
+        let initial = Arc::new(build_app_state(config, None).unwrap());
         let (sender, mut receiver) = tokio::sync::watch::channel(initial);
 
         let router = axum::Router::new()
@@ -4035,5 +4281,284 @@ vm = [{ provider = "missing-prov", model = "m" }]
     fn test_process_alive_detects_live_and_dead_pids() {
         assert!(process_alive(std::process::id()));
         assert!(!process_alive(dead_pid()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Reload state preservation, restart warnings, aliases (improvements
+    // batch, 2026-11-03)
+    // -----------------------------------------------------------------------
+
+    /// A hot-reload must not wipe runtime state for providers that keep
+    /// their name: circuit position, failure history, admin offline, and
+    /// counters all survive — editing the config mid-incident must not
+    /// re-enable a provider taken offline or reset failover history.
+    #[tokio::test]
+    async fn test_reload_preserves_runtime_state() {
+        let path = temp_path("carry.toml");
+        std::fs::write(&path, test_config_toml("prov-a")).unwrap();
+        let config = Config::load_from_file(&path).unwrap();
+        let initial = Arc::new(build_app_state(config, None).unwrap());
+
+        // Simulate an incident: circuit open, failures accumulated, provider
+        // manually taken offline, traffic counted, session pinned.
+        {
+            let p = &initial.providers[0];
+            *p.circuit.write().await = CircuitState::Open {
+                until: Instant::now() + Duration::from_secs(300),
+            };
+            *p.consecutive_failures.write().await = 5;
+            p.manual_disabled
+                .store(true, std::sync::atomic::Ordering::Release);
+            p.requests
+                .fetch_add(7, std::sync::atomic::Ordering::Relaxed);
+        }
+        initial.session_affinity.pin("session-1", "prov-a");
+
+        let (sender, mut receiver) = tokio::sync::watch::channel(initial.clone());
+
+        // Same provider name, unrelated config edit (different model set).
+        std::fs::write(&path, test_config_toml("prov-a")).unwrap();
+        reload_config(&path, &sender).unwrap();
+        receiver.changed().await.unwrap();
+        let reloaded = receiver.borrow_and_update().clone();
+
+        let p = &reloaded.providers[0];
+        // The carried `until` instant is still in the future.
+        match *p.circuit.read().await {
+            CircuitState::Open { until } => assert!(
+                until > Instant::now(),
+                "circuit position must survive a reload"
+            ),
+            state => panic!("circuit must still be Open, got {:?}", state),
+        }
+        assert_eq!(*p.consecutive_failures.read().await, 5);
+        assert!(
+            p.manual_disabled.load(std::sync::atomic::Ordering::Acquire),
+            "admin offline must survive a reload"
+        );
+        assert_eq!(
+            p.requests.load(std::sync::atomic::Ordering::Relaxed),
+            7,
+            "traffic counters must survive a reload"
+        );
+        assert_eq!(
+            reloaded.session_affinity.pinned_provider("session-1"),
+            Some("prov-a".to_string()),
+            "session pins must survive a reload"
+        );
+
+        // A provider renamed out of the config loses its carried state, and
+        // a provider added by the edit starts fresh.
+        let two_providers = r#"
+[server]
+host = "127.0.0.1"
+port = 18099
+otel_endpoint = "http://127.0.0.1:4318"
+
+[[providers]]
+name = "prov-b"
+enabled = true
+base_url = "http://127.0.0.1:9/v1/"
+api_key = "key"
+models = ["m"]
+
+[[providers]]
+name = "prov-a"
+enabled = true
+base_url = "http://127.0.0.1:9/v1/"
+api_key = "key"
+models = ["m"]
+
+[virtual_models]
+vm = [{ provider = "prov-a", model = "m" }]
+vm2 = [{ provider = "prov-b", model = "m" }]
+"#
+        .to_string();
+        std::fs::write(&path, two_providers).unwrap();
+        reload_config(&path, &sender).unwrap();
+        receiver.changed().await.unwrap();
+        let reloaded = receiver.borrow_and_update().clone();
+
+        let fresh = reloaded
+            .providers
+            .iter()
+            .find(|p| p.name == "prov-b")
+            .expect("new provider must exist after reload");
+        assert_eq!(*fresh.consecutive_failures.read().await, 0);
+        assert!(!fresh
+            .manual_disabled
+            .load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(fresh.requests.load(std::sync::atomic::Ordering::Relaxed), 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Server fields that only apply at startup produce one explicit
+    /// warning per change, and an unchanged config produces none.
+    #[test]
+    fn test_server_config_restart_warnings() {
+        let old = test_server_config();
+        assert_eq!(
+            server_config_restart_warnings(&old, &test_server_config()),
+            Vec::<String>::new(),
+            "identical configs must not warn"
+        );
+
+        let mut new = test_server_config();
+        new.port = 18098;
+        new.watch_config = false;
+        let warnings = server_config_restart_warnings(&old, &new);
+        assert_eq!(warnings.len(), 2, "got: {:?}", warnings);
+        assert!(warnings[0].contains("server.port"), "got: {:?}", warnings);
+        assert!(
+            warnings[1].contains("server.watch_config"),
+            "got: {:?}",
+            warnings
+        );
+        for warning in &warnings {
+            assert!(warning.contains("restart required"), "got: {}", warning);
+        }
+    }
+
+    /// POST /reload surfaces restart warnings in its JSON body.
+    #[tokio::test]
+    async fn test_http_reload_reports_restart_warnings() {
+        let path = temp_path("warn-reload.toml");
+        std::fs::write(&path, test_config_toml("prov-a")).unwrap();
+        let config = Config::load_from_file(&path).unwrap();
+        let initial = Arc::new(build_app_state(config, None).unwrap());
+        let (sender, _receiver) = tokio::sync::watch::channel(initial);
+
+        let router = axum::Router::new()
+            .route("/reload", axum::routing::post(handle_http_reload))
+            .with_state(Reloader {
+                sender,
+                config_path: path.clone(),
+            });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        // Same config, but with a startup-only field changed.
+        let changed = test_config_toml("prov-a").replace("port = 18099", "port = 18098");
+        std::fs::write(&path, changed).unwrap();
+
+        let res = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{}/reload", port))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let body: Value = res.json().await.unwrap();
+        let warnings = body["warnings"].as_array().expect("warnings array");
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].as_str().unwrap().contains("server.port"),
+            "got: {}",
+            warnings[0]
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Aliases and the default model route requests from unmodified OpenAI
+    /// clients onto virtual models, and unknown names still 400 without a
+    /// default.
+    #[tokio::test]
+    async fn test_alias_and_default_model_route_requests() {
+        let upstream_body = r#"{\"choices\":[{\"index\":0,\"text\":\"ok\",\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            upstream_body.len(),
+            upstream_body
+        );
+        let recorded = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let addr = spawn_recording_upstream(vec![response; 3], recorded.clone()).await;
+
+        let mut aliases = std::collections::HashMap::new();
+        aliases.insert("gpt-4o".to_string(), "test".to_string());
+        let (_app_state, rs) = build_test_state_with(addr, aliases, Some("test".to_string()));
+
+        let router = axum::Router::new()
+            .route(
+                "/v1/completions",
+                axum::routing::post(routes::create_completions),
+            )
+            .layer(middleware::from_fn(add_request_id))
+            .with_state(rs);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let url = format!("http://{}/v1/completions", proxy_addr);
+
+        // Alias name routes.
+        let res = client
+            .post(&url)
+            .json(&serde_json::json!({"model": "gpt-4o", "prompt": "x"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200, "alias must route");
+
+        // Unknown name routes via the default model.
+        let res = client
+            .post(&url)
+            .json(&serde_json::json!({"model": "whatever-client-sends", "prompt": "x"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200, "default model must catch unknown names");
+
+        // The upstream saw the real model, and route stats landed on the
+        // canonical virtual model, not the alias.
+        let recorded = recorded.lock().await;
+        assert_eq!(recorded.len(), 2);
+        let (_path, body) = &recorded[0];
+        let upstream_json: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(upstream_json["model"], "model");
+    }
+
+    /// GET /v1/models lists alias names alongside their target models so
+    /// clients can discover them.
+    #[tokio::test]
+    async fn test_list_models_includes_aliases() {
+        let response =
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}";
+        let recorded = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let addr = spawn_recording_upstream(vec![response.to_string()], recorded).await;
+
+        let mut aliases = std::collections::HashMap::new();
+        aliases.insert("gpt-4o".to_string(), "test".to_string());
+        let (_aliased, rs) = build_test_state_with(addr, aliases, None);
+
+        let router = axum::Router::new()
+            .route("/v1/models", axum::routing::get(routes::list_models))
+            .with_state(rs);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let body: Value = reqwest::Client::new()
+            .get(format!("http://{}/v1/models", proxy_addr))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let ids: Vec<&str> = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&"test"), "target vm must be listed: {:?}", ids);
+        assert!(ids.contains(&"gpt-4o"), "alias must be listed: {:?}", ids);
     }
 }

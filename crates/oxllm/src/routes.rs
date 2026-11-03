@@ -82,6 +82,22 @@ pub async fn list_models(State(app_state): State<Arc<AppState>>) -> impl IntoRes
         }
     }
 
+    // Alias names ride along with their (healthy) target virtual models, so
+    // unmodified OpenAI clients can discover and use the names they were
+    // built with.
+    let mut aliases: Vec<(&String, &String)> = app_state.aliases.iter().collect();
+    aliases.sort();
+    for (alias, vm) in aliases {
+        if data.iter().any(|m| m.id == *vm) {
+            data.push(ModelObject {
+                id: alias.clone(),
+                object: "model",
+                created: 1717070400, // May 30, 2026 constant
+                owned_by: "oxllm-alias",
+            });
+        }
+    }
+
     Json(ModelsResponse {
         object: "list",
         data,
@@ -429,9 +445,19 @@ pub async fn create_embeddings(
     };
 
     // Owned copy: `payload` is mutated per attempt, so the &str borrow cannot
-    // live across the routing loop.
-    let route_name = requested_model.to_string();
-    let candidates = app_state.resolve_candidates(requested_model);
+    // live across the routing loop. Names resolve through aliases and the
+    // configured default model before being rejected.
+    let route_name = match app_state.resolve_route(requested_model) {
+        Some(route) => route.to_string(),
+        None => {
+            return json_error_response(
+                &format!("Invalid or unmapped virtual model: {}", requested_model),
+                "invalid_request_error",
+                StatusCode::BAD_REQUEST,
+            )
+        },
+    };
+    let candidates = app_state.resolve_candidates(&route_name);
     if candidates.is_empty() {
         return json_error_response(
             &format!("Invalid or unmapped virtual model: {}", requested_model),
@@ -443,7 +469,9 @@ pub async fn create_embeddings(
     // Extract W3C traceparent headers if present for tracing
     let (trace_id, parent_span_id) = extract_traceparent(&headers);
 
-    let strategy = AdaptivePriorityStrategy;
+    let strategy = AdaptivePriorityStrategy {
+        circuit: app_state.circuit,
+    };
     let mut attempts = 0;
     let start_time = Instant::now();
     let mut last_upstream_error = String::new();
@@ -790,9 +818,19 @@ pub async fn create_completions(
     };
 
     // Owned copy: `payload` is mutated per attempt, so the &str borrow cannot
-    // live across the routing loop.
-    let route_name = requested_model.to_string();
-    let candidates = app_state.resolve_candidates(requested_model);
+    // live across the routing loop. Names resolve through aliases and the
+    // configured default model before being rejected.
+    let route_name = match app_state.resolve_route(requested_model) {
+        Some(route) => route.to_string(),
+        None => {
+            return json_error_response(
+                &format!("Invalid or unmapped virtual model: {}", requested_model),
+                "invalid_request_error",
+                StatusCode::BAD_REQUEST,
+            )
+        },
+    };
+    let candidates = app_state.resolve_candidates(&route_name);
     if candidates.is_empty() {
         return json_error_response(
             &format!("Invalid or unmapped virtual model: {}", requested_model),
@@ -807,7 +845,9 @@ pub async fn create_completions(
         .unwrap_or(false);
     let (trace_id, parent_span_id) = extract_traceparent(&headers);
 
-    let strategy = AdaptivePriorityStrategy;
+    let strategy = AdaptivePriorityStrategy {
+        circuit: app_state.circuit,
+    };
     let mut attempts = 0;
     let start_time = Instant::now();
     let mut last_upstream_error = String::new();
@@ -1154,9 +1194,19 @@ pub async fn create_chat_completions(
     };
 
     // Owned copy: `payload` is mutated per attempt, so the &str borrow cannot
-    // live across the routing loop.
-    let route_name = requested_model.to_string();
-    let candidates = app_state.resolve_candidates(requested_model);
+    // live across the routing loop. Names resolve through aliases and the
+    // configured default model before being rejected.
+    let route_name = match app_state.resolve_route(requested_model) {
+        Some(route) => route.to_string(),
+        None => {
+            return json_error_response(
+                &format!("Invalid or unmapped virtual model: {}", requested_model),
+                "invalid_request_error",
+                StatusCode::BAD_REQUEST,
+            )
+        },
+    };
+    let candidates = app_state.resolve_candidates(&route_name);
     if candidates.is_empty() {
         return json_error_response(
             &format!("Invalid or unmapped virtual model: {}", requested_model),
@@ -1171,7 +1221,9 @@ pub async fn create_chat_completions(
         .unwrap_or(false);
     let (trace_id, parent_span_id) = extract_traceparent(&headers);
 
-    let strategy = AdaptivePriorityStrategy;
+    let strategy = AdaptivePriorityStrategy {
+        circuit: app_state.circuit,
+    };
     let mut attempts = 0;
     let start_time = Instant::now();
     let mut last_upstream_error = String::new();
@@ -1555,7 +1607,9 @@ fn stream_upstream_body(
 
         // Deferred circuit-breaker feedback after stream completes
         if let Some(provider_state) = app_state.providers.iter().find(|p| p.name == provider_name) {
-            let strategy = AdaptivePriorityStrategy;
+            let strategy = AdaptivePriorityStrategy {
+                circuit: app_state.circuit,
+            };
             strategy
                 .feedback(
                     provider_state,

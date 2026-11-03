@@ -163,10 +163,11 @@ complex-free = "fastest"
 
 #### Reloading Mechanism
 Three triggers share one reload path (parse, validate, swap):
-* **Config File Watching:** The daemon polls the config file's bytes every 2 seconds and hot-reloads when they change, so edits take effect without a manual step. A broken edit is reported once and the previous config keeps serving.
+* **Config File Watching:** The daemon polls the config file's bytes every 2 seconds (disable with `server.watch_config = false`) and hot-reloads when they change, so edits take effect without a manual step. A broken edit is reported once and the previous config keeps serving.
 * **POSIX Signal Handling:** The application listens for a `SIGHUP` signal.
 * **HTTP Reload Endpoint:** A `POST /reload` endpoint (localhost-restricted) triggers the same logic and returns a 400 with the reason when the new config is rejected.
 * **Action:** Upon any trigger, the configuration file is re-parsed. New keys or target providers are mapped into a fresh `Vec<ProviderState>`, and the pointer is safely updated using a `tokio::sync::watch` channel, maintaining current uptime for connected clients.
+* **State preservation:** providers that keep their name carry their circuit-breaker position, failure/rate-limit windows, counters, admin offline flag, and session-affinity pins across the swap — a config edit no longer resets failover state. Server fields that only apply at startup (`port`, `host`, `bind_family`, `otel_endpoint`, affinity TTL/capacity, `shutdown_timeout_secs`, `watch_config`) are diffed and reported as "restart required" warnings in the reload response and logs.
 
 ---
 
