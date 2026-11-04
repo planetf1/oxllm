@@ -6332,6 +6332,33 @@ vm = [
     }
 
     #[tokio::test]
+    async fn test_messages_passes_anthropic_response_headers() {
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nrequest-id: req_123\r\nanthropic-ratelimit-requests-remaining: 41\r\nContent-Length: {}\r\n\r\n{}",
+            MSG_OK.len(),
+            MSG_OK
+        );
+        let addr = spawn_raw_recording_upstream(vec![resp], Default::default()).await;
+        let (proxy, _s) = spawn_messages_proxy(
+            vec![test_provider("a1", addr, ApiFormat::Anthropic)],
+            vec![],
+        )
+        .await;
+        let res = reqwest::Client::new()
+            .post(format!("http://{}/v1/messages", proxy))
+            .json(&messages_body())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        assert_eq!(res.headers()["request-id"], "req_123");
+        assert_eq!(
+            res.headers()["anthropic-ratelimit-requests-remaining"],
+            "41"
+        );
+    }
+
+    #[tokio::test]
     async fn test_messages_forwards_client_anthropic_version() {
         let rec = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let addr =

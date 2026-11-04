@@ -1415,6 +1415,11 @@ fn copy_response_headers(src: &HeaderMap, dest: &mut HeaderMap) {
             || name_str == "content-type"
             || name_str == "cache-control"
             || name_str == "openai-version"
+            // Anthropic: request id, rate-limit state and backoff hints that
+            // SDKs read for debugging and retries.
+            || name_str == "request-id"
+            || name_str == "retry-after"
+            || name_str.starts_with("anthropic-")
         {
             if let Ok(name) = HeaderName::from_bytes(name_str.as_bytes()) {
                 if let Ok(val) = HeaderValue::from_bytes(value.as_bytes()) {
