@@ -63,6 +63,14 @@ pub struct TelemetryWorker {
     tokens_consumed_counter: Counter<u64>,
 }
 
+/// Full OTLP/HTTP URL for one signal. The exporter's `with_endpoint` uses the
+/// URL verbatim (only the environment-variable route appends the signal
+/// path), so the configured base endpoint must be extended here, or every
+/// export POSTs to `/` and the collector answers 404.
+fn signal_endpoint(base: &str, signal: &str) -> String {
+    format!("{}/v1/{}", base.trim_end_matches('/'), signal)
+}
+
 impl TelemetryWorker {
     /// Spawns the worker thread alongside the runtime initialization.
     /// If the OTLP exporter cannot be initialised (e.g. collector offline or
@@ -75,17 +83,20 @@ impl TelemetryWorker {
         // Build Resource Metadata
         let resource = Resource::builder()
             .with_service_name("oxllm")
-            .with_attributes(vec![KeyValue::new("service.version", "0.1.0")])
+            .with_attributes(vec![KeyValue::new(
+                "service.version",
+                env!("CARGO_PKG_VERSION"),
+            )])
             .build();
 
         let span_exporter = opentelemetry_otlp::SpanExporter::builder()
             .with_http()
-            .with_endpoint(otel_endpoint)
+            .with_endpoint(signal_endpoint(otel_endpoint, "traces"))
             .build();
 
         let metric_exporter = opentelemetry_otlp::MetricExporter::builder()
             .with_http()
-            .with_endpoint(otel_endpoint)
+            .with_endpoint(signal_endpoint(otel_endpoint, "metrics"))
             .build();
 
         match (span_exporter, metric_exporter) {
@@ -258,5 +269,34 @@ impl TelemetryWorker {
                 },
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::signal_endpoint;
+
+    #[test]
+    fn test_signal_endpoint_appends_the_otlp_path() {
+        assert_eq!(
+            signal_endpoint("http://127.0.0.1:4318", "traces"),
+            "http://127.0.0.1:4318/v1/traces"
+        );
+        assert_eq!(
+            signal_endpoint("http://127.0.0.1:4318", "metrics"),
+            "http://127.0.0.1:4318/v1/metrics"
+        );
+    }
+
+    #[test]
+    fn test_signal_endpoint_tolerates_trailing_slashes() {
+        assert_eq!(
+            signal_endpoint("http://collector:4318/", "traces"),
+            "http://collector:4318/v1/traces"
+        );
+        assert_eq!(
+            signal_endpoint("https://collector.example/otlp//", "metrics"),
+            "https://collector.example/otlp/v1/metrics"
+        );
     }
 }
