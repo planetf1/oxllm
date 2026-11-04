@@ -136,6 +136,9 @@ Behaviour specific to this route:
   feed the cached-token counter.
 * **Session affinity**: `x-session-id` as usual, falling back to
   `metadata.user_id` from the body.
+* **`GET /v1/models`** returns a superset of the OpenAI and Anthropic list shapes
+  (`object`/`created`/`owned_by` plus `type`/`display_name`/`created_at` and
+  `has_more`/`first_id`/`last_id`), so either SDK family can list models.
 
 OpenAI-to-Anthropic body translation is not implemented; it is a possible
 follow-up.

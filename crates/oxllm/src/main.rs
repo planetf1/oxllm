@@ -6774,4 +6774,43 @@ vm = [
             Some("a1")
         );
     }
+
+    #[tokio::test]
+    async fn test_models_is_superset_of_openai_and_anthropic_shapes() {
+        let addr =
+            spawn_raw_recording_upstream(vec![http_json("200 OK", "{}")], Default::default()).await;
+        let (_state, rs) = build_test_state_with(addr, Default::default(), None);
+        let router = axum::Router::new()
+            .route("/v1/models", axum::routing::get(routes::list_models))
+            .with_state(rs);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let models_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let body: Value = reqwest::Client::new()
+            .get(format!("http://{}/v1/models", models_addr))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        // OpenAI shape.
+        assert_eq!(body["object"], "list");
+        let first = &body["data"][0];
+        assert_eq!(first["object"], "model");
+        assert!(first["created"].is_u64());
+        assert!(first["owned_by"].is_string());
+        // Anthropic shape.
+        assert_eq!(first["type"], "model");
+        assert_eq!(first["display_name"], first["id"]);
+        assert!(first["created_at"].as_str().unwrap().ends_with('Z'));
+        assert_eq!(body["has_more"], false);
+        assert_eq!(body["first_id"], first["id"]);
+        assert_eq!(
+            body["last_id"],
+            body["data"].as_array().unwrap().last().unwrap()["id"]
+        );
+    }
 }

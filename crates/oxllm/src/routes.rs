@@ -34,13 +34,26 @@ struct ModelObject {
     object: &'static str,
     created: u64,
     owned_by: &'static str,
+    // Anthropic `GET /v1/models` fields. OpenAI clients ignore them, so one
+    // response satisfies both SDK families.
+    #[serde(rename = "type")]
+    kind: &'static str,
+    display_name: String,
+    created_at: &'static str,
 }
 
 #[derive(Serialize)]
 struct ModelsResponse {
     object: &'static str,
     data: Vec<ModelObject>,
+    // Anthropic list pagination fields (the list is never paginated).
+    has_more: bool,
+    first_id: Option<String>,
+    last_id: Option<String>,
 }
+
+/// `created` (1717070400) as RFC 3339, for Anthropic's `created_at`.
+const MODEL_CREATED_AT: &str = "2024-05-30T12:00:00Z";
 
 /// GET /v1/models
 pub async fn list_models(State(app_state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -82,6 +95,9 @@ pub async fn list_models(State(app_state): State<Arc<AppState>>) -> impl IntoRes
                 object: "model",
                 created: 1717070400, // May 30, 2026 constant
                 owned_by: "oxllm-virtual",
+                kind: "model",
+                display_name: vm_name.clone(),
+                created_at: MODEL_CREATED_AT,
             });
         }
     }
@@ -98,12 +114,18 @@ pub async fn list_models(State(app_state): State<Arc<AppState>>) -> impl IntoRes
                 object: "model",
                 created: 1717070400, // May 30, 2026 constant
                 owned_by: "oxllm-alias",
+                kind: "model",
+                display_name: alias.clone(),
+                created_at: MODEL_CREATED_AT,
             });
         }
     }
 
     Json(ModelsResponse {
         object: "list",
+        has_more: false,
+        first_id: data.first().map(|m| m.id.clone()),
+        last_id: data.last().map(|m| m.id.clone()),
         data,
     })
 }

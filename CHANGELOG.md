@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shape. Inbound `server.api_keys` are accepted via `x-api-key` on these
   routes, and `metadata.user_id` is a session-affinity fallback. Usage stats
   read Anthropic `usage` (cache tokens included), streamed or not.
+- `GET /v1/models` now also carries the Anthropic list fields (`type`,
+  `display_name`, `created_at`, `has_more`, `first_id`, `last_id`) alongside the
+  OpenAI ones.
 
 ## [0.1.24] - 2026-11-03
 
