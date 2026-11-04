@@ -2675,7 +2675,9 @@ mod integration_tests {
         let content = body["choices"][0]["message"]["content"].as_str().unwrap();
         assert_eq!(content, "Hello from prov2");
 
-        let p1_limited = app_state.providers[0].rate_limited_until.read().await;
+        // The 429 window is held by the limited model, not the whole provider.
+        let p1_model = app_state.providers[0].model_health.get("gpt-4-upstream");
+        let p1_limited = p1_model.rate_limited_until.read().await;
         assert!(p1_limited.is_some());
     }
 
@@ -6648,16 +6650,12 @@ vm = [
         // the same provider until the breaker threshold, as on OpenAI routes.
         assert!(!r1.lock().await.is_empty());
         assert_eq!(r2.lock().await.len(), 1);
-        // 429 is scoped to the provider (rate limits apply to the key); a
-        // server error or overload is scoped to the model.
+        // 429, server errors and overload are all scoped to the model; the
+        // provider itself stays reachable.
         let health = state.providers[0].model_health.get("upstream-a1");
         let model_failures = *health.consecutive_failures.read().await;
         let provider_failures = *state.providers[0].consecutive_failures.read().await;
-        if first_status.starts_with("429") {
-            assert_eq!((provider_failures, model_failures), (1, 0));
-        } else {
-            assert_eq!((provider_failures, model_failures), (0, 1));
-        }
+        assert_eq!((provider_failures, model_failures), (0, 1));
     }
 
     #[tokio::test]
@@ -6693,7 +6691,8 @@ vm = [
             .await
             .unwrap();
         assert_eq!(res.status(), 200);
-        let until = state.providers[0]
+        let health = state.providers[0].model_health.get("upstream-a1");
+        let until = health
             .rate_limited_until
             .read()
             .await
@@ -7667,5 +7666,86 @@ grp = [{ provider = "p1", model = "m-down" }, { provider = "p1", model = "m-up" 
         assert!(help.contains("--route"), "got: {help}");
         assert!(help.contains("-vv"), "got: {help}");
         assert!(help.contains("oxllm tail"), "next step named: {help}");
+    }
+
+    /// A 429 for one model (LiteLLM answers "No deployments available for
+    /// selected model" per model) must not rate-limit its siblings on the
+    /// same provider: the sibling keeps serving and only the limited model
+    /// is skipped until its window ends.
+    #[tokio::test]
+    async fn test_429_for_one_model_does_not_block_its_sibling() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let reply = if req.contains("model-limited") {
+                        "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 30\r\nConnection: close\r\nContent-Length: 0\r\n\r\n".to_string()
+                    } else {
+                        http_json("200 OK", r#"{"choices":[],"usage":{}}"#).replacen(
+                            "\r\n",
+                            "\r\nConnection: close\r\n",
+                            1,
+                        )
+                    };
+                    let _ = stream.write_all(reply.as_bytes()).await;
+                });
+            }
+        });
+        let (proxy, state) = spawn_proxy_with_targets(
+            vec![test_provider("gw", addr, ApiFormat::Openai)],
+            vec![target("gw", "model-limited"), target("gw", "model-ok")],
+            vec![],
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let url = format!("http://{}/v1/chat/completions", proxy);
+        let body = serde_json::json!({"model":"vm","messages":[{"role":"user","content":"x"}]});
+
+        // First request: model-limited answers 429, model-ok serves.
+        let res = client.post(&url).json(&body).send().await.unwrap();
+        assert_eq!(res.status(), 200);
+        assert_eq!(state.request_log.recent(1)[0].model, "model-ok");
+
+        // The 429 window belongs to the model, not the provider.
+        assert!(
+            state.providers[0].rate_limited_until.read().await.is_none(),
+            "a model's 429 must not rate-limit the whole provider"
+        );
+        let limited = state.providers[0].model_health.get("model-limited");
+        assert!(limited.rate_limited_until.read().await.is_some());
+
+        // A single-entry route for the sibling model is served.
+        let (proxy2, _s2) = spawn_proxy_with_targets(
+            vec![test_provider("gw", addr, ApiFormat::Openai)],
+            vec![target("gw", "model-ok")],
+            vec![],
+        )
+        .await;
+        let res = client
+            .post(format!("http://{}/v1/chat/completions", proxy2))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+
+        // And the limited model is skipped instantly on the next request.
+        let t = Instant::now();
+        let res = client.post(&url).json(&body).send().await.unwrap();
+        assert_eq!(res.status(), 200);
+        assert!(t.elapsed() < Duration::from_millis(500));
+        let availability = state.providers[0].entry_availability("model-limited").await;
+        assert_eq!(availability.name(), "rate_limited");
+        assert_eq!(
+            state.providers[0]
+                .entry_availability("model-ok")
+                .await
+                .name(),
+            "healthy"
+        );
     }
 }

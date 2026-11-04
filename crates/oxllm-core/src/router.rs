@@ -92,8 +92,11 @@ pub enum Outcome {
     /// The host could not be reached (refused, DNS, TLS, reset): counted
     /// against the provider, since every model on it is equally affected.
     Unreachable,
-    /// The upstream answered 429: a rate-limit window for the provider
-    /// (limits normally apply to the key), honouring `retry_after`.
+    /// The upstream answered 429: a rate-limit window for this model,
+    /// honouring `retry_after`. Gateways such as LiteLLM rate-limit per
+    /// model ("No deployments available for selected model"), so a sibling
+    /// model on the same provider keeps serving; a key-wide limit costs one
+    /// 429 per model rather than hiding the siblings of a single model.
     RateLimited,
     /// The upstream answered with a server error, or a body or stream broke:
     /// counted against this model only.
@@ -358,17 +361,17 @@ impl AdaptivePriorityStrategy {
                     .await;
                 release(&mv, model_probe);
             },
-            Outcome::RateLimited => {
-                self.record_failure(&pv, limits, provider_probe, Some(429), retry_after)
-                    .await;
-                release(&mv, model_probe);
-            },
-            Outcome::ModelError | Outcome::ModelTimeout => {
+            Outcome::ModelError | Outcome::ModelTimeout | Outcome::RateLimited => {
                 if outcome == Outcome::ModelTimeout {
                     let mut failures = mv.failures.write().await;
                     *failures = (*failures).max(threshold.saturating_sub(1));
                 }
-                self.record_failure(&mv, limits, model_probe, None, None)
+                let (status, retry) = if outcome == Outcome::RateLimited {
+                    (Some(429), retry_after)
+                } else {
+                    (None, None)
+                };
+                self.record_failure(&mv, limits, model_probe, status, retry)
                     .await;
                 // The host answered, so the provider itself is reachable.
                 if provider_probe {
