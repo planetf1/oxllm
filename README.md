@@ -156,7 +156,6 @@ headers. Browser-based applications can call the proxy directly.
 oxllm/
 ├── Cargo.toml              # Workspace root
 ├── config.toml             # Multi-tier cloud provider config (6 providers)
-├── config-local-test.toml  # Local-only Ollama config for testing
 ├── crates/
 │   ├── oxllm-core/         # Core: config parsing, circuit breaker, router, telemetry
 │   └── oxllm/              # CLI: Axum server, routes, signal handling, admin API
@@ -194,7 +193,7 @@ Builds from [crates.io](https://crates.io/crates/oxllm). Requires Rust 1.85.1+.
 git clone https://github.com/planetf1/oxllm.git
 cd oxllm
 cargo build --release
-./target/release/oxllm serve --config config-local-test.toml
+./target/release/oxllm serve --config config.toml
 ```
 
 ### Default Config Location
@@ -206,7 +205,7 @@ cargo build --release
 
 ```bash
 # Quick start with local Ollama (no API keys needed):
-cp config-local-test.toml ~/.config/oxllm/config.toml
+cp config.toml ~/.config/oxllm/config.toml
 oxllm serve
 
 # Or with cloud providers (set env vars first):
@@ -233,8 +232,9 @@ Ollama can be added as a local fallback for testing or as a last resort.
 
 The repo includes two ready-to-use configs:
 
-- **`config.toml`** — 6 free-tier cloud providers with 2 virtual model tiers
-- **`config-local-test.toml`** — local Ollama only (for testing)
+- **`config.toml`** — free-tier cloud providers in two virtual model tiers (`smart`, `basic`), with a local Ollama fallback
+
+For a local-only trial, delete the cloud providers and keep the Ollama one (no API keys needed).
 
 For the cloud config, set your API keys (see [Provider Guide](docs/providers.md) for sign-up links):
 
@@ -278,10 +278,6 @@ curl -X POST http://127.0.0.1:8080/v1/completions \
 curl http://127.0.0.1:8080/status
 ```
 
-For local testing with Ollama instead of cloud providers:
-```bash
-oxllm serve --config config-local-test.toml
-```
 
 ## ⚙️ Configuration
 
@@ -304,17 +300,6 @@ oxllm serve --config config-local-test.toml
 
 ### Provider Definition
 
-Virtual models can be layered: a target of `{ virtual = "other" }` splices in another virtual model's targets, in their own order.
-
-```toml
-[virtual_models]
-general-med = [{ virtual = "gemma12b" }, { virtual = "granite8b" }]   # quality order
-gemma12b    = [{ provider = "omlx-local", model = "gemma-12b" }, { provider = "llamacpp-local", model = "gemma-12b-Q4" }]
-granite8b   = [{ provider = "omlx-local", model = "granite-8b" }, { provider = "llamacpp-local", model = "granite-8b-Q4" }]
-```
-
-Clients ask for `general-med`; the runtime behind each model is a leaf detail you can swap without touching the tiers. A `priority` on a reference orders the whole group; a leaf reached by several paths appears once; cycles, undefined references and nesting deeper than 16 are rejected at load, `oxllm validate` and reload (a rejected reload keeps the running config). `/status` and counters show the flattened leaf targets.
-
 Each provider requires `name`, `enabled`, `base_url` (with trailing `/v1/`), `api_key` (or `${VAR}` env reference), and `models` list. Optional per-provider keys: `upstream_timeout_secs` (overrides `server.upstream_timeout_secs`, so a fast-failing local provider can fail over sooner than a slow global timeout) and `cost_per_mtok` (cost weight used by the `cheapest` policy). Per-provider circuit tuning: `circuit_failure_threshold` and `circuit_base_cooldown_secs` override the server-wide values for that provider. `first_byte_timeout_secs` applies to streaming requests only: a provider that sends no response headers in that time is abandoned and its circuit opens at once, so a hung endpoint costs one short wait instead of the full `upstream_timeout_secs`. Non-streaming requests ignore it, because their headers only arrive after the whole generation.
 
 ### Virtual Models (Fallback Chains)
@@ -335,16 +320,30 @@ smart = [
 ]
 ```
 
+#### Layered virtual models
+
+Virtual models can be layered: a target of `{ virtual = "other" }` splices in another virtual model's targets, in their own order.
+
+```toml
+[virtual_models]
+general-med = [{ virtual = "gemma12b" }, { virtual = "granite8b" }]   # quality order
+gemma12b    = [{ provider = "omlx-local", model = "gemma-12b" }, { provider = "llamacpp-local", model = "gemma-12b-Q4" }]
+granite8b   = [{ provider = "omlx-local", model = "granite-8b" }, { provider = "llamacpp-local", model = "granite-8b-Q4" }]
+```
+
+Clients ask for `general-med`; the runtime behind each model is a leaf detail you can swap without touching the tiers. A `priority` on a reference orders the whole group; a leaf reached by several paths appears once; cycles, undefined references and nesting deeper than 16 are rejected at load, `oxllm validate` and reload (a rejected reload keeps the running config). `/status` and counters show the flattened leaf targets.
+
 ### How the Routing Algorithm Works
 
-1. When a request arrives, the proxy iterates the virtual model's provider list in order (or by measured latency — see **Routing Policies** below).
-2. For each provider, it checks: **circuit breaker state** (Closed? Open? HalfOpen?), **rate-limit window** (cooling down?), **manual override** (admin-disabled?).
-3. The first healthy provider is selected for the request.
-4. On success: circuit resets to Closed, failure count drops to 0.
-5. On 429 (rate limit): sets a cooldown timer based on `retry-after` header (default `rate_limit_fallback_secs`, 30s). After `circuit_failure_threshold` failures, circuit opens.
-6. On 5xx: increments failure counter. After `circuit_failure_threshold` (default 3) failures, circuit opens for **`circuit_base_cooldown_secs` × 2^(failures−threshold)** seconds (default 60s base).
-7. **HalfOpen probes**: After cooldown expires, a single probe request is allowed. Only one concurrent probe — others bypass via atomic `compare_exchange`.
-8. **Idle decay**: Every 5 minutes without a request, failure count decreases by 1. Below 3 failures, Open circuits automatically rehabilitate to Closed.
+1. A request names a virtual model (or an alias, or falls to `default_model`). Its pool is a list of **entries**: one (provider, upstream model) pair each, in routing order (see **Routing Policies**).
+2. Entries are tried in order, **each at most once per request**. An entry is skipped when its provider or its model is unavailable: circuit open, rate-limited, or admin-offline. If none can take the request, the client gets a 502 (Anthropic-shaped `api_error` body on `/v1/messages`).
+3. Health is tracked at two scopes. The **provider** scope is reachability: connection failures and 429s (a rate limit applies to the key, so it covers every model on the provider). The **model** scope is everything a response can say about one model: timeouts, 5xx/529, and a stream that breaks. One hanging model therefore does not take its healthy siblings on the same gateway out of rotation.
+4. On success the entry's circuit closes and its failure count resets.
+5. On 429 the provider is rate-limited for `retry-after` (else `rate_limit_fallback_secs`) and the request fails over immediately.
+6. On a timeout the model's circuit opens **at once**: a hang costs every caller a full timeout, so waiting for `circuit_failure_threshold` victims would multiply it. Other failures (5xx, 529, connection errors) count towards the threshold (default 3); at the threshold the circuit opens for `circuit_base_cooldown_secs` x 2^(failures - threshold).
+7. **HalfOpen probes**: after the cooldown a single probe request is allowed through; concurrent requests skip the entry (an atomic `compare_exchange`, no lock). A successful probe closes the circuit.
+8. **Idle decay**: every 5 minutes without traffic reduces the failure count by 1; below the threshold an open circuit closes again.
+9. Anthropic routes (`/v1/messages`) return 4xx other than 408/429 to the caller untouched: another provider would not fix a bad request or key, and it says nothing about provider health.
 
 ### Routing Policies
 
@@ -411,9 +410,9 @@ A bounded ring of recent request records (metadata only: timestamp, endpoint,
 route, provider, model, status, attempts, latency, TTFT, error, request id —
 never bodies) is kept in memory (`server.request_log_capacity`, default 256):
 
-- `oxllm status` renders the most recent records, plus the daemon version and
-  the last reload outcome (failures and pending restart-required warnings).
-- `oxllm tail [-n N]` prints the last N records and then follows live traffic
+- `oxllm status -vv` renders the most recent records; the header carries the daemon
+  version and any failed reload or pending restart-required warning.
+- `oxllm tail [-r N]` prints the last N records and then follows live traffic
   over a localhost-only SSE stream; plain lines, so `grep`/`jq` compose.
 - Admin-offline providers show as "Offline (admin)" instead of looking healthy.
 
@@ -442,114 +441,85 @@ response passes through verbatim.
 
 ### Status & Metrics
 
-`oxllm status` prints per-virtual-model routing tables, a per-route rollup with
-latency distributions (p50/p95/p99 of total latency and time-to-first-byte), and
-per-provider totals. Traffic is attributed per `(provider, model)` pair, so two
-virtual models sharing one provider do not show each other's traffic, and
-`cached_tokens` (upstream prompt-cache reuse) is reported per route so warm-vs-cold
-latency differences can be explained. Tables
-drop optional columns to fit the terminal width (`$COLUMNS`, or `--width`), and
-`--json` emits the raw `/status` payload for scripting. The same counters feed
-the OpenTelemetry spans (`gen_ai.usage.*`, `proxy.attempts_required`) and
-metrics exported to the configured OTLP endpoint.
+`oxllm status` answers "is anything wrong?" first, then lets you drill down:
+
+| Command | Shows |
+|---|---|
+| `oxllm status` | health, a list of problems, one row per route (state, strategy, available/total entries, requests, failures, p50/p95) |
+| `oxllm status -v` | + each route's entries: state (with retry countdown), API, priority/weight tier, traffic, TTFT |
+| `oxllm status -vv` | + provider reachability, token and latency percentiles, the last 15 requests |
+| `--route NAME` | narrows any level to one virtual model |
+| `--json` | the same tiers as JSON for scripts, e.g. `oxllm status --json \| jq '.health.problems'` |
+
+A route is **ok** (every entry available), **degraded** (some), or **down** (none can take a request). Entry states are `healthy`, `probing`, `rate_limited`, `open`, and `offline` (admin). Traffic is attributed per `(provider, model)`, so two routes sharing a provider do not show each other's counts, and `cached_tokens` (upstream prompt-cache reuse) is reported per route. Tables drop optional columns to fit the terminal (`$COLUMNS` or `--width`).
+
+The same counters feed the OpenTelemetry spans and metrics (see Telemetry below).
 
 ### Example Configs
 
-- `config.toml` — 6 cloud providers across 2 tiers (smart + basic)
-- `config-local-test.toml` — local Ollama only, zero API keys
+- `config.toml` — cloud providers across 2 tiers (smart + basic) plus a local Ollama fallback
 
 ---
 
 ## 📟 CLI Subcommands
 
 ```bash
-# Start the proxy
-oxllm serve                          # default: ~/.config/oxllm/config.toml
-oxllm serve -v                       # verbose: per-request routing info
-oxllm serve -vv                      # trace: full request/response dump
+# Run
+oxllm serve -c config.toml           # foreground; -v debug, -vv trace
+oxllm validate -c config.toml        # syntax, references, cycles; run before reload
+oxllm install -c config.toml         # run as a login service (launchd / systemd)
 
-# Validate config syntax
-oxllm validate                       # checks env vars, provider cross-refs
+# Observe
+oxllm status                         # problems first, then one row per route
+oxllm status -v                      # + each route's entries
+oxllm status -vv --json              # everything, as JSON
+oxllm status --host router.lan       # a remote daemon (OXLLM_HOST / OXLLM_PORT)
+oxllm tail -r 20                     # last 20 requests, then follow live (Ctrl-C to stop)
 
-# Live dashboard (no external collector needed)
-oxllm status                         # version, routing tables, counters, recent requests
-oxllm status --host router.lan       # against a remote daemon (OXLLM_HOST/OXLLM_PORT)
-
-# Watch traffic as it happens (Ctrl-C to stop)
-oxllm tail                           # live stream of request records
-oxllm tail -n 20                     # last 20 records, then follow live traffic
-
-# Manage providers at runtime
-oxllm provider list                  # condensed provider status table
-oxllm provider offline <name>        # take a provider out of rotation
-oxllm provider online <name>         # re-enable a disabled provider
-oxllm provider reset <name>          # clear circuit breaker, failures, rate limit
-
-# Config hot-reload (automatic on file change; manual trigger below)
-oxllm reload                         # POST /reload on -p PORT (default 8080),
-                                     # or --pid <pid> to SIGHUP directly
-
-# Graceful stop (drains in-flight SSE streams)
-oxllm stop
+# Operate
+oxllm provider list                  # providers and their state
+oxllm provider offline <name>        # take a provider out of rotation (manual hold)
+oxllm provider online <name>         # put it back
+oxllm provider reset <name>          # clear circuit, failures, rate limit
+oxllm reload                         # apply config edits (validated first); or --pid <pid> for SIGHUP
+oxllm stop                           # graceful stop (drains in-flight streams)
+oxllm uninstall                      # remove the service
 ```
 
-`oxllm reload` and `oxllm stop` exit non-zero when no daemon can be reached, so
-`edit && oxllm reload` chains fail loudly instead of silently doing nothing.
+`oxllm reload` and `oxllm stop` exit non-zero when no daemon can be reached or the new config is invalid, so `edit && oxllm reload` chains fail loudly instead of silently doing nothing. Every command has `--help` with examples and a suggested next step.
 
-### Example `oxllm status` Output (after ~5 hours of real use)
+### Example `oxllm status` output
 
-```
-Uptime: 311m 3s  |  Total Requests: 150
-
-Virtual Model: smart
--------------------------------------------------------------------------------------------------------------------------------
-| Provider             | Model                                         | Circuit                        | Requests |  Success |
--------------------------------------------------------------------------------------------------------------------------------
-| groq-strong          | llama-3.3-70b-versatile                       | Open (197s cooldown)           |       16 |        0 |
-| sambanova-strong     | Llama-4-Maverick-17B-128E-Instruct            | Closed (Healthy)               |       30 |        8 |
-| groq-basic           | meta-llama/llama-4-scout-17b-16e-instruct     | Open (225s cooldown)           |       30 |       17 |
-| google-basic         | gemini-2.5-flash                              | Closed (Healthy)               |       32 |       22 |
-| sambanova-basic      | DeepSeek-V3.1                                 | Closed (Healthy)               |       15 |       10 |
-| openrouter-basic     | ibm-granite/granite-4.1-8b                    | Closed (Healthy)               |       27 |       27 |
-| ollama-fallback      | granite4.1:3b                                 | Closed (Healthy)               |        0 |        0 |
-
-Virtual Model: basic
--------------------------------------------------------------------------------------------------------------------------------
-| Provider             | Model                                         | Circuit                        | Requests |  Success |
--------------------------------------------------------------------------------------------------------------------------------
-| groq-basic           | meta-llama/llama-4-scout-17b-16e-instruct     | Open (225s cooldown)           |       30 |       17 |
-| google-basic         | gemini-2.5-flash                              | Closed (Healthy)               |       32 |       22 |
-| sambanova-basic      | DeepSeek-V3.1                                 | Closed (Healthy)               |       15 |       10 |
-| openrouter-basic     | ibm-granite/granite-4.1-8b                    | Closed (Healthy)               |       27 |       27 |
-| ollama-fallback      | granite4.1:3b                                 | Closed (Healthy)               |        0 |        0 |
-
-Use 'oxllm provider offline <name>' to take a provider out of rotation.
-Use 'oxllm provider reset <name>' to clear circuit breaker state.
-```
-
-Piping through `cat` or a pager adds the full per-provider counter table with failure counts, token volumes, and last-request timestamps:
+A pool with one provider down and a rate-limited sibling (default level):
 
 ```
-+--------------------+-----------------------------------------------+--------------------------------+----------+---------------+----------+-----------+--------------+---------------+--------------+
-| Provider Name      | Models                                                | Circuit Breaker State          | Failures | Rate Limited? | Requests | Successes | Tokens Input | Tokens Output | Last Request|
-+--------------------+-----------------------------------------------+--------------------------------+----------+---------------+----------+-----------+--------------+---------------+--------------+
-| groq-strong        | llama-3.3-70b-versatile                       | Open (Cooldown: 197s left)     | 5        | No            | 16       | 0         | 0            | 0             | Just now     |
-| sambanova-strong   | Llama-4-Maverick-17B-128E-Instruct            | Closed (Healthy)               | 13       | No            | 30       | 8         | 94           | 4             | Just now     |
-| groq-basic         | meta-llama/llama-4-scout-17b-16e-instruct     | Open (Cooldown: 225s left)     | 5        | No            | 30       | 17        | 232          | 10            | Just now     |
-| google-basic       | gemini-2.5-flash                              | Closed (Healthy)               | 8        | No            | 32       | 22        | 0            | 0             | Just now     |
-| sambanova-basic    | DeepSeek-V3.1                                 | Closed (Healthy)               | 1        | Yes           | 15       | 10        | 0            | 0             | Just now     |
-| openrouter-basic   | ibm-granite/granite-4.1-8b                    | Closed (Healthy)               | 0        | No            | 27       | 27        | 0            | 0             | Just now     |
-| ollama-fallback    | granite4.1:3b                                 | Closed (Healthy)               | 0        | No            | 0        | 0         | 0            | 0             | Never        |
-+--------------------+-----------------------------------------------+--------------------------------+----------+---------------+----------+-----------+--------------+---------------+--------------+
+oxllm 0.1.24  up 3h 02m  412 requests  DEGRADED
+
+  ! pool-docs              degraded      1 of 2 entries available
+  ! claude-ext             down          aws/claude-sonnet-5-5 (open), retry in 41s
+
+Routes
++───────────────+──────────+──────────+───────+─────+──────+────────+────────+
+| Route         | State    | Strategy | Avail | Req | Fail | p50    | p95    |
++───────────────+──────────+──────────+───────+─────+──────+────────+────────+
+| pool-docs     | degraded | priority |   1/2 | 118 |    2 |  912ms | 3410ms |
+| pool-easy     | ok       | priority |   3/3 | 204 |    0 |  655ms | 1203ms |
++───────────────+──────────+──────────+───────+─────+──────+────────+────────+
+
+More: oxllm status -v (targets per route)  |  -vv (providers, recent requests)  |  --route NAME  |  --json
 ```
 
-This example — captured after 5 hours of real use — shows:
-- **groq-strong**: Circuit is *Open* (197s cooldown remaining) after 5 failures with 0 successes across 16 requests, meaning all attempts hit rate limits or errors.
-- **groq-basic**: Also *Open* (225s cooldown) after 5 failures, but 17 of 30 requests succeeded before the circuit tripped.
-- **sambanova-strong**: *Closed* and healthy but with 13 failures — it's been reliable enough to stay open despite a high error rate.
-- **openrouter-basic**: Perfect record — 27/27 requests succeeded, 0 failures, circuit Closed.
-- **sambanova-basic**: Currently *rate-limited* (1 failure, marked "Yes"), but the circuit remains Closed.
-- **ollama-fallback**: Never used (0 requests), sitting idle as the last-resort local model.
+`-v` adds, per route, which entry is where and why (the Tier column shows `p1`/`w3` for an explicit priority or weight):
+
+```
+pool-docs  (priority: configured order, first healthy wins; failover on error)
++───+────────────+───────────────────────+───────────+───────────+──────+─────+
+| # | Provider   | Model                 | State     | API       | Tier | Req |
++───+────────────+───────────────────────+───────────+───────────+──────+─────+
+| 1 | claude-ext | aws/claude-sonnet-5-5 | open 41s  | anthropic | -    |  96 |
+| 2 | claude-int | aws/claude-sonnet-5-5 | healthy   | anthropic | -    |  22 |
++───+────────────+───────────────────────+───────────+───────────+──────+─────+
+```
 
 All admin endpoints (`/health`, `/status`, `/reload`, `/admin/*`) are restricted to localhost — external callers receive `403 Forbidden`.
 
@@ -574,27 +544,31 @@ without a collector.
 
 ### Span Attributes (Traces)
 
-Every routed transaction generates a span with GenAI semantic conventions:
+Every request produces one `oxllm.transaction` span with GenAI semantic conventions:
 
 | Attribute | Example | Description |
 |---|---|---|
-| `gen_ai.operation.name` | `chat` / `embeddings` | Operation type |
-| `gen_ai.provider.name` | `groq-strong` | Provider selected |
-| `gen_ai.request.model` | `llama-3.3-70b-versatile` | Model used |
-| `gen_ai.usage.input_tokens` | `1420` | Input token count |
-| `gen_ai.usage.output_tokens` | `312` | Output token count |
-| `proxy.attempts_required` | `2` | How many providers were tried |
-| `proxy.initial_failure_reason` | `429_too_many_requests` | First failure cause (if any) |
+| `gen_ai.operation.name` | `chat` / `messages` | Endpoint family |
+| `gen_ai.provider.name` | `claude-ext` | Provider that served it (the last one tried, on failure) |
+| `gen_ai.request.model` | `aws/claude-sonnet-5-5` | Upstream model used |
+| `gen_ai.usage.input_tokens` | `1420` | Input tokens (Anthropic: includes cache reads and creations) |
+| `gen_ai.usage.output_tokens` | `312` | Output tokens |
+| `proxy.route` | `pool-docs` | Virtual model the client asked for |
+| `proxy.attempts_required` | `2` | Pool entries tried |
+| `proxy.initial_failure_reason` | `all_providers_failed` | Set on a failed request (`all_providers_failed`, `no_available_provider`, `stream_failed`) |
+| `proxy.request_id` | `oxllm-3dc0...` | Matches the `x-request-id` response header |
 
-Spans are linked to incoming W3C `traceparent` headers when present.
+A request that fails after every entry (or whose stream breaks) gets span status `ERROR`, so `otelite traces list --status ERROR` finds it. Spans link to an incoming W3C `traceparent` when present. Find them by service: `otelite traces list --since 1h` and look for service `oxllm`.
 
 ### Metrics
 
 | Metric | Type | Description |
 |---|---|---|
-| `llm_proxy.provider.status` | Gauge | `0` = healthy, `1` = rate-limited, `2` = circuit tripped |
-| `llm_proxy.request.duration` | Histogram | Request lifecycle duration (ms) |
-| `llm_proxy.tokens.consumed` | Counter | Cumulative tokens by provider, model, type |
+| `llm_proxy.provider.status` | Gauge | `0` = healthy, `1` = rate-limited, `2` = circuit tripped (per provider) |
+| `llm_proxy.request.duration` | Histogram | Request lifecycle (ms), buckets from 5 ms to 10 min so slow LLM calls are not lost in an overflow bucket |
+| `llm_proxy.tokens.consumed` | Counter | Cumulative tokens by provider, model and type |
+
+Metrics are exported every 60 s by default. `otel_endpoint` is the collector's base URL; oxllm appends `/v1/traces` and `/v1/metrics` itself.
 
 ### Logging
 

@@ -59,7 +59,12 @@ mod routes;
     name = "oxllm",
     version = env!("CARGO_PKG_VERSION"),
     author = "Nigel Jones",
-    about = "Minimalist adaptive routing LLM proxy"
+    about = "Resilient routing proxy for LLM APIs (OpenAI and Anthropic wire formats)",
+    long_about = "oxllm sits between your clients and your LLM providers. Clients ask for a \
+virtual model name; oxllm picks a provider for it, fails over when one is slow or down, and \
+reports what happened.\n\nEndpoints: /v1/chat/completions, /v1/completions, /v1/embeddings, \
+/v1/messages (Anthropic), /v1/models.",
+    after_help = "Getting started:\n  1. oxllm validate -c config.toml   check a config\n  2. oxllm serve -c config.toml      run in the foreground\n  3. oxllm status                    what is healthy, what is not\n\nRunning as a service:\n  oxllm install -c config.toml       launchd (macOS) / systemd (Linux), starts at login\n  oxllm reload                       apply config edits without dropping connections\n\nWhen something is wrong:\n  oxllm status -v                    per-route targets and why each is out\n  oxllm tail -r 20                   the last 20 requests, then live\n  oxllm provider offline NAME        take a provider out of rotation\n  oxllm provider reset NAME          clear its circuit and failure count\n\nDocs: README.md (config reference), docs/architecture.md (design)."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -68,7 +73,10 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Starts the gateway Axum server and telemetry worker
+    /// Runs the proxy in the foreground (use `install` to run it as a service)
+    #[command(
+        after_help = "Config: --config, else $OXLLM_CONFIG, else ~/.config/oxllm/config.toml, else ./config.toml.\n${VAR} references in the config need those variables set in this shell.\nNext: oxllm status (from another terminal), or oxllm install to keep it running."
+    )]
     Serve {
         /// Path to the configuration TOML file
         /// (searches: <path>, ~/.config/oxllm/config.toml, ./config.toml)
@@ -79,7 +87,10 @@ enum Commands {
         #[arg(short, long, action = clap::ArgAction::Count, default_value_t = 0)]
         verbose: u8,
     },
-    /// Parses and validates the configuration syntax and cross-references
+    /// Checks a config file without starting anything (syntax, references, cycles)
+    #[command(
+        after_help = "Exits 0 when valid, 1 with the reason when not. Run it before `oxllm reload`.\nNote: ${VAR} references must be set in this shell, or validation fails on them."
+    )]
     Validate {
         /// Path to the configuration TOML file
         /// (searches: <path>, ~/.config/oxllm/config.toml, ./config.toml)
@@ -117,7 +128,10 @@ oxllm provider offline NAME (take a provider out of rotation)"
         #[arg(short, long)]
         route: Option<String>,
     },
-    /// Triggers hot-reload on the running gateway (POST /reload, or SIGHUP via --pid)
+    /// Applies config edits to the running daemon without dropping connections
+    #[command(
+        after_help = "The new config is validated first; if it is invalid the daemon keeps the old one and this exits 1 with the reason.\nProvider health, counters and session pins carry over for providers that keep their name.\nNext: oxllm status"
+    )]
     Reload {
         /// Host of the running gateway server
         #[arg(long, default_value = "127.0.0.1", env = "OXLLM_HOST")]
@@ -129,14 +143,19 @@ oxllm provider offline NAME (take a provider out of rotation)"
         #[arg(long)]
         pid: Option<u32>,
     },
-    /// Gracefully stops the running oxllm daemon (sends SIGTERM)
+    /// Stops the daemon gracefully (SIGTERM; in-flight requests drain first)
+    #[command(
+        after_help = "If it was installed as a service the service manager restarts it; use `oxllm uninstall` to remove it."
+    )]
     Stop {
         /// PID of the running oxllm process (optional, reads from /tmp/oxllm.pid by default)
         #[arg(short, long)]
         pid: Option<u32>,
     },
-    /// Installs oxllm as a user-level service (launchd agent on macOS,
-    /// systemd user service on Linux) and starts it
+    /// Installs oxllm as a login service (launchd on macOS, systemd on Linux) and starts it
+    #[command(
+        after_help = "The service does not inherit your shell, so ${VAR} references in the config will not resolve; use a wrapper script that exports them, or avoid references.\nNext: oxllm status"
+    )]
     Install {
         /// Path to the configuration TOML file
         /// (searches: <path>, ~/.config/oxllm/config.toml, ./config.toml)
@@ -146,9 +165,12 @@ oxllm provider offline NAME (take a provider out of rotation)"
         #[arg(long)]
         force: bool,
     },
-    /// Stops and removes the installed oxllm service
+    /// Stops and removes the installed service
     Uninstall,
-    /// Streams live request records from the running daemon (Ctrl-C to stop)
+    /// Shows recent requests, then follows new ones live (Ctrl-C to stop)
+    #[command(
+        after_help = "Each line: time, endpoint, route, provider that served it, status, latency, attempts. Metadata only; request and response bodies are never recorded.\nExample: oxllm tail -r 20"
+    )]
     Tail {
         /// Host of the running gateway server
         #[arg(long, default_value = "127.0.0.1", env = "OXLLM_HOST")]
@@ -160,14 +182,17 @@ oxllm provider offline NAME (take a provider out of rotation)"
         #[arg(short, long, default_value_t = 0)]
         recent: usize,
     },
-    /// Manage providers (list, offline, online, reset)
-    #[command(subcommand)]
+    /// Takes providers out of or back into rotation, and resets their health
+    #[command(
+        subcommand,
+        after_help = "Examples:\n  oxllm provider list\n  oxllm provider offline cb        stop sending traffic (survives circuit recovery)\n  oxllm provider online cb         resume\n  oxllm provider reset cb          clear circuit, failures and rate limit"
+    )]
     Provider(ProviderCommand),
 }
 
 #[derive(Subcommand, Debug)]
 enum ProviderCommand {
-    /// List all providers and their circuit state
+    /// Lists providers with their state (see `oxllm status -v` for per-model detail)
     List {
         /// Host of the running gateway server
         #[arg(long, default_value = "127.0.0.1", env = "OXLLM_HOST")]
@@ -179,7 +204,7 @@ enum ProviderCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Take a provider offline (circuit breaker + manual disabled)
+    /// Takes a provider out of rotation until `online` (a manual hold, not a circuit)
     Offline {
         /// Name of the provider to take offline
         name: String,
@@ -190,7 +215,7 @@ enum ProviderCommand {
         #[arg(short, long, default_value_t = 8080, env = "OXLLM_PORT")]
         port: u16,
     },
-    /// Bring a provider back online
+    /// Puts a provider back into rotation
     Online {
         /// Name of the provider to bring online
         name: String,
@@ -201,7 +226,7 @@ enum ProviderCommand {
         #[arg(short, long, default_value_t = 8080, env = "OXLLM_PORT")]
         port: u16,
     },
-    /// Reset a provider's circuit breaker, failures, and rate limit
+    /// Clears a provider's circuit, failure count and rate-limit window
     Reset {
         /// Name of the provider to reset
         name: String,
@@ -7605,5 +7630,42 @@ grp = [{ provider = "p1", model = "m-down" }, { provider = "p1", model = "m-up" 
         assert!(problems.iter().any(
             |p| p["scope"] == "provider" && p["detail"].as_str().unwrap().contains("retry in")
         ));
+    }
+
+    // ---- CLI help -----------------------------------------------------------
+
+    #[test]
+    fn test_cli_definition_is_consistent_and_every_command_is_described() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        cmd.clone().debug_assert();
+        fn walk(cmd: &clap::Command, path: &str) {
+            for sub in cmd.get_subcommands() {
+                let name = format!("{path} {}", sub.get_name());
+                if sub.get_name() != "help" {
+                    assert!(
+                        sub.get_about().is_some(),
+                        "`{}` has no one-line description",
+                        name.trim()
+                    );
+                }
+                walk(sub, &name);
+            }
+        }
+        walk(&cmd, "oxllm");
+    }
+
+    #[test]
+    fn test_cli_help_points_to_the_next_step() {
+        use clap::CommandFactory;
+        let mut top = Cli::command();
+        let help = top.render_long_help().to_string();
+        assert!(help.contains("Getting started"), "got: {help}");
+        assert!(help.contains("oxllm status -v"), "got: {help}");
+        let mut status = Cli::command().find_subcommand("status").unwrap().clone();
+        let help = status.render_long_help().to_string();
+        assert!(help.contains("--route"), "got: {help}");
+        assert!(help.contains("-vv"), "got: {help}");
+        assert!(help.contains("oxllm tail"), "next step named: {help}");
     }
 }

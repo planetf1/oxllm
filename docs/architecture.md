@@ -78,21 +78,26 @@ pub struct ProviderState {
     pub base_url: Url,
     pub api_key: String,
     pub models: Vec<String>,
+    pub api: ApiFormat,                 // openai | anthropic
+    pub tuning: ProviderTuning,         // per-provider circuit / first-byte overrides
+    // Provider scope: reachability (connect failures, 429)
     pub circuit: Arc<RwLock<CircuitState>>,
     pub rate_limited_until: Arc<RwLock<Option<Instant>>>,
     pub consecutive_failures: Arc<RwLock<u32>>,
     pub last_attempt_time: Arc<RwLock<Option<Instant>>>,
     pub probe_in_flight: Arc<AtomicBool>,
+    // Model scope: timeouts, 5xx/529, broken streams, per upstream model
+    pub model_health: Arc<ModelHealthMap>,
     pub requests: AtomicU64,
     pub successes: AtomicU64,
     pub tokens_input: AtomicU64,
     pub tokens_output: AtomicU64,
-    pub manual_disabled: AtomicBool, // v0.1.6: set via admin endpoints to manually disable a provider
+    pub manual_disabled: AtomicBool,    // set via admin endpoints
 }
 ```
 
 #### Adaptive Logic & Circuit Breaker Rules:
-1.  **The Handshake Guard**: When a request hits `/v1/chat/completions`, the engine loops through the configured provider array under a fast `RwLock::read` lock, selecting the first provider where `circuit` is `Closed` or is in `HalfOpen` (with no active `probe_in_flight`), and `rate_limited_until` is either `None` or in the past.
+1.  **The Handshake Guard**: A request resolves its virtual model to an ordered list of pool entries (provider, upstream model), then selects the first entry where both the provider scope and the model scope are `Closed` (or `HalfOpen` with no active `probe_in_flight`) and not rate-limited. Each entry is tried at most once per request. Nested virtual models are flattened when state is built, so this loop only ever sees leaf entries.
 2.  **Thundering Herd Defense**: When a provider's `Open` cooldown expires:
     * The provider transitions to `HalfOpen`.
     * The first request that selects it flags `probe_in_flight = true` atomically via `.compare_exchange()`.
@@ -196,8 +201,9 @@ To protect against Out-Of-Memory (OOM) situations on memory-constrained edge rou
 The agent must configure the following standard metrics:
 
 * `llm_proxy.provider.status` (Gauge): Emits `0` for healthy, `1` for rate-limited cooldown, `2` for circuit-breaker tripped. Attributes: `provider.name`.
-* `llm_proxy.request.duration` (Histogram): Total lifecycle duration of the transaction. Attributes: `provider.name`, `client.endpoint`.
-* `llm_proxy.tokens.consumed` (Counter): Cumulative count of tokens processed. Attributes: `provider.name`, `model.name`, `type` (`input` or `output`).
+* `llm_proxy.request.duration` (Histogram, ms): Total lifecycle duration of the transaction. Attributes: `gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.model`. Explicit buckets run from 5 ms to 10 minutes: the OTel defaults stop at 10 s, and a slow LLM call then lands in the +Inf overflow bucket, which some backends (otelite) refuse to store.
+* `llm_proxy.tokens.consumed` (Counter): Cumulative count of tokens processed. Same attributes plus `type` (`input` or `output`).
+* The exporter's base `otel_endpoint` is extended per signal (`/v1/traces`, `/v1/metrics`); the OTLP/HTTP exporter would otherwise POST to the collector root and every export would 404.
 
 ### 4.4. Semantic Span Attributes
 Every routed transaction generates an OpenTelemetry Span containing the official GenAI Semantic Conventions:
@@ -206,7 +212,7 @@ Every routed transaction generates an OpenTelemetry Span containing the official
 {
   "trace_id": "...",
   "span_id": "...",
-  "name": "oxllm.chat.completions",
+  "name": "oxllm.transaction",
   "attributes": {
     "gen_ai.operation.name": "chat",
     "gen_ai.provider.name": "groq",
@@ -214,7 +220,8 @@ Every routed transaction generates an OpenTelemetry Span containing the official
     "gen_ai.usage.input_tokens": 1420,
     "gen_ai.usage.output_tokens": 312,
     "proxy.attempts_required": 2,
-    "proxy.initial_failure_reason": "429_tokens_exhausted"
+    "proxy.route": "smart",
+    "proxy.request_id": "oxllm-3dc05f6228e58f0a"
   }
 }
 ```
