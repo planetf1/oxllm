@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Nested virtual models**: a target can be `{ virtual = "other" }` instead of
+  `provider`/`model`, splicing in that model's targets in their own order, so
+  tiers can be layered (`general-med -> [gemma12b, granite8b]`, each of those
+  listing runtimes). Flattened once at state-build time; the request path is
+  unchanged and counters stay per leaf (provider, model). A `priority` on a
+  reference applies to the whole group; `weight` is rejected on references;
+  leaves reached by several paths appear once. Validation rejects cycles
+  (error names the full path, `a -> b -> c -> a`), undefined references, and
+  nesting deeper than 16, on startup, `oxllm validate`, `oxllm reload`,
+  SIGHUP and the config watcher; a rejected reload keeps the running config.
+  Flattening re-checks for cycles itself, so it never relies on `validate()`.
+
+### Added
 - **Per-provider tuning**: `circuit_failure_threshold` and
   `circuit_base_cooldown_secs` override the server-wide values for one
   provider, so a flaky gateway and a stable local server need not share a

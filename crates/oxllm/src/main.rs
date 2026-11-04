@@ -249,6 +249,10 @@ impl axum::extract::FromRef<ReloadableState> for Reloader {
 /// edit mid-incident no longer re-enables a provider taken offline or
 /// resets failover history.
 fn build_app_state(config: Config, previous: Option<&AppState>) -> Result<AppState, String> {
+    // Flatten nested virtual models up front (this re-checks for cycles, so
+    // it holds even if the caller skipped `validate()`); the routing hot
+    // path only ever sees leaf targets.
+    let virtual_models = config.flatten_virtual_models().map_err(|e| e.to_string())?;
     let mut providers = Vec::new();
     for p in config.providers {
         if !p.enabled {
@@ -334,7 +338,7 @@ fn build_app_state(config: Config, previous: Option<&AppState>) -> Result<AppSta
     let request_log_capacity = config.server.request_log_capacity;
     Ok(AppState {
         providers,
-        virtual_models: config.virtual_models,
+        virtual_models,
         aliases: config.aliases,
         default_model: config.server.default_model.clone(),
         circuit: CircuitConfig {
@@ -2497,12 +2501,14 @@ mod integration_tests {
                     model: "gpt-4-upstream".to_string(),
                     priority: None,
                     weight: None,
+                    virtual_ref: None,
                 },
                 VirtualModelTarget {
                     provider: "prov2".to_string(),
                     model: "gpt-4-upstream".to_string(),
                     priority: None,
                     weight: None,
+                    virtual_ref: None,
                 },
             ],
         );
@@ -2620,6 +2626,7 @@ mod integration_tests {
                 model: "gpt-4-upstream".to_string(),
                 priority: None,
                 weight: None,
+                virtual_ref: None,
             }],
         );
 
@@ -2799,6 +2806,7 @@ mod integration_tests {
                 model: "granite-4.1-3b-4bit".to_string(),
                 priority: None,
                 weight: None,
+                virtual_ref: None,
             }],
         );
 
@@ -3010,6 +3018,7 @@ mod integration_tests {
                 model: "small".to_string(),
                 priority: None,
                 weight: None,
+                virtual_ref: None,
             }],
         );
         virtual_models.insert(
@@ -3019,6 +3028,7 @@ mod integration_tests {
                 model: "big".to_string(),
                 priority: None,
                 weight: None,
+                virtual_ref: None,
             }],
         );
 
@@ -3170,6 +3180,7 @@ mod integration_tests {
                 model: "m".to_string(),
                 priority: None,
                 weight: None,
+                virtual_ref: None,
             }],
         );
 
@@ -3305,12 +3316,14 @@ mod integration_tests {
                     model: "m".to_string(),
                     priority: None,
                     weight: None,
+                    virtual_ref: None,
                 },
                 VirtualModelTarget {
                     provider: "prov-b".to_string(),
                     model: "m".to_string(),
                     priority: None,
                     weight: None,
+                    virtual_ref: None,
                 },
             ],
         );
@@ -3525,12 +3538,14 @@ mod integration_tests {
                     model: "model".into(),
                     priority: None,
                     weight: None,
+                    virtual_ref: None,
                 },
                 VirtualModelTarget {
                     provider: "p2".into(),
                     model: "model".into(),
                     priority: None,
                     weight: None,
+                    virtual_ref: None,
                 },
             ],
         );
@@ -3682,12 +3697,14 @@ mod integration_tests {
                     model: "model".into(),
                     priority: None,
                     weight: None,
+                    virtual_ref: None,
                 },
                 VirtualModelTarget {
                     provider: "p2".into(),
                     model: "model".into(),
                     priority: None,
                     weight: None,
+                    virtual_ref: None,
                 },
             ],
         );
@@ -3806,6 +3823,7 @@ mod integration_tests {
                 model: "model".into(),
                 priority: None,
                 weight: None,
+                virtual_ref: None,
             }],
         );
 
@@ -3945,6 +3963,7 @@ mod integration_tests {
                 model: "model".into(),
                 priority: None,
                 weight: None,
+                virtual_ref: None,
             }],
         );
 
@@ -4057,6 +4076,7 @@ mod integration_tests {
                 model: "real-model".into(),
                 priority: None,
                 weight: None,
+                virtual_ref: None,
             }],
         );
 
@@ -4161,6 +4181,7 @@ mod integration_tests {
                 model: "model".into(),
                 priority: None,
                 weight: None,
+                virtual_ref: None,
             }],
         );
         let state = Arc::new(AppState {
@@ -4277,6 +4298,7 @@ mod integration_tests {
                 model: "model".into(),
                 priority: None,
                 weight: None,
+                virtual_ref: None,
             }],
         );
         let state = Arc::new(AppState {
@@ -4397,6 +4419,7 @@ mod integration_tests {
                 model: "model".into(),
                 priority: None,
                 weight: None,
+                virtual_ref: None,
             }],
         );
 
@@ -5452,12 +5475,14 @@ vm = [
                     model: "Kev-4B-Q4_K_M".to_string(),
                     priority: None,
                     weight: None,
+                    virtual_ref: None,
                 },
                 VirtualModelTarget {
                     provider: "hosted-jev".to_string(),
                     model: "jev".to_string(),
                     priority: None,
                     weight: None,
+                    virtual_ref: None,
                 },
             ],
         );
@@ -5678,12 +5703,14 @@ vm = [
                     model: "m".to_string(),
                     priority: None,
                     weight: Some(3),
+                    virtual_ref: None,
                 },
                 VirtualModelTarget {
                     provider: "light".to_string(),
                     model: "m".to_string(),
                     priority: None,
                     weight: Some(1),
+                    virtual_ref: None,
                 },
             ],
         );
@@ -5806,12 +5833,14 @@ vm = [
                     model: "m".to_string(),
                     priority: None,
                     weight: None,
+                    virtual_ref: None,
                 },
                 VirtualModelTarget {
                     provider: "configured-second-but-fast".to_string(),
                     model: "m".to_string(),
                     priority: None,
                     weight: None,
+                    virtual_ref: None,
                 },
             ],
         );
@@ -6155,7 +6184,14 @@ vm = [
             let mut idx = 0usize;
             while let Ok((mut stream, _)) = listener.accept().await {
                 let recorded = recorded.clone();
-                let response = responses[idx.min(responses.len() - 1)].clone();
+                // The mock closes the socket after one reply, so tell the
+                // client not to pool it; otherwise a follow-up request can
+                // reuse the dead connection and fail spuriously.
+                let response = responses[idx.min(responses.len() - 1)].replacen(
+                    "\r\n",
+                    "\r\nConnection: close\r\n",
+                    1,
+                );
                 idx += 1;
                 tokio::spawn(async move {
                     let mut buf = Vec::new();
@@ -6238,6 +6274,7 @@ vm = [
                 model: format!("upstream-{}", p.name),
                 priority: None,
                 weight: None,
+                virtual_ref: None,
             })
             .collect();
         spawn_proxy_with_targets(providers, targets, api_keys).await
@@ -6855,6 +6892,7 @@ vm = [
             model: model.to_string(),
             priority: None,
             weight: None,
+            virtual_ref: None,
         }
     }
 
@@ -6885,7 +6923,9 @@ vm = [
             .send()
             .await
             .unwrap();
-        assert_eq!(res.status(), 200);
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        assert_eq!(status, 200, "body: {text}");
         let seen = rec.lock().await.clone();
         assert_eq!(seen.len(), 2, "one attempt per entry: {seen:?}");
         assert!(
@@ -7041,5 +7081,137 @@ vm = [
             t.elapsed()
         );
         assert_eq!(state.request_log.recent(1)[0].provider, "slow");
+    }
+
+    fn nested_toml(extra_vms: &str) -> String {
+        format!(
+            r#"
+[server]
+host = "127.0.0.1"
+port = 8080
+otel_endpoint = "http://127.0.0.1:4318"
+watch_config = false
+
+[[providers]]
+name = "p1"
+enabled = true
+base_url = "http://127.0.0.1:9/v1/"
+api_key = "k"
+models = ["m"]
+
+[virtual_models]
+leaf = [{{ provider = "p1", model = "m" }}]
+{extra_vms}
+"#
+        )
+    }
+
+    /// A reload that introduces a reference cycle is rejected with the full
+    /// path in the error, and the running config is kept.
+    #[tokio::test]
+    async fn test_reload_with_cycle_keeps_previous_config() {
+        let path = temp_path("nested-cycle.toml");
+        std::fs::write(&path, nested_toml("outer = [{ virtual = \"leaf\" }]")).unwrap();
+        let config = Config::load_from_file(&path).unwrap();
+        config.validate().unwrap();
+        let initial = Arc::new(build_app_state(config, None).unwrap());
+        let (sender, receiver) = tokio::sync::watch::channel(initial.clone());
+        assert!(receiver.borrow().virtual_models.contains_key("outer"));
+
+        std::fs::write(
+            &path,
+            nested_toml(
+                "a = [{ virtual = \"b\" }]\nb = [{ virtual = \"c\" }]\nc = [{ virtual = \"a\" }]",
+            ),
+        )
+        .unwrap();
+        let err = reload_config(&path, &sender).unwrap_err();
+        assert!(err.contains("a -> b -> c -> a"), "got: {err}");
+        assert!(
+            Arc::ptr_eq(&receiver.borrow(), &initial),
+            "a rejected reload must leave the running state in place"
+        );
+        assert!(receiver
+            .borrow()
+            .reload_health
+            .snapshot()
+            .last_error
+            .is_some());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn load_nested(name: &str, extra_vms: &str) -> Config {
+        let path = temp_path(name);
+        std::fs::write(&path, nested_toml(extra_vms)).unwrap();
+        let config = Config::load_from_file(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        config
+    }
+
+    /// build_app_state refuses a cyclic config even when validate() was
+    /// never called.
+    #[test]
+    fn test_build_app_state_is_cycle_safe_without_validate() {
+        let config = load_nested("nested-nov.toml", "a = [{ virtual = \"a\" }]");
+        let err = build_app_state(config, None).err().expect("must refuse");
+        assert!(err.contains("a -> a"), "got: {err}");
+    }
+
+    /// End to end: the flattened output of build_app_state drives a real
+    /// request. `outer` references `grp` (down, up); the request is served
+    /// by `up` after `down` fails, with the leaf's own model name upstream.
+    #[tokio::test]
+    async fn test_nested_virtual_model_routes_through_groups() {
+        let mut config = load_nested(
+            "nested-e2e.toml",
+            r#"
+outer = [{ virtual = "grp" }]
+grp = [{ provider = "p1", model = "m-down" }, { provider = "p1", model = "m-up" }]
+"#,
+        );
+        config.validate().unwrap();
+        config.providers.clear();
+        let state = build_app_state_for_flatten_only(&config);
+        let outer = state.get("outer").expect("outer flattened").clone();
+        assert_eq!(
+            outer.iter().map(|t| t.model.as_str()).collect::<Vec<_>>(),
+            ["m-down", "m-up"]
+        );
+
+        // Serve those flattened targets through the real proxy.
+        let rec = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let ok = r#"{"choices":[{"message":{"role":"assistant","content":"x"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
+        let addr = spawn_raw_recording_upstream(
+            vec![
+                http_json("500 Internal Server Error", "{}"),
+                http_json("200 OK", ok),
+            ],
+            rec.clone(),
+        )
+        .await;
+        let targets: Vec<VirtualModelTarget> =
+            outer.iter().map(|t| target("p1", &t.model)).collect();
+        let (proxy, _s) = spawn_proxy_with_targets(
+            vec![test_provider("p1", addr, ApiFormat::Openai)],
+            targets,
+            vec![],
+        )
+        .await;
+        let res = reqwest::Client::new()
+            .post(format!("http://{}/v1/chat/completions", proxy))
+            .json(&serde_json::json!({"model":"vm","messages":[{"role":"user","content":"x"}]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let seen = rec.lock().await.clone();
+        assert!(seen[0].contains("\"model\":\"m-down\""), "got: {}", seen[0]);
+        assert!(seen[1].contains("\"model\":\"m-up\""), "got: {}", seen[1]);
+    }
+
+    fn build_app_state_for_flatten_only(
+        config: &Config,
+    ) -> std::collections::HashMap<String, Vec<VirtualModelTarget>> {
+        config.flatten_virtual_models().unwrap()
     }
 }

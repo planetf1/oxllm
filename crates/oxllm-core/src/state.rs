@@ -816,6 +816,7 @@ mod affinity_tests {
             model: "m".to_string(),
             priority: None,
             weight: None,
+            virtual_ref: None,
         };
         let mut virtual_models = HashMap::new();
         virtual_models.insert(

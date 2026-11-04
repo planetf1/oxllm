@@ -125,8 +125,19 @@ pub struct ProviderConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VirtualModelTarget {
+    /// Provider for a leaf target. Empty when `virtual` is set.
+    #[serde(default)]
     pub provider: String,
+    /// Upstream model name for a leaf target. Empty when `virtual` is set.
+    #[serde(default)]
     pub model: String,
+    /// Instead of `provider`/`model`: the name of another virtual model
+    /// whose targets are spliced in here, in their own order. Resolved once
+    /// at state-build time; cycles are rejected by validation. A `priority`
+    /// on a reference applies to the whole group. `weight` is not allowed
+    /// on a reference.
+    #[serde(rename = "virtual", default)]
+    pub virtual_ref: Option<String>,
     /// Routing preference within one virtual model: lower wins. Targets
     /// without a priority keep their configured order, after all targets
     /// that have one. Absent everywhere, this reproduces the historical
@@ -218,6 +229,30 @@ impl Config {
             }
 
             for target in targets {
+                if let Some(reference) = &target.virtual_ref {
+                    if !target.provider.is_empty() || !target.model.is_empty() {
+                        return Err(OxllmError::ConfigLoad(format!(
+                            "Virtual model '{}' target references virtual model '{}' \
+                             and also sets provider/model; use one or the other",
+                            vm_name, reference
+                        )));
+                    }
+                    if target.weight.is_some() {
+                        return Err(OxllmError::ConfigLoad(format!(
+                            "Virtual model '{}' target references virtual model '{}' \
+                             with a weight; weights apply to provider targets, not groups",
+                            vm_name, reference
+                        )));
+                    }
+                    continue;
+                }
+                if target.provider.is_empty() || target.model.is_empty() {
+                    return Err(OxllmError::ConfigLoad(format!(
+                        "Virtual model '{}' has a target without provider and model \
+                         (or `virtual = \"<name>\"`)",
+                        vm_name
+                    )));
+                }
                 match provider_map.get(target.provider.as_str()) {
                     Some(provider) => {
                         if !provider.enabled {
@@ -234,6 +269,9 @@ impl Config {
                 }
             }
         }
+
+        // 2b. Virtual-model references: defined, acyclic, bounded depth
+        self.check_virtual_model_references()?;
 
         // 3. Aliases must point at defined virtual models
         for (alias, target) in &self.aliases {
@@ -292,6 +330,137 @@ impl Config {
         }
 
         Ok(())
+    }
+}
+
+/// Maximum nesting of virtual-model references (a -> b -> c is depth 3).
+pub const MAX_VIRTUAL_MODEL_DEPTH: usize = 16;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mark {
+    InProgress,
+    Done,
+}
+
+impl Config {
+    /// Rejects undefined references, cycles (naming the full path, e.g.
+    /// `a -> b -> c -> a`) and nesting deeper than
+    /// [`MAX_VIRTUAL_MODEL_DEPTH`]. Depth-first search with three-colour
+    /// marking; the depth guard fires before recursion can get deep, so a
+    /// hostile chain cannot overflow the stack. Roots are visited in sorted
+    /// order so the reported error is deterministic.
+    pub fn check_virtual_model_references(&self) -> Result<()> {
+        let mut marks: HashMap<&str, Mark> = HashMap::new();
+        let mut roots: Vec<&str> = self.virtual_models.keys().map(String::as_str).collect();
+        roots.sort_unstable();
+        for root in roots {
+            let mut path: Vec<&str> = Vec::new();
+            self.visit_virtual_model(root, &mut marks, &mut path)?;
+        }
+        Ok(())
+    }
+
+    fn visit_virtual_model<'a>(
+        &'a self,
+        name: &'a str,
+        marks: &mut HashMap<&'a str, Mark>,
+        path: &mut Vec<&'a str>,
+    ) -> Result<()> {
+        match marks.get(name) {
+            Some(Mark::Done) => return Ok(()),
+            Some(Mark::InProgress) => {
+                let start = path.iter().position(|n| *n == name).unwrap_or(0);
+                let mut cycle: Vec<&str> = path[start..].to_vec();
+                cycle.push(name);
+                return Err(OxllmError::ConfigLoad(format!(
+                    "Virtual model references form a cycle: {}",
+                    cycle.join(" -> ")
+                )));
+            },
+            None => {},
+        }
+        if path.len() >= MAX_VIRTUAL_MODEL_DEPTH {
+            let mut chain: Vec<&str> = path.clone();
+            chain.push(name);
+            return Err(OxllmError::ConfigLoad(format!(
+                "Virtual model references nest deeper than {} levels: {}",
+                MAX_VIRTUAL_MODEL_DEPTH,
+                chain.join(" -> ")
+            )));
+        }
+        marks.insert(name, Mark::InProgress);
+        path.push(name);
+        for target in self.virtual_models.get(name).into_iter().flatten() {
+            if let Some(reference) = target.virtual_ref.as_deref() {
+                if !self.virtual_models.contains_key(reference) {
+                    return Err(OxllmError::ConfigLoad(format!(
+                        "Virtual model '{}' references undefined virtual model '{}'",
+                        name, reference
+                    )));
+                }
+                self.visit_virtual_model(reference, marks, path)?;
+            }
+        }
+        path.pop();
+        marks.insert(name, Mark::Done);
+        Ok(())
+    }
+
+    /// Resolves every virtual model to a flat list of leaf (provider, model)
+    /// targets. Runs the reference check itself, so it is safe to call
+    /// without `validate()`. Order is preserved: a referenced group's own
+    /// order stays contiguous, and the reference's `priority` applies to the
+    /// whole group (weights inside a nested group are dropped, since a
+    /// per-leaf lottery would break the group's order). Models containing
+    /// references are de-duplicated on (provider, model), keeping the entry
+    /// that sorts first; models without references are returned untouched.
+    pub fn flatten_virtual_models(&self) -> Result<HashMap<String, Vec<VirtualModelTarget>>> {
+        self.check_virtual_model_references()?;
+        let mut memo: HashMap<String, Vec<VirtualModelTarget>> = HashMap::new();
+        let names: Vec<String> = self.virtual_models.keys().cloned().collect();
+        for name in &names {
+            self.flatten_one(name, &mut memo);
+        }
+        Ok(memo)
+    }
+
+    /// Callers guarantee acyclicity and bounded depth via
+    /// `check_virtual_model_references`, so this recursion terminates.
+    fn flatten_one(
+        &self,
+        name: &str,
+        memo: &mut HashMap<String, Vec<VirtualModelTarget>>,
+    ) -> Vec<VirtualModelTarget> {
+        if let Some(done) = memo.get(name) {
+            return done.clone();
+        }
+        let targets = self.virtual_models.get(name).cloned().unwrap_or_default();
+        let has_reference = targets.iter().any(|t| t.virtual_ref.is_some());
+        let mut out: Vec<VirtualModelTarget> = Vec::new();
+        for target in targets {
+            match target.virtual_ref.clone() {
+                None => out.push(target),
+                Some(reference) => {
+                    let mut group = self.flatten_one(&reference, memo);
+                    // Settle the group's internal order before it takes the
+                    // reference's single priority, so it stays contiguous.
+                    group.sort_by_key(|t| t.priority.unwrap_or(u32::MAX));
+                    for mut leaf in group {
+                        leaf.priority = target.priority;
+                        leaf.weight = None;
+                        out.push(leaf);
+                    }
+                },
+            }
+        }
+        if has_reference {
+            out.sort_by_key(|t| t.priority.unwrap_or(u32::MAX));
+            let mut seen: std::collections::HashSet<(String, String)> =
+                std::collections::HashSet::new();
+            out.retain(|t| seen.insert((t.provider.clone(), t.model.clone())));
+        }
+        memo.insert(name.to_string(), out.clone());
+        out
     }
 }
 
@@ -623,5 +792,186 @@ vm = [{ provider = "p", model = "m" }]
             .unwrap_err()
             .to_string()
             .contains("first_byte_timeout_secs"));
+    }
+
+    // ---- nested virtual models ------------------------------------------
+
+    /// Builds a config with providers `p1..p4` and the given virtual models,
+    /// written as TOML array bodies (`{ virtual = "b" }`, `{ provider = ... }`).
+    fn nested_config(vms: &[(&str, &str)]) -> Config {
+        let mut toml = String::from(
+            r#"
+[server]
+host = "127.0.0.1"
+port = 8080
+otel_endpoint = "http://127.0.0.1:4318"
+"#,
+        );
+        for p in ["p1", "p2", "p3", "p4"] {
+            toml.push_str(&format!(
+                "\n[[providers]]\nname = \"{p}\"\nenabled = true\nbase_url = \"http://127.0.0.1:9/v1/\"\napi_key = \"k\"\nmodels = [\"m\"]\n"
+            ));
+        }
+        toml.push_str("\n[virtual_models]\n");
+        for (name, body) in vms {
+            toml.push_str(&format!("{name} = [{body}]\n"));
+        }
+        toml::from_str(&toml).unwrap()
+    }
+
+    fn leaf(p: &str) -> String {
+        format!("{{ provider = \"{p}\", model = \"m\" }}")
+    }
+    fn refer(v: &str) -> String {
+        format!("{{ virtual = \"{v}\" }}")
+    }
+    fn flat_names(config: &Config, vm: &str) -> Vec<String> {
+        config.flatten_virtual_models().unwrap()[vm]
+            .iter()
+            .map(|t| t.provider.clone())
+            .collect()
+    }
+
+    #[test]
+    fn test_nested_rejects_self_reference() {
+        let c = nested_config(&[("a", &refer("a"))]);
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("a -> a"), "got: {err}");
+    }
+
+    #[test]
+    fn test_nested_rejects_two_cycle_naming_the_path() {
+        let c = nested_config(&[("a", &refer("b")), ("b", &refer("a"))]);
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("a -> b -> a"), "got: {err}");
+    }
+
+    #[test]
+    fn test_nested_rejects_long_cycle_naming_the_full_path() {
+        let c = nested_config(&[("a", &refer("b")), ("b", &refer("c")), ("c", &refer("a"))]);
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("a -> b -> c -> a"), "got: {err}");
+    }
+
+    #[test]
+    fn test_nested_cycle_path_excludes_the_entry_chain() {
+        // root -> a -> b -> a: the cycle is a -> b -> a, not root -> ...
+        let c = nested_config(&[
+            ("root", &refer("a")),
+            ("a", &refer("b")),
+            ("b", &format!("{}, {}", leaf("p1"), refer("a"))),
+        ]);
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("a -> b -> a"), "got: {err}");
+        assert!(!err.contains("root"), "got: {err}");
+    }
+
+    #[test]
+    fn test_nested_accepts_diamond() {
+        let c = nested_config(&[
+            ("a", &format!("{}, {}", refer("b"), refer("c"))),
+            ("b", &refer("d")),
+            ("c", &refer("d")),
+            ("d", &leaf("p1")),
+        ]);
+        c.validate().unwrap();
+        // The shared leaf appears once.
+        assert_eq!(flat_names(&c, "a"), ["p1"]);
+    }
+
+    #[test]
+    fn test_nested_rejects_undefined_reference() {
+        let c = nested_config(&[("a", &refer("ghost"))]);
+        let err = c.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("undefined virtual model 'ghost'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_nested_rejects_excess_depth_without_overflow() {
+        // A chain longer than the limit: must error, not recurse unboundedly.
+        let n = MAX_VIRTUAL_MODEL_DEPTH + 5;
+        let mut vms: Vec<(String, String)> = (0..n)
+            .map(|i| (format!("v{i}"), refer(&format!("v{}", i + 1))))
+            .collect();
+        vms.push((format!("v{n}"), leaf("p1")));
+        let refs: Vec<(&str, &str)> = vms.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let err = nested_config(&refs).validate().unwrap_err().to_string();
+        assert!(err.contains("nest deeper than"), "got: {err}");
+        // And a chain exactly at the limit is accepted.
+        let n = MAX_VIRTUAL_MODEL_DEPTH - 1;
+        let mut vms: Vec<(String, String)> = (0..n)
+            .map(|i| (format!("v{i}"), refer(&format!("v{}", i + 1))))
+            .collect();
+        vms.push((format!("v{n}"), leaf("p1")));
+        let refs: Vec<(&str, &str)> = vms.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        nested_config(&refs).validate().unwrap();
+    }
+
+    #[test]
+    fn test_flatten_is_cycle_safe_without_validate() {
+        let c = nested_config(&[("a", &refer("b")), ("b", &refer("a"))]);
+        // Never called validate(): flattening must refuse, not loop.
+        assert!(c.flatten_virtual_models().is_err());
+    }
+
+    #[test]
+    fn test_flatten_preserves_group_order_and_dedups() {
+        // general -> [gemma, granite]; each group has two runtimes; p2 is
+        // shared by both groups and a direct leaf follows.
+        let c = nested_config(&[
+            (
+                "general",
+                &format!("{}, {}, {}", refer("gemma"), refer("granite"), leaf("p4")),
+            ),
+            ("gemma", &format!("{}, {}", leaf("p1"), leaf("p2"))),
+            ("granite", &format!("{}, {}", leaf("p3"), leaf("p2"))),
+        ]);
+        c.validate().unwrap();
+        assert_eq!(flat_names(&c, "general"), ["p1", "p2", "p3", "p4"]);
+        // Referenced models stay usable on their own.
+        assert_eq!(flat_names(&c, "gemma"), ["p1", "p2"]);
+    }
+
+    #[test]
+    fn test_flatten_applies_reference_priority_to_whole_group() {
+        let c = nested_config(&[
+            (
+                "x",
+                &format!(
+                    "{}, {}",
+                    "{ virtual = \"late\", priority = 2 }", "{ virtual = \"early\", priority = 1 }"
+                ),
+            ),
+            ("late", &format!("{}, {}", leaf("p1"), leaf("p2"))),
+            ("early", &format!("{}, {}", leaf("p3"), leaf("p4"))),
+        ]);
+        c.validate().unwrap();
+        assert_eq!(flat_names(&c, "x"), ["p3", "p4", "p1", "p2"]);
+    }
+
+    #[test]
+    fn test_nested_rejects_weight_on_reference_and_mixed_target() {
+        let c = nested_config(&[("a", "{ virtual = \"b\", weight = 2 }"), ("b", &leaf("p1"))]);
+        assert!(c.validate().unwrap_err().to_string().contains("weight"));
+        let c = nested_config(&[
+            ("a", "{ virtual = \"b\", provider = \"p1\", model = \"m\" }"),
+            ("b", &leaf("p1")),
+        ]);
+        assert!(c
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("use one or the other"));
+        let c = nested_config(&[("a", "{ priority = 1 }")]);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn test_flat_configs_flatten_to_themselves() {
+        let c = nested_config(&[("a", &format!("{}, {}", leaf("p2"), leaf("p1")))]);
+        assert_eq!(flat_names(&c, "a"), ["p2", "p1"]);
     }
 }

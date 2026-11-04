@@ -304,6 +304,17 @@ oxllm serve --config config-local-test.toml
 
 ### Provider Definition
 
+Virtual models can be layered: a target of `{ virtual = "other" }` splices in another virtual model's targets, in their own order.
+
+```toml
+[virtual_models]
+general-med = [{ virtual = "gemma12b" }, { virtual = "granite8b" }]   # quality order
+gemma12b    = [{ provider = "omlx-local", model = "gemma-12b" }, { provider = "llamacpp-local", model = "gemma-12b-Q4" }]
+granite8b   = [{ provider = "omlx-local", model = "granite-8b" }, { provider = "llamacpp-local", model = "granite-8b-Q4" }]
+```
+
+Clients ask for `general-med`; the runtime behind each model is a leaf detail you can swap without touching the tiers. A `priority` on a reference orders the whole group; a leaf reached by several paths appears once; cycles, undefined references and nesting deeper than 16 are rejected at load, `oxllm validate` and reload (a rejected reload keeps the running config). `/status` and counters show the flattened leaf targets.
+
 Each provider requires `name`, `enabled`, `base_url` (with trailing `/v1/`), `api_key` (or `${VAR}` env reference), and `models` list. Optional per-provider keys: `upstream_timeout_secs` (overrides `server.upstream_timeout_secs`, so a fast-failing local provider can fail over sooner than a slow global timeout) and `cost_per_mtok` (cost weight used by the `cheapest` policy). Per-provider circuit tuning: `circuit_failure_threshold` and `circuit_base_cooldown_secs` override the server-wide values for that provider. `first_byte_timeout_secs` applies to streaming requests only: a provider that sends no response headers in that time is abandoned and its circuit opens at once, so a hung endpoint costs one short wait instead of the full `upstream_timeout_secs`. Non-streaming requests ignore it, because their headers only arrive after the whole generation.
 
 ### Virtual Models (Fallback Chains)
