@@ -289,6 +289,7 @@ fn build_app_state(config: Config, previous: Option<&AppState>) -> Result<AppSta
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
             model_stats: Arc::new(ModelStats::default()),
+            model_health: Default::default(),
         };
 
         if let Some(old) =
@@ -312,6 +313,7 @@ fn build_app_state(config: Config, previous: Option<&AppState>) -> Result<AppSta
             state.tokens_output =
                 AtomicU64::new(old.tokens_output.load(std::sync::atomic::Ordering::Relaxed));
             state.model_stats = old.model_stats.clone();
+            state.model_health = old.model_health.clone();
         }
         providers.push(state);
     }
@@ -2468,6 +2470,7 @@ mod integration_tests {
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
             model_stats: Arc::new(ModelStats::default()),
+            model_health: Default::default(),
         };
 
         let p2 = ProviderState {
@@ -2490,6 +2493,7 @@ mod integration_tests {
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
             model_stats: Arc::new(ModelStats::default()),
+            model_health: Default::default(),
         };
 
         let mut virtual_models = std::collections::HashMap::new();
@@ -2616,6 +2620,7 @@ mod integration_tests {
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
             model_stats: Arc::new(ModelStats::default()),
+            model_health: Default::default(),
         };
 
         let mut virtual_models = std::collections::HashMap::new();
@@ -2796,6 +2801,7 @@ mod integration_tests {
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
             model_stats: Arc::new(ModelStats::default()),
+            model_health: Default::default(),
         };
 
         let mut virtual_models = std::collections::HashMap::new();
@@ -3008,6 +3014,7 @@ mod integration_tests {
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
             model_stats: Arc::new(ModelStats::default()),
+            model_health: Default::default(),
         };
 
         let mut virtual_models = std::collections::HashMap::new();
@@ -3170,6 +3177,7 @@ mod integration_tests {
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
             model_stats: Arc::new(ModelStats::default()),
+            model_health: Default::default(),
         };
 
         let mut virtual_models = std::collections::HashMap::new();
@@ -3305,6 +3313,7 @@ mod integration_tests {
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
             model_stats: Arc::new(ModelStats::default()),
+            model_health: Default::default(),
         };
 
         let mut virtual_models = std::collections::HashMap::new();
@@ -3443,6 +3452,7 @@ mod integration_tests {
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
             model_stats: Arc::new(ModelStats::default()),
+            model_health: Default::default(),
         };
 
         let p2 = ProviderState {
@@ -3465,6 +3475,7 @@ mod integration_tests {
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
             model_stats: Arc::new(ModelStats::default()),
+            model_health: Default::default(),
         };
 
         let strategy = AdaptivePriorityStrategy::default();
@@ -3524,6 +3535,7 @@ mod integration_tests {
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
             model_stats: Arc::new(ModelStats::default()),
+            model_health: Default::default(),
         };
 
         let p1 = make_provider("p1");
@@ -3664,6 +3676,7 @@ mod integration_tests {
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
             model_stats: Arc::new(ModelStats::default()),
+            model_health: Default::default(),
         };
 
         let p2 = ProviderState {
@@ -3686,6 +3699,7 @@ mod integration_tests {
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
             model_stats: Arc::new(ModelStats::default()),
+            model_health: Default::default(),
         };
 
         let mut virtual_models = std::collections::HashMap::new();
@@ -3813,6 +3827,7 @@ mod integration_tests {
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
             model_stats: Arc::new(ModelStats::default()),
+            model_health: Default::default(),
         };
 
         let mut virtual_models = std::collections::HashMap::new();
@@ -3953,6 +3968,7 @@ mod integration_tests {
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
             model_stats: Arc::new(ModelStats::default()),
+            model_health: Default::default(),
         };
 
         let mut virtual_models = std::collections::HashMap::new();
@@ -4067,6 +4083,7 @@ mod integration_tests {
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
             model_stats: Arc::new(ModelStats::default()),
+            model_health: Default::default(),
         };
         let mut vm = std::collections::HashMap::new();
         vm.insert(
@@ -4171,6 +4188,7 @@ mod integration_tests {
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
             model_stats: Arc::new(ModelStats::default()),
+            model_health: Default::default(),
         };
 
         let mut vms = std::collections::HashMap::new();
@@ -4288,6 +4306,7 @@ mod integration_tests {
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
             model_stats: Arc::new(ModelStats::default()),
+            model_health: Default::default(),
         };
 
         let mut vms = std::collections::HashMap::new();
@@ -4410,6 +4429,7 @@ mod integration_tests {
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
             model_stats: Arc::new(ModelStats::default()),
+            model_health: Default::default(),
         };
         let mut vm = std::collections::HashMap::new();
         vm.insert(
@@ -5464,6 +5484,7 @@ vm = [
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
             model_stats: Arc::new(ModelStats::default()),
+            model_health: Default::default(),
         };
 
         let mut vms = std::collections::HashMap::new();
@@ -5692,6 +5713,7 @@ vm = [
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
             model_stats: Arc::new(ModelStats::default()),
+            model_health: Default::default(),
         };
 
         let mut vms = std::collections::HashMap::new();
@@ -5817,6 +5839,7 @@ vm = [
                 tokens_input: AtomicU64::new(0),
                 tokens_output: AtomicU64::new(0),
                 model_stats: Arc::new(ModelStats::default()),
+                model_health: Default::default(),
             };
             p.model_stats
                 .counters(&ModelStats::key(name, "m"))
@@ -6257,6 +6280,7 @@ vm = [
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
             model_stats: Arc::new(ModelStats::default()),
+            model_health: Default::default(),
         }
     }
 
@@ -6539,10 +6563,16 @@ vm = [
         // the same provider until the breaker threshold, as on OpenAI routes.
         assert!(!r1.lock().await.is_empty());
         assert_eq!(r2.lock().await.len(), 1);
-        assert!(
-            *state.providers[0].consecutive_failures.read().await >= 1,
-            "failed provider must be penalised"
-        );
+        // 429 is scoped to the provider (rate limits apply to the key); a
+        // server error or overload is scoped to the model.
+        let health = state.providers[0].model_health.get("upstream-a1");
+        let model_failures = *health.consecutive_failures.read().await;
+        let provider_failures = *state.providers[0].consecutive_failures.read().await;
+        if first_status.starts_with("429") {
+            assert_eq!((provider_failures, model_failures), (1, 0));
+        } else {
+            assert_eq!((provider_failures, model_failures), (0, 1));
+        }
     }
 
     #[tokio::test]
@@ -6983,12 +7013,15 @@ vm = [
         // One timeout, not `circuit_failure_threshold` (3) of them.
         assert!(first >= Duration::from_secs(1), "first: {:?}", first);
         assert!(first < Duration::from_millis(2500), "first: {:?}", first);
+        // The timeout opens the MODEL's circuit; the provider stays closed.
+        let health = state.providers[0].model_health.get("upstream-slow");
         assert!(
-            matches!(
-                *state.providers[0].circuit.read().await,
-                CircuitState::Open { .. }
-            ),
-            "one timeout must open the circuit"
+            matches!(*health.circuit.read().await, CircuitState::Open { .. }),
+            "one timeout must open the model's circuit"
+        );
+        assert_eq!(
+            *state.providers[0].circuit.read().await,
+            CircuitState::Closed
         );
 
         let t = Instant::now();
@@ -7059,14 +7092,15 @@ vm = [
         );
         let last = state.request_log.recent(1);
         assert_eq!(last[0].provider, "fast");
+        let health = state.providers[0].model_health.get("upstream-slow");
         assert!(matches!(
-            *state.providers[0].circuit.read().await,
+            *health.circuit.read().await,
             CircuitState::Open { .. }
         ));
 
         // Non-streaming: first_byte_timeout_secs does not apply, so the slow
         // provider (circuit reset) is waited on and answers after ~3 s.
-        *state.providers[0].circuit.write().await = CircuitState::Closed;
+        *health.circuit.write().await = CircuitState::Closed;
         let t = Instant::now();
         let res = client
             .post(&url)
@@ -7213,5 +7247,102 @@ grp = [{ provider = "p1", model = "m-down" }, { provider = "p1", model = "m-up" 
         config: &Config,
     ) -> std::collections::HashMap<String, Vec<VirtualModelTarget>> {
         config.flatten_virtual_models().unwrap()
+    }
+
+    /// Two models behind one provider: when the first hangs, its circuit
+    /// opens but the sibling model on the same provider keeps being served,
+    /// and the hung model is skipped without waiting on later requests.
+    #[tokio::test]
+    async fn test_hung_model_does_not_take_down_its_sibling() {
+        // A single upstream that hangs only for model-slow, answers model-ok.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    if req.contains("model-slow") {
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                    } else {
+                        let _ = stream
+                            .write_all(
+                                http_json("200 OK", r#"{"choices":[],"usage":{}}"#)
+                                    .replacen("\r\n", "\r\nConnection: close\r\n", 1)
+                                    .as_bytes(),
+                            )
+                            .await;
+                    }
+                });
+            }
+        });
+        let mut p = test_provider("gw", addr, ApiFormat::Openai);
+        p.upstream_timeout_secs = Some(1);
+        let (proxy, state) = spawn_proxy_with_targets(
+            vec![p],
+            vec![target("gw", "model-slow"), target("gw", "model-ok")],
+            vec![],
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let url = format!("http://{}/v1/chat/completions", proxy);
+        let body = serde_json::json!({"model":"vm","messages":[{"role":"user","content":"x"}]});
+
+        // First request: pays one timeout on model-slow, served by model-ok.
+        let t = Instant::now();
+        let res = client.post(&url).json(&body).send().await.unwrap();
+        assert_eq!(res.status(), 200);
+        assert!(t.elapsed() >= Duration::from_secs(1));
+        assert_eq!(state.request_log.recent(1)[0].model, "model-ok");
+
+        // The provider itself is healthy; only model-slow is open.
+        assert_eq!(
+            *state.providers[0].circuit.read().await,
+            CircuitState::Closed
+        );
+        let slow = state.providers[0].model_health.get("model-slow");
+        assert!(matches!(
+            *slow.circuit.read().await,
+            CircuitState::Open { .. }
+        ));
+        let ok = state.providers[0].model_health.get("model-ok");
+        assert_eq!(*ok.circuit.read().await, CircuitState::Closed);
+
+        // Second request skips model-slow instantly and still succeeds.
+        let t = Instant::now();
+        let res = client.post(&url).json(&body).send().await.unwrap();
+        assert_eq!(res.status(), 200);
+        assert!(
+            t.elapsed() < Duration::from_millis(600),
+            "took {:?}",
+            t.elapsed()
+        );
+        assert_eq!(state.request_log.recent(1)[0].model, "model-ok");
+    }
+
+    /// A refused connection is a provider-level failure: every model on the
+    /// host is affected, so the provider circuit (not the model's) counts it.
+    #[tokio::test]
+    async fn test_unreachable_host_is_a_provider_failure() {
+        let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = dead.local_addr().unwrap();
+        drop(dead); // nothing listens: connection refused
+        let (proxy, state) = spawn_proxy_with_targets(
+            vec![test_provider("gone", addr, ApiFormat::Openai)],
+            vec![target("gone", "m1")],
+            vec![],
+        )
+        .await;
+        let res = reqwest::Client::new()
+            .post(format!("http://{}/v1/chat/completions", proxy))
+            .json(&serde_json::json!({"model":"vm","messages":[{"role":"user","content":"x"}]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 502);
+        assert_eq!(*state.providers[0].consecutive_failures.read().await, 1);
+        let health = state.providers[0].model_health.get("m1");
+        assert_eq!(*health.consecutive_failures.read().await, 0);
     }
 }

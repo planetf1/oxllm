@@ -16,7 +16,7 @@ use tracing::{debug, error, warn};
 use oxllm_core::config::ApiFormat;
 use oxllm_core::router::{
     latency_band, order_by_cost, order_by_latency, rotate_within_band, weighted_lottery,
-    AdaptivePriorityStrategy, LatencyCandidate, RoutingStrategy,
+    AdaptivePriorityStrategy, LatencyCandidate, Outcome,
 };
 use oxllm_core::state::{
     unix_millis, AppState, CircuitState, ModelStats, ProviderState, RequestRecord, RouteCandidate,
@@ -669,26 +669,18 @@ async fn proxy_request(
     let mut tried = vec![false; candidates.len()];
     loop {
         let remaining: Vec<usize> = (0..candidates.len()).filter(|i| !tried[*i]).collect();
-        let states: Vec<&ProviderState> =
-            remaining.iter().map(|&i| candidates[i].provider).collect();
-        let Some(selected) = strategy.select(&states).await else {
+        let entries: Vec<(&ProviderState, &str)> = remaining
+            .iter()
+            .map(|&i| (candidates[i].provider, candidates[i].model.as_str()))
+            .collect();
+        let Some((picked, selected)) = strategy.select_entry(&entries).await else {
             break;
         };
         attempts += 1;
-        let Some(entry) = remaining
-            .iter()
-            .copied()
-            .find(|&i| candidates[i].provider.name == selected.name)
-        else {
-            warn!(
-                request_id = %request_id,
-                "Provider {} not among remaining candidates",
-                selected.name
-            );
-            break;
-        };
+        let entry = remaining[picked];
         tried[entry] = true;
         let target_model = candidates[entry].model.clone();
+        let held = (selected.is_probe, selected.model_probe);
 
         // 1. Rewrite model field in JSON body
         payload["model"] = Value::String(target_model.clone());
@@ -699,6 +691,7 @@ async fn proxy_request(
             Ok(url) => url,
             Err(e) => {
                 error!("Invalid base URL path join for {}: {}", selected.name, e);
+                strategy.release_probes(candidates[entry].provider, &target_model, held);
                 continue;
             },
         };
@@ -785,7 +778,9 @@ async fn proxy_request(
                     if let Some(state) =
                         app_state.providers.iter().find(|p| p.name == selected.name)
                     {
-                        strategy.feedback_timeout(state, selected.is_probe).await;
+                        strategy
+                            .feedback_entry(state, &target_model, held, Outcome::ModelTimeout, None)
+                            .await;
                         telemetry.emit(TelemetryEvent::UpdateStatus {
                             provider: selected.name.clone(),
                             status: circuit_status(state).await,
@@ -811,7 +806,7 @@ async fn proxy_request(
                         status_code,
                         app_state.clone(),
                         selected.name.clone(),
-                        selected.is_probe,
+                        (selected.is_probe, selected.model_probe),
                         spec.operation,
                         route_name.clone(),
                         target_model,
@@ -840,11 +835,11 @@ async fn proxy_request(
                             .find(|p| p.name == selected.name)
                             .unwrap();
                         strategy
-                            .feedback(
+                            .feedback_entry(
                                 target_provider_state,
-                                false,
-                                selected.is_probe,
-                                Some(status_code),
+                                &target_model,
+                                held,
+                                Outcome::ModelError,
                                 None,
                             )
                             .await;
@@ -870,11 +865,11 @@ async fn proxy_request(
                     .find(|p| p.name == selected.name)
                     .unwrap();
                 strategy
-                    .feedback(
+                    .feedback_entry(
                         target_provider_state,
-                        true,
-                        selected.is_probe,
-                        Some(status_code),
+                        &target_model,
+                        held,
+                        Outcome::Success,
                         None,
                     )
                     .await;
@@ -977,16 +972,9 @@ async fn proxy_request(
                 if spec.api == ApiFormat::Anthropic && is_passthrough_client_error(status_code) {
                     let upstream_headers = res.headers().clone();
                     let error_body = res.bytes().await.unwrap_or_default();
-                    if selected.is_probe {
-                        // Release the lock-free probe permit; the circuit
-                        // stays HalfOpen so the next request probes again.
-                        if let Some(p) =
-                            app_state.providers.iter().find(|p| p.name == selected.name)
-                        {
-                            p.probe_in_flight
-                                .store(false, std::sync::atomic::Ordering::SeqCst);
-                        }
-                    }
+                    // Release any lock-free probe permits; circuits stay as
+                    // they were so the next request probes again.
+                    strategy.release_probes(candidates[entry].provider, &target_model, held);
                     app_state.request_log.record(RequestRecord {
                         ts_ms: unix_millis(),
                         endpoint: spec.operation.to_string(),
@@ -1041,12 +1029,17 @@ async fn proxy_request(
                     .iter()
                     .find(|p| p.name == selected.name)
                     .unwrap();
+                let outcome = if status_code == 429 {
+                    Outcome::RateLimited
+                } else {
+                    Outcome::ModelError
+                };
                 strategy
-                    .feedback(
+                    .feedback_entry(
                         target_provider_state,
-                        false,
-                        selected.is_probe,
-                        Some(status_code),
+                        &target_model,
+                        held,
+                        outcome,
                         retry_after,
                     )
                     .await;
@@ -1071,15 +1064,14 @@ async fn proxy_request(
                     .iter()
                     .find(|p| p.name == selected.name)
                     .unwrap();
-                if e.is_timeout() {
-                    strategy
-                        .feedback_timeout(target_provider_state, selected.is_probe)
-                        .await;
+                let outcome = if e.is_timeout() {
+                    Outcome::ModelTimeout
                 } else {
-                    strategy
-                        .feedback(target_provider_state, false, selected.is_probe, None, None)
-                        .await;
-                }
+                    Outcome::Unreachable
+                };
+                strategy
+                    .feedback_entry(target_provider_state, &target_model, held, outcome, None)
+                    .await;
                 telemetry.emit(TelemetryEvent::UpdateStatus {
                     provider: selected.name.clone(),
                     status: circuit_status(target_provider_state).await,
@@ -1302,7 +1294,7 @@ fn stream_upstream_body(
     status_code: u16,
     app_state: Arc<AppState>,
     provider_name: String,
-    is_probe: bool,
+    held: (bool, bool),
     operation: &'static str,
     route_name: String,
     model_name: String,
@@ -1352,11 +1344,15 @@ fn stream_upstream_body(
                 circuit: app_state.circuit,
             };
             strategy
-                .feedback(
+                .feedback_entry(
                     provider_state,
-                    stream_success,
-                    is_probe,
-                    Some(status_code),
+                    &model_name,
+                    held,
+                    if stream_success {
+                        Outcome::Success
+                    } else {
+                        Outcome::ModelError
+                    },
                     None,
                 )
                 .await;

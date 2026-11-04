@@ -166,6 +166,177 @@ impl ReloadHealth {
     }
 }
 
+/// Health of one (provider, upstream model) pair. A provider's own circuit
+/// tracks reachability (connect failures); everything a response can say
+/// about a model (timeouts, 5xx, 429, a broken stream) is held here, so one
+/// hanging model on a shared gateway cannot take its healthy siblings out.
+#[derive(Debug)]
+pub struct ModelHealth {
+    pub circuit: RwLock<CircuitState>,
+    pub consecutive_failures: RwLock<u32>,
+    pub rate_limited_until: RwLock<Option<Instant>>,
+    pub last_attempt_time: RwLock<Option<Instant>>,
+    /// Lock-free thundering-herd permit for the HalfOpen probe.
+    pub probe_in_flight: AtomicBool,
+}
+
+impl Default for ModelHealth {
+    fn default() -> Self {
+        Self {
+            circuit: RwLock::new(CircuitState::Closed),
+            consecutive_failures: RwLock::new(0),
+            rate_limited_until: RwLock::new(None),
+            last_attempt_time: RwLock::new(None),
+            probe_in_flight: AtomicBool::new(false),
+        }
+    }
+}
+
+/// Lazily created `ModelHealth` per upstream model name of one provider.
+/// Shared (`Arc`) so health survives a config reload for unchanged providers.
+#[derive(Debug, Default)]
+pub struct ModelHealthMap {
+    inner: std::sync::RwLock<HashMap<String, Arc<ModelHealth>>>,
+}
+
+impl ModelHealthMap {
+    pub fn get(&self, model: &str) -> Arc<ModelHealth> {
+        if let Some(existing) = self
+            .inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(model)
+            .cloned()
+        {
+            return existing;
+        }
+        let mut map = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        map.entry(model.to_string()).or_default().clone()
+    }
+
+    /// Existing health for a model, without creating it.
+    pub fn peek(&self, model: &str) -> Option<Arc<ModelHealth>> {
+        self.inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(model)
+            .cloned()
+    }
+}
+
+/// Effective availability of one pool entry, combining its provider's
+/// reachability with the model's own health.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryAvailability {
+    Healthy,
+    /// Circuit half-open: one probe request is allowed through.
+    Probing,
+    /// Rate-limited until the given number of seconds from now.
+    RateLimited {
+        secs: u64,
+    },
+    /// Circuit open for the given number of seconds from now.
+    Open {
+        secs: u64,
+    },
+    /// Taken offline by an admin.
+    Offline,
+}
+
+impl EntryAvailability {
+    /// Machine-readable name used in `/status`.
+    pub fn name(&self) -> &'static str {
+        match self {
+            EntryAvailability::Healthy => "healthy",
+            EntryAvailability::Probing => "probing",
+            EntryAvailability::RateLimited { .. } => "rate_limited",
+            EntryAvailability::Open { .. } => "open",
+            EntryAvailability::Offline => "offline",
+        }
+    }
+
+    pub fn is_available(&self) -> bool {
+        matches!(
+            self,
+            EntryAvailability::Healthy | EntryAvailability::Probing
+        )
+    }
+
+    /// Seconds until the entry is expected to be tried again, if known.
+    pub fn retry_in_secs(&self) -> Option<u64> {
+        match self {
+            EntryAvailability::RateLimited { secs } | EntryAvailability::Open { secs } => {
+                Some(*secs)
+            },
+            _ => None,
+        }
+    }
+}
+
+impl ProviderState {
+    /// Availability of the (this provider, `model`) pair right now: admin
+    /// override first, then the worse of the provider's own circuit and the
+    /// model's circuit / rate-limit window.
+    pub async fn entry_availability(&self, model: &str) -> EntryAvailability {
+        if self
+            .manual_disabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return EntryAvailability::Offline;
+        }
+        let now = Instant::now();
+        let secs_left = |until: Instant| until.saturating_duration_since(now).as_secs().max(1);
+
+        let mut worst = EntryAvailability::Healthy;
+        let mut consider = |candidate: EntryAvailability| {
+            let rank = |a: &EntryAvailability| match a {
+                EntryAvailability::Healthy => 0,
+                EntryAvailability::Probing => 1,
+                EntryAvailability::RateLimited { .. } => 2,
+                EntryAvailability::Open { .. } => 3,
+                EntryAvailability::Offline => 4,
+            };
+            if rank(&candidate) > rank(&worst) {
+                worst = candidate;
+            }
+        };
+
+        match *self.circuit.read().await {
+            CircuitState::Closed => {},
+            CircuitState::HalfOpen => consider(EntryAvailability::Probing),
+            CircuitState::Open { until } if now < until => consider(EntryAvailability::Open {
+                secs: secs_left(until),
+            }),
+            CircuitState::Open { .. } => consider(EntryAvailability::Probing),
+        }
+        if let Some(until) = *self.rate_limited_until.read().await {
+            if now < until {
+                consider(EntryAvailability::RateLimited {
+                    secs: secs_left(until),
+                });
+            }
+        }
+        if let Some(health) = self.model_health.peek(model) {
+            match *health.circuit.read().await {
+                CircuitState::Closed => {},
+                CircuitState::HalfOpen => consider(EntryAvailability::Probing),
+                CircuitState::Open { until } if now < until => consider(EntryAvailability::Open {
+                    secs: secs_left(until),
+                }),
+                CircuitState::Open { .. } => consider(EntryAvailability::Probing),
+            }
+            if let Some(until) = *health.rate_limited_until.read().await {
+                if now < until {
+                    consider(EntryAvailability::RateLimited {
+                        secs: secs_left(until),
+                    });
+                }
+            }
+        }
+        worst
+    }
+}
+
 /// Per-provider overrides of the server-wide circuit and timeout settings.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ProviderTuning {
@@ -212,6 +383,9 @@ pub struct ProviderState {
     // Keyed by "provider\u{0}model" to avoid ambiguity when either side can
     // contain the separator character.
     pub model_stats: Arc<ModelStats>,
+
+    // Per-(provider, upstream-model) circuit state; see `ModelHealth`.
+    pub model_health: Arc<ModelHealthMap>,
 }
 
 /// Bounded LRU of session-key -> provider pins, with TTL.
@@ -541,7 +715,10 @@ pub struct SelectedProvider {
     pub name: String,
     pub base_url: Url,
     pub api_key: String,
+    /// This selection holds the provider's HalfOpen probe permit.
     pub is_probe: bool,
+    /// This selection holds the model's HalfOpen probe permit.
+    pub model_probe: bool,
     pub upstream_timeout_secs: Option<u64>,
 }
 
@@ -806,6 +983,7 @@ mod affinity_tests {
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
             model_stats: Arc::new(ModelStats::default()),
+            model_health: Default::default(),
         }
     }
 

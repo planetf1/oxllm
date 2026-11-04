@@ -1,6 +1,7 @@
-use crate::state::{CircuitConfig, CircuitState, ProviderState, SelectedProvider};
-use std::sync::atomic::Ordering;
+use crate::state::{CircuitConfig, CircuitState, ModelHealth, ProviderState, SelectedProvider};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
 use tracing::info;
 
 /// Modular strategy trait for selecting providers and updating their health state.
@@ -29,19 +30,80 @@ pub struct AdaptivePriorityStrategy {
     pub circuit: CircuitConfig,
 }
 
-impl AdaptivePriorityStrategy {
-    /// Exponential circuit cooldown: base cooldown doubling for each
-    /// failure beyond the threshold.
-    fn open_cooldown(&self, provider: &ProviderState, failures: u32) -> Duration {
-        let exponent = failures.saturating_sub(self.threshold(provider));
-        let multiplier = 2u64.pow(exponent);
-        let base = provider
-            .tuning
-            .circuit_base_cooldown_secs
-            .unwrap_or(self.circuit.base_cooldown_secs);
-        Duration::from_secs(base * multiplier)
+/// Borrowed view over the circuit-breaker fields that a provider and a
+/// (provider, model) pair both carry, so one implementation of the breaker
+/// serves both scopes.
+pub struct CircuitView<'a> {
+    pub name: &'a str,
+    pub circuit: &'a RwLock<CircuitState>,
+    pub failures: &'a RwLock<u32>,
+    pub rate_limited_until: &'a RwLock<Option<Instant>>,
+    pub last_attempt: &'a RwLock<Option<Instant>>,
+    pub probe: &'a AtomicBool,
+}
+
+impl<'a> CircuitView<'a> {
+    fn of_provider(p: &'a ProviderState) -> Self {
+        Self {
+            name: &p.name,
+            circuit: &p.circuit,
+            failures: &p.consecutive_failures,
+            rate_limited_until: &p.rate_limited_until,
+            last_attempt: &p.last_attempt_time,
+            probe: &p.probe_in_flight,
+        }
     }
 
+    fn of_model(name: &'a str, h: &'a ModelHealth) -> Self {
+        Self {
+            name,
+            circuit: &h.circuit,
+            failures: &h.consecutive_failures,
+            rate_limited_until: &h.rate_limited_until,
+            last_attempt: &h.last_attempt_time,
+            probe: &h.probe_in_flight,
+        }
+    }
+}
+
+/// Breaker limits for one provider: failures that open a circuit, and the
+/// first cooldown (which doubles per failure beyond the threshold).
+#[derive(Clone, Copy)]
+struct Limits {
+    threshold: u32,
+    base_cooldown_secs: u64,
+}
+
+/// Result of checking one breaker scope for a request.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Admit {
+    Skip,
+    Go,
+    /// Admitted as the single HalfOpen probe; the caller holds the permit.
+    Probe,
+}
+
+/// What happened to an attempt against one pool entry, as far as health
+/// accounting is concerned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// The upstream answered successfully.
+    Success,
+    /// The host could not be reached (refused, DNS, TLS, reset): counted
+    /// against the provider, since every model on it is equally affected.
+    Unreachable,
+    /// The upstream answered 429: a rate-limit window for the provider
+    /// (limits normally apply to the key), honouring `retry_after`.
+    RateLimited,
+    /// The upstream answered with a server error, or a body or stream broke:
+    /// counted against this model only.
+    ModelError,
+    /// The upstream did not answer in time: opens this model's circuit at
+    /// once, since a hang costs every caller a full timeout.
+    ModelTimeout,
+}
+
+impl AdaptivePriorityStrategy {
     /// Consecutive failures that open this provider's circuit: its own
     /// override, else the server-wide value.
     fn threshold(&self, provider: &ProviderState) -> u32 {
@@ -50,13 +112,12 @@ impl AdaptivePriorityStrategy {
             .circuit_failure_threshold
             .unwrap_or(self.circuit.failure_threshold)
     }
-}
 
-impl AdaptivePriorityStrategy {
     /// Feedback for an upstream that did not answer within its timeout. A
     /// hung endpoint costs every caller a full timeout, so unlike an
     /// ordinary failure it opens the circuit immediately instead of waiting
-    /// for `failure_threshold` victims.
+    /// for `failure_threshold` victims. Provider-scoped; the request path
+    /// uses [`Self::feedback_entry`], which scopes a timeout to the model.
     pub async fn feedback_timeout(&self, provider: &ProviderState, is_probe: bool) {
         {
             let mut failures = provider.consecutive_failures.write().await;
@@ -64,116 +125,300 @@ impl AdaptivePriorityStrategy {
         }
         self.feedback(provider, false, is_probe, None, None).await;
     }
-}
 
-impl RoutingStrategy for AdaptivePriorityStrategy {
-    async fn select(&self, candidates: &[&ProviderState]) -> Option<SelectedProvider> {
+    /// Decides whether a breaker scope may take a request now: ages old
+    /// failures, expires rate-limit windows, and hands out the single
+    /// HalfOpen probe permit lock-free.
+    async fn admit(&self, v: &CircuitView<'_>, threshold: u32) -> Admit {
         let now = Instant::now();
 
-        for provider in candidates {
-            // Check for manual admin override
-            if provider.manual_disabled.load(Ordering::Acquire) {
-                continue;
-            }
+        // 1. Dynamic Idle Penalty Decay (Aging)
+        {
+            let mut failures = v.failures.write().await;
+            let mut last_attempt = v.last_attempt.write().await;
+            if *failures > 0 {
+                if let Some(last_time) = *last_attempt {
+                    let elapsed = now.saturating_duration_since(last_time);
+                    let decay_steps = elapsed.as_secs() / 300; // 5 minutes = 300 seconds
+                    if decay_steps > 0 {
+                        *failures = failures.saturating_sub(decay_steps as u32);
+                        *last_attempt = Some(last_time + Duration::from_secs(decay_steps * 300));
 
-            // 1. Dynamic Idle Penalty Decay (Aging)
-            {
-                let mut failures = provider.consecutive_failures.write().await;
-                let mut last_attempt = provider.last_attempt_time.write().await;
-                if *failures > 0 {
-                    if let Some(last_time) = *last_attempt {
-                        let elapsed = now.saturating_duration_since(last_time);
-                        let decay_steps = elapsed.as_secs() / 300; // 5 minutes = 300 seconds
-                        if decay_steps > 0 {
-                            *failures = failures.saturating_sub(decay_steps as u32);
-                            *last_attempt =
-                                Some(last_time + Duration::from_secs(decay_steps * 300));
-
-                            // If failures age below the threshold, rehabilitate open circuits
-                            if *failures < self.threshold(provider) {
-                                let mut circ = provider.circuit.write().await;
-                                if let CircuitState::Open { .. } = *circ {
-                                    *circ = CircuitState::Closed;
-                                }
+                        // If failures age below the threshold, rehabilitate open circuits
+                        if *failures < threshold {
+                            let mut circ = v.circuit.write().await;
+                            if let CircuitState::Open { .. } = *circ {
+                                *circ = CircuitState::Closed;
                             }
                         }
                     }
                 }
             }
+        }
 
-            // 2. Rate Limit Window Check
-            {
-                let mut rl = provider.rate_limited_until.write().await;
-                if let Some(until) = *rl {
-                    if now >= until {
-                        *rl = None;
-                    } else {
-                        continue; // Still rate-limited, skip candidate
-                    }
+        // 2. Rate Limit Window Check
+        {
+            let mut rl = v.rate_limited_until.write().await;
+            if let Some(until) = *rl {
+                if now >= until {
+                    *rl = None;
+                } else {
+                    return Admit::Skip;
                 }
-            }
-
-            // 3. Circuit Breaker Checks
-            let current_state = *provider.circuit.read().await;
-            match current_state {
-                CircuitState::Closed => {
-                    // Fully healthy: Route immediately
-                    return Some(SelectedProvider {
-                        name: provider.name.clone(),
-                        base_url: provider.base_url.clone(),
-                        api_key: provider.api_key.clone(),
-                        is_probe: false,
-                        upstream_timeout_secs: provider.upstream_timeout_secs,
-                    });
-                },
-                CircuitState::Open { until } => {
-                    if now >= until {
-                        // Cooldown expired: transition circuit state to HalfOpen
-                        {
-                            let mut state_guard = provider.circuit.write().await;
-                            *state_guard = CircuitState::HalfOpen;
-                        }
-
-                        // Attempt to acquire the single flight probe slot lock-free
-                        if provider
-                            .probe_in_flight
-                            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                            .is_ok()
-                        {
-                            return Some(SelectedProvider {
-                                name: provider.name.clone(),
-                                base_url: provider.base_url.clone(),
-                                api_key: provider.api_key.clone(),
-                                is_probe: true,
-                                upstream_timeout_secs: provider.upstream_timeout_secs,
-                            });
-                        }
-                    }
-                    // Still cooling down or another thread stole the HalfOpen probe permit
-                    continue;
-                },
-                CircuitState::HalfOpen => {
-                    // Lock-free check: If false, we flip it to true and claim the probe slot.
-                    // If true, another concurrent thread is already probing this upstream.
-                    // We instantly pass through to protect the upstream from a thundering herd!
-                    if provider
-                        .probe_in_flight
-                        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                        .is_ok()
-                    {
-                        return Some(SelectedProvider {
-                            name: provider.name.clone(),
-                            base_url: provider.base_url.clone(),
-                            api_key: provider.api_key.clone(),
-                            is_probe: true,
-                            upstream_timeout_secs: provider.upstream_timeout_secs,
-                        });
-                    }
-                    continue;
-                },
             }
         }
 
+        // 3. Circuit Breaker Checks
+        let current_state = *v.circuit.read().await;
+        let claim_probe = || {
+            // Lock-free: flip false -> true to claim the probe slot. If it
+            // is already true another request is probing this scope, and we
+            // pass through to protect it from a thundering herd.
+            v.probe
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        };
+        match current_state {
+            CircuitState::Closed => Admit::Go,
+            CircuitState::Open { until } => {
+                if now >= until {
+                    // Cooldown expired: transition circuit state to HalfOpen
+                    *v.circuit.write().await = CircuitState::HalfOpen;
+                    if claim_probe() {
+                        return Admit::Probe;
+                    }
+                }
+                Admit::Skip
+            },
+            CircuitState::HalfOpen => {
+                if claim_probe() {
+                    Admit::Probe
+                } else {
+                    Admit::Skip
+                }
+            },
+        }
+    }
+
+    async fn record_success(&self, v: &CircuitView<'_>, is_probe: bool) {
+        let now = Instant::now();
+        *v.failures.write().await = 0;
+        *v.circuit.write().await = CircuitState::Closed;
+        *v.last_attempt.write().await = Some(now);
+        *v.rate_limited_until.write().await = None;
+
+        if is_probe {
+            v.probe.store(false, Ordering::SeqCst);
+            info!(
+                target: "oxllm_core::router",
+                "HalfOpen probe succeeded for {} — circuit closed",
+                v.name
+            );
+        } else {
+            info!(
+                target: "oxllm_core::router",
+                "Circuit closed for {} after successful request",
+                v.name
+            );
+        }
+    }
+
+    async fn record_failure(
+        &self,
+        v: &CircuitView<'_>,
+        limits: Limits,
+        is_probe: bool,
+        status_code: Option<u16>,
+        retry_after: Option<Duration>,
+    ) {
+        let Limits {
+            threshold,
+            base_cooldown_secs,
+        } = limits;
+        let now = Instant::now();
+        let mut failures = v.failures.write().await;
+        *failures += 1;
+        *v.last_attempt.write().await = Some(now);
+
+        if status_code == Some(429) {
+            // Rate-limited: extract or apply default backoff
+            let cooldown = retry_after
+                .unwrap_or_else(|| Duration::from_secs(self.circuit.rate_limit_fallback_secs));
+            *v.rate_limited_until.write().await = Some(now + cooldown);
+            info!(
+                target: "oxllm_core::router",
+                "Rate-limited {} for {}s",
+                v.name, cooldown.as_secs()
+            );
+        } else if *failures >= threshold || is_probe {
+            // Tripped or failed probe: trigger exponential circuit cooldown
+            let exponent = failures.saturating_sub(threshold);
+            let cooldown = Duration::from_secs(base_cooldown_secs * 2u64.pow(exponent));
+            *v.circuit.write().await = CircuitState::Open {
+                until: now + cooldown,
+            };
+            info!(
+                target: "oxllm_core::router",
+                "Circuit opened for {} for {}s ({} consecutive failures)",
+                v.name, cooldown.as_secs(), *failures
+            );
+        }
+
+        if is_probe {
+            v.probe.store(false, Ordering::SeqCst);
+        }
+    }
+
+    fn limits(&self, provider: &ProviderState) -> Limits {
+        Limits {
+            threshold: self.threshold(provider),
+            base_cooldown_secs: provider
+                .tuning
+                .circuit_base_cooldown_secs
+                .unwrap_or(self.circuit.base_cooldown_secs),
+        }
+    }
+
+    /// Picks the first usable pool entry. An entry is usable when the
+    /// provider is reachable and admitted AND the (provider, model) pair is
+    /// admitted, so one misbehaving model does not hide its siblings.
+    /// Returns the index into `entries` with the selection.
+    pub async fn select_entry(
+        &self,
+        entries: &[(&ProviderState, &str)],
+    ) -> Option<(usize, SelectedProvider)> {
+        for (idx, (provider, model)) in entries.iter().enumerate() {
+            if provider.manual_disabled.load(Ordering::Acquire) {
+                continue;
+            }
+            let provider_admit = self
+                .admit(
+                    &CircuitView::of_provider(provider),
+                    self.threshold(provider),
+                )
+                .await;
+            if provider_admit == Admit::Skip {
+                continue;
+            }
+            let health = provider.model_health.get(model);
+            let model_view = CircuitView::of_model(model, &health);
+            let model_admit = self.admit(&model_view, self.threshold(provider)).await;
+            if model_admit == Admit::Skip {
+                // Do not strand a probe permit we took on the provider.
+                if provider_admit == Admit::Probe {
+                    provider.probe_in_flight.store(false, Ordering::SeqCst);
+                }
+                continue;
+            }
+            return Some((
+                idx,
+                SelectedProvider {
+                    name: provider.name.clone(),
+                    base_url: provider.base_url.clone(),
+                    api_key: provider.api_key.clone(),
+                    is_probe: provider_admit == Admit::Probe,
+                    model_probe: model_admit == Admit::Probe,
+                    upstream_timeout_secs: provider.upstream_timeout_secs,
+                },
+            ));
+        }
+        None
+    }
+
+    /// Records the outcome of an attempt against one pool entry, scoping the
+    /// failure to the provider or to the model as described on [`Outcome`].
+    /// Probe permits held by the selection are always resolved or released.
+    pub async fn feedback_entry(
+        &self,
+        provider: &ProviderState,
+        model: &str,
+        selected_probe: (bool, bool),
+        outcome: Outcome,
+        retry_after: Option<Duration>,
+    ) {
+        let (provider_probe, model_probe) = selected_probe;
+        let health = provider.model_health.get(model);
+        let pv = CircuitView::of_provider(provider);
+        let mv = CircuitView::of_model(model, &health);
+        let limits = self.limits(provider);
+        let threshold = limits.threshold;
+        let release = |view: &CircuitView<'_>, held: bool| {
+            if held {
+                view.probe.store(false, Ordering::SeqCst);
+            }
+        };
+
+        match outcome {
+            Outcome::Success => {
+                self.record_success(&pv, provider_probe).await;
+                self.record_success(&mv, model_probe).await;
+            },
+            Outcome::Unreachable => {
+                self.record_failure(&pv, limits, provider_probe, None, None)
+                    .await;
+                release(&mv, model_probe);
+            },
+            Outcome::RateLimited => {
+                self.record_failure(&pv, limits, provider_probe, Some(429), retry_after)
+                    .await;
+                release(&mv, model_probe);
+            },
+            Outcome::ModelError | Outcome::ModelTimeout => {
+                if outcome == Outcome::ModelTimeout {
+                    let mut failures = mv.failures.write().await;
+                    *failures = (*failures).max(threshold.saturating_sub(1));
+                }
+                self.record_failure(&mv, limits, model_probe, None, None)
+                    .await;
+                // The host answered, so the provider itself is reachable.
+                if provider_probe {
+                    self.record_success(&pv, true).await;
+                }
+            },
+        }
+    }
+
+    /// Releases the probe permits of a selection that never produced an
+    /// outcome (client error passed through, bad URL), leaving circuits as
+    /// they were so the next request probes again.
+    pub fn release_probes(&self, provider: &ProviderState, model: &str, held: (bool, bool)) {
+        if held.0 {
+            provider.probe_in_flight.store(false, Ordering::SeqCst);
+        }
+        if held.1 {
+            provider
+                .model_health
+                .get(model)
+                .probe_in_flight
+                .store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+impl RoutingStrategy for AdaptivePriorityStrategy {
+    async fn select(&self, candidates: &[&ProviderState]) -> Option<SelectedProvider> {
+        for provider in candidates {
+            // Check for manual admin override
+            if provider.manual_disabled.load(Ordering::Acquire) {
+                continue;
+            }
+            let admit = self
+                .admit(
+                    &CircuitView::of_provider(provider),
+                    self.threshold(provider),
+                )
+                .await;
+            if admit != Admit::Skip {
+                return Some(SelectedProvider {
+                    name: provider.name.clone(),
+                    base_url: provider.base_url.clone(),
+                    api_key: provider.api_key.clone(),
+                    is_probe: admit == Admit::Probe,
+                    model_probe: false,
+                    upstream_timeout_secs: provider.upstream_timeout_secs,
+                });
+            }
+        }
         None
     }
 
@@ -185,72 +430,18 @@ impl RoutingStrategy for AdaptivePriorityStrategy {
         status_code: Option<u16>,
         retry_after: Option<Duration>,
     ) {
-        let now = Instant::now();
-
+        let view = CircuitView::of_provider(provider);
         if success {
-            let mut failures = provider.consecutive_failures.write().await;
-            *failures = 0;
-
-            let mut state = provider.circuit.write().await;
-            *state = CircuitState::Closed;
-
-            let mut last_attempt = provider.last_attempt_time.write().await;
-            *last_attempt = Some(now);
-
-            let mut rl = provider.rate_limited_until.write().await;
-            *rl = None;
-
-            if is_probe {
-                provider.probe_in_flight.store(false, Ordering::SeqCst);
-                info!(
-                    target: "oxllm_core::router",
-                    "HalfOpen probe succeeded for {} — circuit closed",
-                    provider.name
-                );
-            } else {
-                info!(
-                    target: "oxllm_core::router",
-                    "Circuit closed for {} after successful request",
-                    provider.name
-                );
-            }
+            self.record_success(&view, is_probe).await;
         } else {
-            let mut failures = provider.consecutive_failures.write().await;
-            *failures += 1;
-
-            let mut last_attempt = provider.last_attempt_time.write().await;
-            *last_attempt = Some(now);
-
-            // Handle Failures
-            if status_code == Some(429) {
-                // Rate-limited: extract or apply default backoff
-                let cooldown = retry_after
-                    .unwrap_or_else(|| Duration::from_secs(self.circuit.rate_limit_fallback_secs));
-                let mut rl = provider.rate_limited_until.write().await;
-                *rl = Some(now + cooldown);
-                info!(
-                    target: "oxllm_core::router",
-                    "Rate-limited {} for {}s",
-                    provider.name, cooldown.as_secs()
-                );
-            } else if *failures >= self.threshold(provider) || is_probe {
-                // Tripped or failed probe: trigger exponential circuit cooldown
-                let cooldown = self.open_cooldown(provider, *failures);
-
-                let mut state = provider.circuit.write().await;
-                *state = CircuitState::Open {
-                    until: now + cooldown,
-                };
-                info!(
-                    target: "oxllm_core::router",
-                    "Circuit opened for {} for {}s ({} consecutive failures)",
-                    provider.name, cooldown.as_secs(), *failures
-                );
-            }
-
-            if is_probe {
-                provider.probe_in_flight.store(false, Ordering::SeqCst);
-            }
+            self.record_failure(
+                &view,
+                self.limits(provider),
+                is_probe,
+                status_code,
+                retry_after,
+            )
+            .await;
         }
     }
 }
@@ -420,6 +611,7 @@ mod tests {
             tokens_input: AtomicU64::new(0),
             tokens_output: AtomicU64::new(0),
             model_stats: Arc::new(crate::state::ModelStats::default()),
+            model_health: Default::default(),
         }
     }
 
