@@ -119,9 +119,10 @@ Behaviour specific to this route:
 * **Inbound auth**: with `server.api_keys` set, `/v1/messages*` accepts the key
   as `x-api-key` or `Authorization: Bearer` (constant-time compare). The OpenAI
   routes still take Bearer only.
-* **Failover**: 429 and 529 (`overloaded_error`) put the provider on cooldown
-  (honouring `retry-after`); 5xx and connection errors count towards the circuit
-  threshold; all fail over to the next candidate. Other 4xx (auth,
+* **Failover**: 429 puts the provider on cooldown (honouring `retry-after`) and
+  fails over at once. 5xx (including 529 `overloaded_error`) and connection
+  errors are retried against the same provider until the circuit threshold, so a
+  one-off blip is absorbed; a persistent failure opens the circuit and fails over. Other 4xx (auth,
   `invalid_request_error`) are returned to the caller untouched, with no failover
   and no health penalty.
 * **Errors oxllm generates** (unknown model, no `anthropic` candidate, all

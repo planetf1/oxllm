@@ -14,8 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (default `"openai"`, so existing configs are unchanged). Upstream auth uses
   `x-api-key` with `anthropic-version` (default `2023-06-01`) and
   `anthropic-beta` forwarded. Requests only reach providers of the matching
-  wire format, so one virtual model can mix both. 429 and 529 trigger a
-  rate-limit cooldown honouring `retry-after`; 5xx fail over; other 4xx return
+  wire format, so one virtual model can mix both. 429 triggers a
+  rate-limit cooldown honouring `retry-after`; 5xx and 529 are retried until
+  the circuit threshold, then fail over; other 4xx return
   to the caller untouched. Errors oxllm generates use the Anthropic error
   shape. Inbound `server.api_keys` are accepted via `x-api-key` on these
   routes, and `metadata.user_id` is a session-affinity fallback. Usage stats

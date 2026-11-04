@@ -6436,7 +6436,7 @@ vm = [
             .await
             .unwrap();
         assert_eq!(res.status(), 200);
-        // 429/529 cool the provider down at once; a plain 5xx is retried on
+        // 429 cools the provider down at once; 5xx and 529 are retried on
         // the same provider until the breaker threshold, as on OpenAI routes.
         assert!(!r1.lock().await.is_empty());
         assert_eq!(r2.lock().await.len(), 1);

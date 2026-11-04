@@ -195,7 +195,7 @@ impl RoutingStrategy for AdaptivePriorityStrategy {
             *last_attempt = Some(now);
 
             // Handle Failures
-            if matches!(status_code, Some(429) | Some(529)) {
+            if status_code == Some(429) {
                 // Rate-limited: extract or apply default backoff
                 let cooldown = retry_after
                     .unwrap_or_else(|| Duration::from_secs(self.circuit.rate_limit_fallback_secs));
