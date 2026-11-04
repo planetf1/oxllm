@@ -6213,6 +6213,14 @@ vm = [
                 weight: None,
             })
             .collect();
+        spawn_proxy_with_targets(providers, targets, api_keys).await
+    }
+
+    async fn spawn_proxy_with_targets(
+        providers: Vec<ProviderState>,
+        targets: Vec<VirtualModelTarget>,
+        api_keys: Vec<String>,
+    ) -> (SocketAddr, Arc<AppState>) {
         let mut virtual_models = std::collections::HashMap::new();
         virtual_models.insert("vm".to_string(), targets);
         let app_state = Arc::new(AppState {
@@ -6811,6 +6819,123 @@ vm = [
         assert_eq!(
             body["last_id"],
             body["data"].as_array().unwrap().last().unwrap()["id"]
+        );
+    }
+
+    fn target(provider: &str, model: &str) -> VirtualModelTarget {
+        VirtualModelTarget {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            priority: None,
+            weight: None,
+        }
+    }
+
+    /// A provider listed twice in one virtual model: when its first entry
+    /// fails, the second entry (a different model) is tried next on the same
+    /// provider, rather than the first being retried.
+    #[tokio::test]
+    async fn test_same_provider_second_entry_is_a_real_fallback() {
+        let rec = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let openai_ok = r#"{"choices":[{"message":{"role":"assistant","content":"x"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
+        let addr = spawn_raw_recording_upstream(
+            vec![
+                http_json("500 Internal Server Error", "{}"),
+                http_json("200 OK", openai_ok),
+            ],
+            rec.clone(),
+        )
+        .await;
+        let (proxy, _s) = spawn_proxy_with_targets(
+            vec![test_provider("p", addr, ApiFormat::Openai)],
+            vec![target("p", "model-a"), target("p", "model-b")],
+            vec![],
+        )
+        .await;
+        let res = reqwest::Client::new()
+            .post(format!("http://{}/v1/chat/completions", proxy))
+            .json(&serde_json::json!({"model":"vm","messages":[{"role":"user","content":"x"}]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let seen = rec.lock().await.clone();
+        assert_eq!(seen.len(), 2, "one attempt per entry: {seen:?}");
+        assert!(
+            seen[0].contains("\"model\":\"model-a\""),
+            "got: {}",
+            seen[0]
+        );
+        assert!(
+            seen[1].contains("\"model\":\"model-b\""),
+            "got: {}",
+            seen[1]
+        );
+    }
+
+    /// An upstream that accepts the connection and never answers.
+    async fn spawn_hanging_upstream() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        addr
+    }
+
+    /// A hung upstream costs one timeout, then its circuit opens at once and
+    /// the next request skips it without waiting.
+    #[tokio::test]
+    async fn test_hung_upstream_opens_circuit_after_one_timeout() {
+        let hang = spawn_hanging_upstream().await;
+        let ok_addr =
+            spawn_raw_recording_upstream(vec![http_json("200 OK", MSG_OK)], Default::default())
+                .await;
+        let mut slow = test_provider("slow", hang, ApiFormat::Anthropic);
+        slow.upstream_timeout_secs = Some(1);
+        let (proxy, state) = spawn_messages_proxy(
+            vec![slow, test_provider("ok", ok_addr, ApiFormat::Anthropic)],
+            vec![],
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let url = format!("http://{}/v1/messages", proxy);
+
+        let t = Instant::now();
+        let res = client
+            .post(&url)
+            .json(&messages_body())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let first = t.elapsed();
+        // One timeout, not `circuit_failure_threshold` (3) of them.
+        assert!(first >= Duration::from_secs(1), "first: {:?}", first);
+        assert!(first < Duration::from_millis(2500), "first: {:?}", first);
+        assert!(
+            matches!(
+                *state.providers[0].circuit.read().await,
+                CircuitState::Open { .. }
+            ),
+            "one timeout must open the circuit"
+        );
+
+        let t = Instant::now();
+        let res = client
+            .post(&url)
+            .json(&messages_body())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        assert!(
+            t.elapsed() < Duration::from_millis(800),
+            "second request must skip the hung provider, took {:?}",
+            t.elapsed()
         );
     }
 }

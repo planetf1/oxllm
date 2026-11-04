@@ -39,6 +39,20 @@ impl AdaptivePriorityStrategy {
     }
 }
 
+impl AdaptivePriorityStrategy {
+    /// Feedback for an upstream that did not answer within its timeout. A
+    /// hung endpoint costs every caller a full timeout, so unlike an
+    /// ordinary failure it opens the circuit immediately instead of waiting
+    /// for `failure_threshold` victims.
+    pub async fn feedback_timeout(&self, provider: &ProviderState, is_probe: bool) {
+        {
+            let mut failures = provider.consecutive_failures.write().await;
+            *failures = (*failures).max(self.circuit.failure_threshold.saturating_sub(1));
+        }
+        self.feedback(provider, false, is_probe, None, None).await;
+    }
+}
+
 impl RoutingStrategy for AdaptivePriorityStrategy {
     async fn select(&self, candidates: &[&ProviderState]) -> Option<SelectedProvider> {
         let now = Instant::now();

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **A provider listed twice in one virtual model never reached its second
+  entry.** The routing loop picked the upstream model by provider name and
+  selected by provider, so after a failure it retried the first entry until
+  the circuit opened. Each (provider, model) entry is now tried at most once
+  per request, in order.
+- **A hung upstream cost every caller `circuit_failure_threshold` full
+  timeouts** (3 x `upstream_timeout_secs`) before its circuit opened. A
+  timeout now opens the circuit at once, so one request pays one timeout and
+  later requests skip the provider until its cooldown ends and a probe
+  succeeds.
+
 ### Added
 - **Anthropic Messages API**: `POST /v1/messages` (SSE streaming) and
   `POST /v1/messages/count_tokens`, forwarded verbatim (apart from the `model`

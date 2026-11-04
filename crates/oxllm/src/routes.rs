@@ -655,7 +655,6 @@ async fn proxy_request(
         session_key(&app_state, &headers, &payload).as_deref(),
         &candidates,
     );
-    let candidate_states: Vec<&ProviderState> = candidates.iter().map(|c| c.provider).collect();
 
     // Route-level counters: one row per virtual model, one request each,
     // regardless of how many provider attempts it takes.
@@ -664,23 +663,32 @@ async fn proxy_request(
         .requests
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    while let Some(selected) = strategy.select(&candidate_states).await {
-        attempts += 1;
-        let target_model = match candidates
-            .iter()
-            .find(|c| c.provider.name == selected.name)
-            .map(|c| c.model.clone())
-        {
-            Some(m) => m,
-            None => {
-                warn!(
-                    request_id = %request_id,
-                    "Provider {} removed from candidates during routing",
-                    selected.name
-                );
-                continue;
-            },
+    // Each pool entry (provider + model) is tried at most once per request,
+    // so a provider listed twice with different models gets its second entry
+    // as a genuine fallback instead of re-hitting the first.
+    let mut tried = vec![false; candidates.len()];
+    loop {
+        let remaining: Vec<usize> = (0..candidates.len()).filter(|i| !tried[*i]).collect();
+        let states: Vec<&ProviderState> =
+            remaining.iter().map(|&i| candidates[i].provider).collect();
+        let Some(selected) = strategy.select(&states).await else {
+            break;
         };
+        attempts += 1;
+        let Some(entry) = remaining
+            .iter()
+            .copied()
+            .find(|&i| candidates[i].provider.name == selected.name)
+        else {
+            warn!(
+                request_id = %request_id,
+                "Provider {} not among remaining candidates",
+                selected.name
+            );
+            break;
+        };
+        tried[entry] = true;
+        let target_model = candidates[entry].model.clone();
 
         // 1. Rewrite model field in JSON body
         payload["model"] = Value::String(target_model.clone());
@@ -1023,9 +1031,15 @@ async fn proxy_request(
                     .iter()
                     .find(|p| p.name == selected.name)
                     .unwrap();
-                strategy
-                    .feedback(target_provider_state, false, selected.is_probe, None, None)
-                    .await;
+                if e.is_timeout() {
+                    strategy
+                        .feedback_timeout(target_provider_state, selected.is_probe)
+                        .await;
+                } else {
+                    strategy
+                        .feedback(target_provider_state, false, selected.is_probe, None, None)
+                        .await;
+                }
                 telemetry.emit(TelemetryEvent::UpdateStatus {
                     provider: selected.name.clone(),
                     status: circuit_status(target_provider_state).await,
