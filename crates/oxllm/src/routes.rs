@@ -755,7 +755,47 @@ async fn proxy_request(
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
-        let res = req.send().await;
+        // Streaming requests may also carry a first-byte deadline, so a
+        // hung endpoint is abandoned long before the total timeout.
+        let first_byte = app_state
+            .providers
+            .iter()
+            .find(|p| p.name == selected.name)
+            .and_then(|p| p.tuning.first_byte_timeout_secs)
+            .filter(|_| is_streaming && spec.streaming)
+            .map(Duration::from_secs);
+        let res = match first_byte {
+            Some(limit) => match tokio::time::timeout(limit, req.send()).await {
+                Ok(r) => r,
+                Err(_) => {
+                    warn!(
+                        request_id = %request_id,
+                        "{} request upstream {} sent no response headers within {}s",
+                        spec.operation,
+                        selected.name,
+                        limit.as_secs()
+                    );
+                    last_upstream_error = format!(
+                        "no response headers within first_byte_timeout_secs ({}s)",
+                        limit.as_secs()
+                    );
+                    last_failed_provider = selected.name.clone();
+                    last_failed_model = target_model.clone();
+                    last_failed_status = 0;
+                    if let Some(state) =
+                        app_state.providers.iter().find(|p| p.name == selected.name)
+                    {
+                        strategy.feedback_timeout(state, selected.is_probe).await;
+                        telemetry.emit(TelemetryEvent::UpdateStatus {
+                            provider: selected.name.clone(),
+                            status: circuit_status(state).await,
+                        });
+                    }
+                    continue;
+                },
+            },
+            None => req.send().await,
+        };
 
         match res {
             Ok(res) if res.status().is_success() => {

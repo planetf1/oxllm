@@ -269,6 +269,11 @@ fn build_app_state(config: Config, previous: Option<&AppState>) -> Result<AppSta
             upstream_timeout_secs: p.upstream_timeout_secs,
             cost_per_mtok: p.cost_per_mtok,
             api: p.api,
+            tuning: oxllm_core::state::ProviderTuning {
+                circuit_failure_threshold: p.circuit_failure_threshold,
+                circuit_base_cooldown_secs: p.circuit_base_cooldown_secs,
+                first_byte_timeout_secs: p.first_byte_timeout_secs,
+            },
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -2447,6 +2452,7 @@ mod integration_tests {
             upstream_timeout_secs: None,
             cost_per_mtok: None,
             api: Default::default(),
+            tuning: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -2468,6 +2474,7 @@ mod integration_tests {
             upstream_timeout_secs: None,
             cost_per_mtok: None,
             api: Default::default(),
+            tuning: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -2591,6 +2598,7 @@ mod integration_tests {
             upstream_timeout_secs: None,
             cost_per_mtok: None,
             api: Default::default(),
+            tuning: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -2769,6 +2777,7 @@ mod integration_tests {
             upstream_timeout_secs: None,
             cost_per_mtok: None,
             api: Default::default(),
+            tuning: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -2979,6 +2988,7 @@ mod integration_tests {
             upstream_timeout_secs: None,
             cost_per_mtok: None,
             api: Default::default(),
+            tuning: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -3138,6 +3148,7 @@ mod integration_tests {
             upstream_timeout_secs: Some(2),
             cost_per_mtok: None,
             api: Default::default(),
+            tuning: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -3271,6 +3282,7 @@ mod integration_tests {
             upstream_timeout_secs: None,
             cost_per_mtok: None,
             api: Default::default(),
+            tuning: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -3406,6 +3418,7 @@ mod integration_tests {
             upstream_timeout_secs: None,
             cost_per_mtok: None,
             api: Default::default(),
+            tuning: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -3427,6 +3440,7 @@ mod integration_tests {
             upstream_timeout_secs: None,
             cost_per_mtok: None,
             api: Default::default(),
+            tuning: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -3485,6 +3499,7 @@ mod integration_tests {
             upstream_timeout_secs: None,
             cost_per_mtok: None,
             api: Default::default(),
+            tuning: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -3622,6 +3637,7 @@ mod integration_tests {
             upstream_timeout_secs: None,
             cost_per_mtok: None,
             api: Default::default(),
+            tuning: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -3643,6 +3659,7 @@ mod integration_tests {
             upstream_timeout_secs: None,
             cost_per_mtok: None,
             api: Default::default(),
+            tuning: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -3767,6 +3784,7 @@ mod integration_tests {
             upstream_timeout_secs: None,
             cost_per_mtok: None,
             api: Default::default(),
+            tuning: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -3905,6 +3923,7 @@ mod integration_tests {
             upstream_timeout_secs: None,
             cost_per_mtok: None,
             api: Default::default(),
+            tuning: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -4017,6 +4036,7 @@ mod integration_tests {
             upstream_timeout_secs: None,
             cost_per_mtok: None,
             api: Default::default(),
+            tuning: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -4119,6 +4139,7 @@ mod integration_tests {
             upstream_timeout_secs: None,
             cost_per_mtok: None,
             api: Default::default(),
+            tuning: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -4234,6 +4255,7 @@ mod integration_tests {
             upstream_timeout_secs: None,
             cost_per_mtok: None,
             api: Default::default(),
+            tuning: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -4354,6 +4376,7 @@ mod integration_tests {
             upstream_timeout_secs: None,
             cost_per_mtok: None,
             api: Default::default(),
+            tuning: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -5406,6 +5429,7 @@ vm = [
             upstream_timeout_secs: None,
             cost_per_mtok: None,
             api: Default::default(),
+            tuning: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -5631,6 +5655,7 @@ vm = [
             upstream_timeout_secs: None,
             cost_per_mtok: None,
             api: Default::default(),
+            tuning: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -5753,6 +5778,7 @@ vm = [
                 upstream_timeout_secs: None,
                 cost_per_mtok: None,
                 api: Default::default(),
+                tuning: Default::default(),
                 circuit: Arc::new(RwLock::new(CircuitState::Closed)),
                 consecutive_failures: Arc::new(RwLock::new(0)),
                 rate_limited_until: Arc::new(RwLock::new(None)),
@@ -6183,6 +6209,7 @@ vm = [
             upstream_timeout_secs: Some(2),
             cost_per_mtok: None,
             api,
+            tuning: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -6937,5 +6964,82 @@ vm = [
             "second request must skip the hung provider, took {:?}",
             t.elapsed()
         );
+    }
+
+    /// Upstream that accepts the request, then sends nothing for `delay`
+    /// before answering with `response`.
+    async fn spawn_delayed_upstream(delay: Duration, response: String) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let response = response.clone();
+                tokio::spawn(async move {
+                    let mut tmp = [0u8; 4096];
+                    let _ = stream.read(&mut tmp).await;
+                    tokio::time::sleep(delay).await;
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// A streaming request abandons a provider that sends no headers within
+    /// first_byte_timeout_secs and fails over; non-streaming requests are
+    /// unaffected (their headers legitimately arrive after the generation).
+    #[tokio::test]
+    async fn test_first_byte_timeout_fails_over_streaming_only() {
+        let sse = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string();
+        let slow =
+            spawn_delayed_upstream(Duration::from_secs(3), http_json("200 OK", MSG_OK)).await;
+        let fast = spawn_raw_recording_upstream(vec![sse], Default::default()).await;
+        let mut slow_p = test_provider("slow", slow, ApiFormat::Anthropic);
+        slow_p.tuning.first_byte_timeout_secs = Some(1);
+        slow_p.upstream_timeout_secs = Some(10);
+        let (proxy, state) = spawn_messages_proxy(
+            vec![slow_p, test_provider("fast", fast, ApiFormat::Anthropic)],
+            vec![],
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let url = format!("http://{}/v1/messages", proxy);
+
+        // Streaming: gives up on `slow` after ~1 s, served by `fast`.
+        let mut body = messages_body();
+        body["stream"] = Value::Bool(true);
+        let t = Instant::now();
+        let res = client.post(&url).json(&body).send().await.unwrap();
+        assert_eq!(res.status(), 200);
+        let took = t.elapsed();
+        assert!(
+            took >= Duration::from_secs(1) && took < Duration::from_millis(2500),
+            "took {:?}",
+            took
+        );
+        let last = state.request_log.recent(1);
+        assert_eq!(last[0].provider, "fast");
+        assert!(matches!(
+            *state.providers[0].circuit.read().await,
+            CircuitState::Open { .. }
+        ));
+
+        // Non-streaming: first_byte_timeout_secs does not apply, so the slow
+        // provider (circuit reset) is waited on and answers after ~3 s.
+        *state.providers[0].circuit.write().await = CircuitState::Closed;
+        let t = Instant::now();
+        let res = client
+            .post(&url)
+            .json(&messages_body())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        assert!(
+            t.elapsed() >= Duration::from_secs(3),
+            "took {:?}",
+            t.elapsed()
+        );
+        assert_eq!(state.request_log.recent(1)[0].provider, "slow");
     }
 }

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Per-provider tuning**: `circuit_failure_threshold` and
+  `circuit_base_cooldown_secs` override the server-wide values for one
+  provider, so a flaky gateway and a stable local server need not share a
+  setting. `first_byte_timeout_secs` (streaming requests only) abandons a
+  provider that sends no response headers in time and fails over, catching a
+  hung endpoint long before `upstream_timeout_secs`.
+
 ### Fixed
 - **A provider listed twice in one virtual model never reached its second
   entry.** The routing loop picked the upstream model by provider name and

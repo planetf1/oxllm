@@ -166,6 +166,14 @@ impl ReloadHealth {
     }
 }
 
+/// Per-provider overrides of the server-wide circuit and timeout settings.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProviderTuning {
+    pub circuit_failure_threshold: Option<u32>,
+    pub circuit_base_cooldown_secs: Option<u64>,
+    pub first_byte_timeout_secs: Option<u64>,
+}
+
 #[derive(Debug)]
 pub struct ProviderState {
     pub name: String,
@@ -178,6 +186,8 @@ pub struct ProviderState {
     pub cost_per_mtok: Option<f64>,
     /// Wire format this provider speaks.
     pub api: ApiFormat,
+    /// Per-provider circuit/timeout overrides.
+    pub tuning: ProviderTuning,
 
     // Protects volatile metrics without needing a write lock on the entire pool vector
     pub circuit: Arc<RwLock<CircuitState>>,
@@ -784,6 +794,7 @@ mod affinity_tests {
             upstream_timeout_secs: None,
             cost_per_mtok: None,
             api,
+            tuning: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),

@@ -304,7 +304,7 @@ oxllm serve --config config-local-test.toml
 
 ### Provider Definition
 
-Each provider requires `name`, `enabled`, `base_url` (with trailing `/v1/`), `api_key` (or `${VAR}` env reference), and `models` list. Optional per-provider keys: `upstream_timeout_secs` (overrides `server.upstream_timeout_secs`, so a fast-failing local provider can fail over sooner than a slow global timeout) and `cost_per_mtok` (cost weight used by the `cheapest` policy).
+Each provider requires `name`, `enabled`, `base_url` (with trailing `/v1/`), `api_key` (or `${VAR}` env reference), and `models` list. Optional per-provider keys: `upstream_timeout_secs` (overrides `server.upstream_timeout_secs`, so a fast-failing local provider can fail over sooner than a slow global timeout) and `cost_per_mtok` (cost weight used by the `cheapest` policy). Per-provider circuit tuning: `circuit_failure_threshold` and `circuit_base_cooldown_secs` override the server-wide values for that provider. `first_byte_timeout_secs` applies to streaming requests only: a provider that sends no response headers in that time is abandoned and its circuit opens at once, so a hung endpoint costs one short wait instead of the full `upstream_timeout_secs`. Non-streaming requests ignore it, because their headers only arrive after the whole generation.
 
 ### Virtual Models (Fallback Chains)
 

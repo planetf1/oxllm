@@ -108,6 +108,19 @@ pub struct ProviderConfig {
     /// inbound routes may use this provider.
     #[serde(default)]
     pub api: ApiFormat,
+    /// Per-provider override of `server.circuit_failure_threshold`.
+    #[serde(default)]
+    pub circuit_failure_threshold: Option<u32>,
+    /// Per-provider override of `server.circuit_base_cooldown_secs`.
+    #[serde(default)]
+    pub circuit_base_cooldown_secs: Option<u64>,
+    /// Streaming requests only: give up on this provider if response
+    /// headers have not arrived within this many seconds, and fail over.
+    /// Catches a hung endpoint far sooner than the total
+    /// `upstream_timeout_secs`. Not applied to non-streaming requests,
+    /// whose headers arrive only after the whole generation.
+    #[serde(default)]
+    pub first_byte_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -247,6 +260,22 @@ impl Config {
             return Err(OxllmError::ConfigLoad(
                 "server.circuit_failure_threshold must be at least 1".into(),
             ));
+        }
+
+        // 5b. Per-provider tuning sanity
+        for p in &self.providers {
+            if p.circuit_failure_threshold == Some(0) {
+                return Err(OxllmError::ConfigLoad(format!(
+                    "Provider '{}': circuit_failure_threshold must be at least 1",
+                    p.name
+                )));
+            }
+            if p.first_byte_timeout_secs == Some(0) {
+                return Err(OxllmError::ConfigLoad(format!(
+                    "Provider '{}': first_byte_timeout_secs must be at least 1",
+                    p.name
+                )));
+            }
         }
 
         // 6. Weights must be positive
@@ -538,5 +567,61 @@ vm = [{ provider = "p", model = "m" }]
         )
         .unwrap_err();
         assert!(err.to_string().contains("gemini"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_provider_tuning_parses_and_defaults_to_none() {
+        let config = minimal_config();
+        let p = &config.providers[0];
+        assert_eq!(p.circuit_failure_threshold, None);
+        assert_eq!(p.circuit_base_cooldown_secs, None);
+        assert_eq!(p.first_byte_timeout_secs, None);
+
+        let tuned: Config = toml::from_str(
+            r#"
+[server]
+host = "127.0.0.1"
+port = 8080
+otel_endpoint = "http://127.0.0.1:4318"
+
+[[providers]]
+name = "p"
+enabled = true
+base_url = "http://127.0.0.1:9/v1/"
+api_key = "k"
+models = ["m"]
+circuit_failure_threshold = 1
+circuit_base_cooldown_secs = 15
+first_byte_timeout_secs = 20
+
+[virtual_models]
+vm = [{ provider = "p", model = "m" }]
+"#,
+        )
+        .unwrap();
+        let p = &tuned.providers[0];
+        assert_eq!(p.circuit_failure_threshold, Some(1));
+        assert_eq!(p.circuit_base_cooldown_secs, Some(15));
+        assert_eq!(p.first_byte_timeout_secs, Some(20));
+        tuned.validate().unwrap();
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_provider_tuning() {
+        let mut config = minimal_config();
+        config.providers[0].circuit_failure_threshold = Some(0);
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("circuit_failure_threshold"));
+
+        let mut config = minimal_config();
+        config.providers[0].first_byte_timeout_secs = Some(0);
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("first_byte_timeout_secs"));
     }
 }

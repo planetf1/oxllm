@@ -32,10 +32,23 @@ pub struct AdaptivePriorityStrategy {
 impl AdaptivePriorityStrategy {
     /// Exponential circuit cooldown: base cooldown doubling for each
     /// failure beyond the threshold.
-    fn open_cooldown(&self, failures: u32) -> Duration {
-        let exponent = failures.saturating_sub(self.circuit.failure_threshold);
+    fn open_cooldown(&self, provider: &ProviderState, failures: u32) -> Duration {
+        let exponent = failures.saturating_sub(self.threshold(provider));
         let multiplier = 2u64.pow(exponent);
-        Duration::from_secs(self.circuit.base_cooldown_secs * multiplier)
+        let base = provider
+            .tuning
+            .circuit_base_cooldown_secs
+            .unwrap_or(self.circuit.base_cooldown_secs);
+        Duration::from_secs(base * multiplier)
+    }
+
+    /// Consecutive failures that open this provider's circuit: its own
+    /// override, else the server-wide value.
+    fn threshold(&self, provider: &ProviderState) -> u32 {
+        provider
+            .tuning
+            .circuit_failure_threshold
+            .unwrap_or(self.circuit.failure_threshold)
     }
 }
 
@@ -47,7 +60,7 @@ impl AdaptivePriorityStrategy {
     pub async fn feedback_timeout(&self, provider: &ProviderState, is_probe: bool) {
         {
             let mut failures = provider.consecutive_failures.write().await;
-            *failures = (*failures).max(self.circuit.failure_threshold.saturating_sub(1));
+            *failures = (*failures).max(self.threshold(provider).saturating_sub(1));
         }
         self.feedback(provider, false, is_probe, None, None).await;
     }
@@ -77,7 +90,7 @@ impl RoutingStrategy for AdaptivePriorityStrategy {
                                 Some(last_time + Duration::from_secs(decay_steps * 300));
 
                             // If failures age below the threshold, rehabilitate open circuits
-                            if *failures < self.circuit.failure_threshold {
+                            if *failures < self.threshold(provider) {
                                 let mut circ = provider.circuit.write().await;
                                 if let CircuitState::Open { .. } = *circ {
                                     *circ = CircuitState::Closed;
@@ -220,9 +233,9 @@ impl RoutingStrategy for AdaptivePriorityStrategy {
                     "Rate-limited {} for {}s",
                     provider.name, cooldown.as_secs()
                 );
-            } else if *failures >= self.circuit.failure_threshold || is_probe {
+            } else if *failures >= self.threshold(provider) || is_probe {
                 // Tripped or failed probe: trigger exponential circuit cooldown
-                let cooldown = self.open_cooldown(*failures);
+                let cooldown = self.open_cooldown(provider, *failures);
 
                 let mut state = provider.circuit.write().await;
                 *state = CircuitState::Open {
@@ -395,6 +408,7 @@ mod tests {
             upstream_timeout_secs: None,
             cost_per_mtok: None,
             api: Default::default(),
+            tuning: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -788,5 +802,33 @@ mod tests {
             },
             None => panic!("expected a rate-limit window"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_per_provider_threshold_and_cooldown_override_server_values() {
+        let mut p = setup_provider("flaky");
+        p.tuning.circuit_failure_threshold = Some(1);
+        p.tuning.circuit_base_cooldown_secs = Some(7);
+        // Server-wide default is 3 failures / 60 s; the override wins.
+        let strategy = AdaptivePriorityStrategy::default();
+        strategy.feedback(&p, false, false, Some(500), None).await;
+        let state = *p.circuit.read().await;
+        match state {
+            CircuitState::Open { until } => {
+                let left = until.saturating_duration_since(Instant::now());
+                assert!(left <= Duration::from_secs(7), "cooldown {:?}", left);
+            },
+            other => panic!("expected Open after one failure, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_timeout_feedback_respects_per_provider_threshold() {
+        let mut p = setup_provider("slow");
+        p.tuning.circuit_failure_threshold = Some(5);
+        let strategy = AdaptivePriorityStrategy::default();
+        strategy.feedback_timeout(&p, false).await;
+        // A timeout still opens the circuit at once, however high the threshold.
+        assert!(matches!(*p.circuit.read().await, CircuitState::Open { .. }));
     }
 }
