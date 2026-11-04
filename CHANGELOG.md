@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.25] - 2026-11-04
+
 ### Added
 - **Nested virtual models**: a target can be `{ virtual = "other" }` instead of
   `provider`/`model`, splicing in that model's targets in their own order, so
