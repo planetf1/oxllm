@@ -19,8 +19,8 @@ use oxllm_core::router::{
     AdaptivePriorityStrategy, LatencyCandidate, Outcome,
 };
 use oxllm_core::state::{
-    unix_millis, AppState, CircuitState, ModelStats, ProviderState, RequestRecord, RouteCandidate,
-    RoutingPolicy,
+    unix_millis, AppState, CircuitState, EntryAvailability, ModelStats, ProviderState,
+    RequestRecord, RouteCandidate, RoutingPolicy,
 };
 use oxllm_core::telemetry::{TelemetryClient, TelemetryEvent};
 
@@ -135,6 +135,23 @@ struct RouteEntry {
     provider: String,
     model: String,
     circuit: String,
+    /// Machine-readable availability: healthy, probing, rate_limited, open
+    /// or offline. `circuit` is the same fact as display text.
+    availability: &'static str,
+    /// Seconds until an open or rate-limited entry is tried again.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_in_secs: Option<u64>,
+    /// Wire format of the provider (openai / anthropic).
+    api: &'static str,
+    /// Explicit `priority` of the target within the route, if configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    priority: Option<u32>,
+    /// Load-sharing `weight` of the target within its priority tier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    weight: Option<u32>,
+    /// Configured cost per 1M output tokens (used by `cheapest`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost_per_mtok: Option<f64>,
     requests: u64,
     successes: u64,
     tokens_input: u64,
@@ -168,6 +185,14 @@ pub async fn get_status(
     struct RouteSummary {
         route: String,
         policy: String,
+        /// Plain-language ordering rule, including weights and priorities.
+        strategy: String,
+        /// Pool entries after flattening nested virtual models.
+        targets: usize,
+        /// Entries that can take a request right now.
+        available: usize,
+        /// ok (all available), degraded (some), or down (none).
+        state: &'static str,
         requests: u64,
         successes: u64,
         failures: u64,
@@ -182,8 +207,27 @@ pub async fn get_status(
         cached_tokens: u64,
     }
 
+    /// One thing that needs attention, for the summary view and scripts.
+    #[derive(Serialize)]
+    struct Problem {
+        /// route, provider or reload
+        scope: &'static str,
+        name: String,
+        /// down, degraded, offline, rate_limited, or reload_failed
+        kind: &'static str,
+        detail: String,
+    }
+
+    #[derive(Serialize)]
+    struct Health {
+        /// ok, degraded, or down (any route with no available entry).
+        state: &'static str,
+        problems: Vec<Problem>,
+    }
+
     #[derive(Serialize)]
     struct StatusResponse {
+        health: Health,
         version: &'static str,
         uptime_secs: u64,
         total_requests: u64,
@@ -272,24 +316,27 @@ pub async fn get_status(
 
     for (vm_name, targets) in &app_state.virtual_models {
         let mut entries = Vec::new();
-        for target in targets {
+        // Show entries in the order routing tries them (stable by priority),
+        // not raw config order, so the table matches behaviour.
+        let mut ordered: Vec<&oxllm_core::config::VirtualModelTarget> = targets.iter().collect();
+        ordered.sort_by_key(|t| t.priority.unwrap_or(u32::MAX));
+        for target in ordered {
             let provider_state = app_state
                 .providers
                 .iter()
                 .find(|p| p.name == target.provider);
-            let circuit_str = match provider_state {
-                Some(provider) => {
-                    let circ = *provider.circuit.read().await;
-                    let now = std::time::Instant::now();
-                    match circ {
-                        CircuitState::Closed => "Closed (Healthy)".to_string(),
-                        CircuitState::HalfOpen => "Half-Open (Probing)".to_string(),
-                        CircuitState::Open { until } => {
-                            let left = until.saturating_duration_since(now).as_secs();
-                            format!("Open ({}s cooldown)", left)
-                        },
-                    }
+            let availability = match provider_state {
+                Some(provider) => Some(provider.entry_availability(&target.model).await),
+                None => None,
+            };
+            let circuit_str = match availability {
+                Some(EntryAvailability::Healthy) => "Closed (Healthy)".to_string(),
+                Some(EntryAvailability::Probing) => "Half-Open (Probing)".to_string(),
+                Some(EntryAvailability::Open { secs }) => format!("Open ({}s cooldown)", secs),
+                Some(EntryAvailability::RateLimited { secs }) => {
+                    format!("Rate-limited ({}s)", secs)
                 },
+                Some(EntryAvailability::Offline) => "Offline (admin)".to_string(),
                 None => "Unknown".to_string(),
             };
             // Traffic attributed to this (provider, model) pair, not to the
@@ -308,6 +355,12 @@ pub async fn get_status(
                 provider: target.provider.clone(),
                 model: target.model.clone(),
                 circuit: circuit_str,
+                availability: availability.map_or("unknown", |a| a.name()),
+                retry_in_secs: availability.and_then(|a| a.retry_in_secs()),
+                api: provider_state.map_or("openai", |p| p.api.as_str()),
+                priority: target.priority,
+                weight: target.weight,
+                cost_per_mtok: provider_state.and_then(|p| p.cost_per_mtok),
                 requests: stats.requests,
                 successes: stats.successes,
                 tokens_input: stats.tokens_input,
@@ -325,7 +378,32 @@ pub async fn get_status(
         .into_iter()
         .map(|route_name| {
             let snap = app_state.route_stats.snapshot(&route_name);
+            let entries = virtual_models.get(&route_name);
+            let targets = entries.map_or(0, |e| e.len());
+            let available = entries.map_or(0, |e| {
+                e.iter()
+                    .filter(|x| matches!(x.availability, "healthy" | "probing"))
+                    .count()
+            });
+            let strategy = describe_strategy(
+                app_state.policies.get(&route_name).copied(),
+                app_state
+                    .virtual_models
+                    .get(&route_name)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+            );
             RouteSummary {
+                strategy,
+                targets,
+                available,
+                state: if available == 0 {
+                    "down"
+                } else if available < targets {
+                    "degraded"
+                } else {
+                    "ok"
+                },
                 policy: match app_state.policies.get(&route_name) {
                     Some(RoutingPolicy::Fastest) => "fastest".to_string(),
                     Some(RoutingPolicy::Cheapest) => "cheapest".to_string(),
@@ -349,7 +427,78 @@ pub async fn get_status(
         .collect();
     routes.sort_by(|a, b| a.route.cmp(&b.route));
 
+    // Problems, most severe first: routes with nothing available, a failed
+    // reload, then degraded routes and individual entries that are out.
+    let mut problems: Vec<Problem> = Vec::new();
+    for r in &routes {
+        if r.state == "down" {
+            problems.push(Problem {
+                scope: "route",
+                name: r.route.clone(),
+                kind: "down",
+                detail: format!("0 of {} entries available", r.targets),
+            });
+        }
+    }
+    if let Some(err) = app_state.reload_health.snapshot().last_error {
+        problems.push(Problem {
+            scope: "reload",
+            name: "config".to_string(),
+            kind: "reload_failed",
+            detail: format!("previous config still serving: {}", err),
+        });
+    }
+    for r in &routes {
+        if r.state == "degraded" {
+            problems.push(Problem {
+                scope: "route",
+                name: r.route.clone(),
+                kind: "degraded",
+                detail: format!("{} of {} entries available", r.available, r.targets),
+            });
+        }
+    }
+    let mut seen_entries = std::collections::HashSet::new();
+    let mut vm_names: Vec<&String> = virtual_models.keys().collect();
+    vm_names.sort();
+    for vm in vm_names {
+        for e in &virtual_models[vm] {
+            if matches!(e.availability, "healthy" | "probing") {
+                continue;
+            }
+            if !seen_entries.insert((e.provider.clone(), e.model.clone(), e.availability)) {
+                continue;
+            }
+            let kind = match e.availability {
+                "offline" => "offline",
+                "rate_limited" => "rate_limited",
+                _ => "down",
+            };
+            let detail = match e.retry_in_secs {
+                Some(s) => format!("{} ({}), retry in {}s", e.model, e.availability, s),
+                None => format!("{} ({})", e.model, e.availability),
+            };
+            problems.push(Problem {
+                scope: "provider",
+                name: e.provider.clone(),
+                kind,
+                detail,
+            });
+        }
+    }
+    let overall = if routes.iter().any(|r| r.state == "down") {
+        "down"
+    } else if !problems.is_empty() {
+        "degraded"
+    } else {
+        "ok"
+    };
+
     Json(StatusResponse {
+        health: Health {
+            state: overall,
+            problems,
+        },
         version: env!("CARGO_PKG_VERSION"),
         uptime_secs: start_time.elapsed().as_secs(),
         total_requests,
@@ -359,6 +508,37 @@ pub async fn get_status(
         routes,
         recent_requests: app_state.request_log.recent(50),
     })
+}
+
+/// Plain-language description of how a route orders its entries, for
+/// `/status`: the policy plus any explicit priorities and weights.
+fn describe_strategy(
+    policy: Option<RoutingPolicy>,
+    targets: &[oxllm_core::config::VirtualModelTarget],
+) -> String {
+    match policy {
+        Some(RoutingPolicy::Fastest) => {
+            "fastest: lowest measured time-to-first-byte first (20% bands, re-sampled every 20th request)"
+                .to_string()
+        },
+        Some(RoutingPolicy::Cheapest) => {
+            "cheapest: lowest cost_per_mtok first, latency breaks ties".to_string()
+        },
+        _ => {
+            let weighted = targets.iter().any(|t| t.weight.is_some());
+            let prioritised = targets.iter().any(|t| t.priority.is_some());
+            let mut s = if prioritised {
+                "priority: lowest `priority` first, then configured order".to_string()
+            } else {
+                "priority: configured order, first healthy wins".to_string()
+            };
+            if weighted {
+                s.push_str("; entries with a weight share load within their tier");
+            }
+            s.push_str("; failover on error");
+            s
+        },
+    }
 }
 
 /// GET /admin/tail (localhost-only): live SSE stream of request records as
@@ -919,6 +1099,7 @@ async fn proxy_request(
                 // Push Telemetry Metrics
                 telemetry.emit(TelemetryEvent::RecordTransaction {
                     operation: spec.operation.to_string(),
+                    route: route_name.clone(),
                     provider: selected.name.clone(),
                     model: target_model.clone(),
                     input_tokens,
@@ -1097,6 +1278,26 @@ async fn proxy_request(
     if let Some(key) = session_key(&app_state, &headers, &payload).as_deref() {
         app_state.session_affinity.unpin(key);
     }
+    // A request that exhausts every entry is the most interesting one to
+    // trace, so it gets a span and a duration sample like any other.
+    telemetry.emit(TelemetryEvent::RecordTransaction {
+        operation: spec.operation.to_string(),
+        route: route_name.clone(),
+        provider: last_failed_provider.clone(),
+        model: last_failed_model.clone(),
+        input_tokens: 0,
+        output_tokens: 0,
+        duration: start_time.elapsed(),
+        attempts,
+        failure_reason: Some(if attempts == 0 {
+            "no_available_provider".to_string()
+        } else {
+            "all_providers_failed".to_string()
+        }),
+        trace_id: trace_id.clone(),
+        parent_span_id: parent_span_id.clone(),
+        request_id: request_id.clone(),
+    });
     app_state.request_log.record(RequestRecord {
         ts_ms: unix_millis(),
         endpoint: spec.operation.to_string(),
@@ -1395,6 +1596,7 @@ fn stream_upstream_body(
         // Push Telemetry Metrics
         telemetry.emit(TelemetryEvent::RecordTransaction {
             operation: operation.to_string(),
+            route: route_name.clone(),
             provider: provider_name.clone(),
             model: model_name.clone(),
             input_tokens: usage_scan.usage.input,

@@ -86,7 +86,17 @@ enum Commands {
         #[arg(short, long, default_value = "config.toml", env = "OXLLM_CONFIG")]
         config: PathBuf,
     },
-    /// Fetches and displays the active health and circuit status
+    /// Shows health at a glance: problems first, then one row per route
+    #[command(
+        long_about = "Shows what is wrong first, then one row per route (state, strategy, \
+available/total entries, traffic, latency).\n\nDetail levels (each includes the previous):\n  \
+(default)  health, problems, routes\n  -v         + each route's targets: state, tier, traffic\n  \
+-vv        + providers, latency percentiles, recent requests\n\n--json emits the same tiers for \
+scripts. --route NAME narrows everything to one virtual model.",
+        after_help = "Examples:\n  oxllm status\n  oxllm status -v --route pool-standard\n  \
+oxllm status --json | jq '.health.problems'\n\nNext: oxllm tail -r 20 (live requests), \
+oxllm provider offline NAME (take a provider out of rotation)"
+    )]
     Status {
         /// Host of the running gateway server
         #[arg(long, default_value = "127.0.0.1", env = "OXLLM_HOST")]
@@ -94,12 +104,18 @@ enum Commands {
         /// Port of the running gateway server
         #[arg(short, long, default_value_t = 8080, env = "OXLLM_PORT")]
         port: u16,
-        /// Emit the raw /status JSON instead of formatted tables
+        /// Emit JSON at the chosen detail level instead of tables
         #[arg(long)]
         json: bool,
         /// Table width in characters (defaults to $COLUMNS, else 120)
         #[arg(short, long)]
         width: Option<usize>,
+        /// More detail: -v targets per route, -vv providers and recent requests
+        #[arg(short, long, action = clap::ArgAction::Count)]
+        verbose: u8,
+        /// Show only this virtual model
+        #[arg(short, long)]
+        route: Option<String>,
     },
     /// Triggers hot-reload on the running gateway (POST /reload, or SIGHUP via --pid)
     Reload {
@@ -1230,19 +1246,404 @@ fn cli_base_url(host: &str, port: u16) -> String {
     format!("http://{}:{}", host, port)
 }
 
+/// How much `oxllm status` prints. Each level includes the one before.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum Detail {
+    /// Health, problems, one row per route.
+    Summary,
+    /// Plus each route's targets with state, priority/weight and traffic.
+    Targets,
+    /// Plus per-provider totals, latency percentiles and recent requests.
+    Full,
+}
+
+impl Detail {
+    fn from_verbosity(v: u8) -> Self {
+        match v {
+            0 => Detail::Summary,
+            1 => Detail::Targets,
+            _ => Detail::Full,
+        }
+    }
+}
+
+/// `1h 02m`, `17m 15s`, `42s`.
+fn fmt_duration(secs: u64) -> String {
+    if secs >= 3600 {
+        format!("{}h {:02}m", secs / 3600, (secs / 60) % 60)
+    } else if secs >= 60 {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}s", secs)
+    }
+}
+
+fn jstr<'a>(v: &'a serde_json::Value, key: &str) -> &'a str {
+    v.get(key).and_then(|x| x.as_str()).unwrap_or("-")
+}
+
+fn ju64(v: &serde_json::Value, key: &str) -> u64 {
+    v.get(key).and_then(|x| x.as_u64()).unwrap_or(0)
+}
+
+fn jms(v: &serde_json::Value, key: &str) -> String {
+    fmt_ms(v.get(key).and_then(|x| x.as_u64()))
+}
+
+/// Entry state for a table cell: `healthy`, `open 12s`, `rate_limited 5s`.
+fn entry_state(e: &serde_json::Value) -> String {
+    let state = e
+        .get("availability")
+        .and_then(|x| x.as_str())
+        .unwrap_or("unknown");
+    match e.get("retry_in_secs").and_then(|x| x.as_u64()) {
+        Some(s) => format!("{} {}s", state, s),
+        None => state.to_string(),
+    }
+}
+
+fn col(header: &'static str, right_align: bool, optional: bool) -> TableColumn {
+    TableColumn {
+        header,
+        right_align,
+        optional,
+    }
+}
+
+/// Renders the `/status` JSON at the requested detail level. Tolerant of
+/// older daemons: fields it needs but cannot find print as `-`, and the
+/// health summary is derived only when the daemon reports it.
+fn render_status(
+    status: &serde_json::Value,
+    detail: Detail,
+    route_filter: Option<&str>,
+    max_width: usize,
+) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let empty = Vec::new();
+    let arr = |key: &str| -> &Vec<serde_json::Value> {
+        status.get(key).and_then(|v| v.as_array()).unwrap_or(&empty)
+    };
+
+    let health = status.get("health");
+    let overall = health
+        .and_then(|h| h.get("state"))
+        .and_then(|s| s.as_str())
+        .unwrap_or("unknown");
+    let _ = writeln!(
+        out,
+        "\noxllm {}  up {}  {} requests  {}",
+        status
+            .get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(daemon older than v0.1.24)"),
+        fmt_duration(ju64(status, "uptime_secs")),
+        ju64(status, "total_requests"),
+        overall.to_uppercase()
+    );
+    for w in status["reload"]["restart_warnings"]
+        .as_array()
+        .unwrap_or(&empty)
+    {
+        let _ = writeln!(out, "  reload warning: {}", w.as_str().unwrap_or("?"));
+    }
+
+    // Problems come first: this is what the operator opened status to learn.
+    let problems = health
+        .and_then(|h| h.get("problems"))
+        .and_then(|p| p.as_array())
+        .unwrap_or(&empty);
+    if problems.is_empty() {
+        if overall == "ok" {
+            let _ = writeln!(out, "  all routes healthy");
+        }
+    } else {
+        let _ = writeln!(out);
+        for p in problems {
+            let _ = writeln!(
+                out,
+                "  ! {:<22} {:<13} {}",
+                truncate_str(jstr(p, "name"), 22),
+                jstr(p, "kind"),
+                jstr(p, "detail")
+            );
+        }
+    }
+
+    // Routes: one row per virtual model.
+    let routes: Vec<&serde_json::Value> = arr("routes")
+        .iter()
+        .filter(|r| route_filter.is_none_or(|f| jstr(r, "route") == f))
+        .collect();
+    if routes.is_empty() {
+        if let Some(f) = route_filter {
+            let _ = writeln!(out, "\nNo route named '{}'. Routes:", f);
+            for r in arr("routes") {
+                let _ = writeln!(out, "  {}", jstr(r, "route"));
+            }
+        }
+    } else {
+        let full = detail >= Detail::Full;
+        let rows: Vec<Vec<String>> = routes
+            .iter()
+            .map(|r| {
+                let mut row = vec![
+                    jstr(r, "route").to_string(),
+                    jstr(r, "state").to_string(),
+                    jstr(r, "policy").to_string(),
+                    format!("{}/{}", ju64(r, "available"), ju64(r, "targets")),
+                    ju64(r, "requests").to_string(),
+                    ju64(r, "failures").to_string(),
+                    jms(r, "latency_p50_ms"),
+                    jms(r, "latency_p95_ms"),
+                ];
+                if full {
+                    row.push(ju64(r, "tokens_input").to_string());
+                    row.push(ju64(r, "tokens_output").to_string());
+                    row.push(jms(r, "ttft_p50_ms"));
+                    row.push(jms(r, "latency_p99_ms"));
+                }
+                row
+            })
+            .collect();
+        let mut cols = vec![
+            col("Route", false, false),
+            col("State", false, false),
+            col("Strategy", false, true),
+            col("Avail", true, false),
+            col("Req", true, false),
+            col("Fail", true, true),
+            col("p50", true, true),
+            col("p95", true, true),
+        ];
+        if full {
+            cols.extend([
+                col("Tok In", true, true),
+                col("Tok Out", true, true),
+                col("TTFT50", true, true),
+                col("p99", true, true),
+            ]);
+        }
+        let _ = writeln!(out, "\nRoutes\n{}", render_table(&cols, &rows, max_width));
+    }
+
+    if detail >= Detail::Targets {
+        let mut vms: Vec<&String> = status["virtual_models"]
+            .as_object()
+            .map(|o| o.keys().collect())
+            .unwrap_or_default();
+        vms.sort();
+        for vm in vms {
+            if route_filter.is_some_and(|f| f != vm.as_str()) {
+                continue;
+            }
+            let route = arr("routes").iter().find(|r| jstr(r, "route") == vm);
+            let _ = writeln!(
+                out,
+                "\n{}{}",
+                vm,
+                route
+                    .map(|r| format!("  ({})", jstr(r, "strategy")))
+                    .unwrap_or_default()
+            );
+            let entries = status["virtual_models"][vm.as_str()]
+                .as_array()
+                .unwrap_or(&empty);
+            let rows: Vec<Vec<String>> = entries
+                .iter()
+                .enumerate()
+                .map(|(i, e)| {
+                    let tuning = match (e.get("priority"), e.get("weight")) {
+                        (Some(p), Some(w)) => format!("p{} w{}", p, w),
+                        (Some(p), None) => format!("p{}", p),
+                        (None, Some(w)) => format!("w{}", w),
+                        (None, None) => "-".to_string(),
+                    };
+                    vec![
+                        (i + 1).to_string(),
+                        jstr(e, "provider").to_string(),
+                        jstr(e, "model").to_string(),
+                        entry_state(e),
+                        jstr(e, "api").to_string(),
+                        tuning,
+                        ju64(e, "requests").to_string(),
+                        ju64(e, "successes").to_string(),
+                        ju64(e, "tokens_input").to_string(),
+                        ju64(e, "tokens_output").to_string(),
+                        jms(e, "ttft_p50_ms"),
+                    ]
+                })
+                .collect();
+            let _ = writeln!(
+                out,
+                "{}",
+                render_table(
+                    &[
+                        col("#", true, false),
+                        col("Provider", false, false),
+                        col("Model", false, false),
+                        col("State", false, false),
+                        col("API", false, true),
+                        col("Tier", false, true),
+                        col("Req", true, false),
+                        col("OK", true, true),
+                        col("Tok In", true, true),
+                        col("Tok Out", true, true),
+                        col("TTFT50", true, true),
+                    ],
+                    &rows,
+                    max_width,
+                )
+            );
+        }
+    }
+
+    if detail >= Detail::Full {
+        let rows: Vec<Vec<String>> = arr("providers")
+            .iter()
+            .map(|p| {
+                let circuit = if p["admin_disabled"].as_bool().unwrap_or(false) {
+                    "Offline (admin)".to_string()
+                } else {
+                    jstr(p, "circuit").to_string()
+                };
+                vec![
+                    jstr(p, "name").to_string(),
+                    circuit,
+                    ju64(p, "failures").to_string(),
+                    if p["rate_limited"].as_bool().unwrap_or(false) {
+                        "yes"
+                    } else {
+                        "no"
+                    }
+                    .to_string(),
+                    ju64(p, "requests").to_string(),
+                    ju64(p, "successes").to_string(),
+                    ju64(p, "tokens_input").to_string(),
+                    ju64(p, "tokens_output").to_string(),
+                    jstr(p, "last_request").to_string(),
+                    jstr(p, "models").to_string(),
+                ]
+            })
+            .collect();
+        let _ = writeln!(
+            out,
+            "\nProviders (reachability; per-model health is in the route tables)\n{}",
+            render_table(
+                &[
+                    col("Provider", false, false),
+                    col("Circuit", false, false),
+                    col("Fails", true, true),
+                    col("Limited", false, true),
+                    col("Req", true, false),
+                    col("OK", true, true),
+                    col("Tok In", true, true),
+                    col("Tok Out", true, true),
+                    col("Last", false, true),
+                    col("Models", false, true),
+                ],
+                &rows,
+                max_width,
+            )
+        );
+
+        let recent = arr("recent_requests");
+        if !recent.is_empty() {
+            let _ = writeln!(
+                out,
+                "Recent requests (newest first, last 15 of {})",
+                recent.len()
+            );
+            for rec in recent.iter().rev().take(15) {
+                let _ = writeln!(out, "{}", format_request_record(rec));
+            }
+        }
+    }
+
+    // Always say how to see more (or less), so the next step is obvious.
+    let _ = match detail {
+        Detail::Summary => writeln!(
+            out,
+            "\nMore: oxllm status -v (targets per route)  |  -vv (providers, recent requests)  |  --route NAME  |  --json"
+        ),
+        Detail::Targets => writeln!(
+            out,
+            "\nMore: oxllm status -vv (providers, recent requests)  |  --json -v for scripts"
+        ),
+        Detail::Full => writeln!(out, "\nLive traffic: oxllm tail -r 20"),
+    };
+    out
+}
+
+/// Reduces a full `/status` document to the requested detail level for
+/// `--json`, so scripts get the same tiers as the table output.
+fn status_json_at(
+    status: &serde_json::Value,
+    detail: Detail,
+    route_filter: Option<&str>,
+) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    let keep = |key: &str, out: &mut serde_json::Map<String, serde_json::Value>| {
+        if let Some(v) = status.get(key) {
+            out.insert(key.to_string(), v.clone());
+        }
+    };
+    for key in [
+        "version",
+        "uptime_secs",
+        "total_requests",
+        "health",
+        "reload",
+    ] {
+        keep(key, &mut out);
+    }
+    let filter_routes = |v: &serde_json::Value| -> serde_json::Value {
+        match (v.as_array(), route_filter) {
+            (Some(items), Some(f)) => serde_json::Value::Array(
+                items
+                    .iter()
+                    .filter(|r| jstr(r, "route") == f)
+                    .cloned()
+                    .collect(),
+            ),
+            _ => v.clone(),
+        }
+    };
+    if let Some(routes) = status.get("routes") {
+        out.insert("routes".to_string(), filter_routes(routes));
+    }
+    if detail >= Detail::Targets {
+        if let Some(vms) = status.get("virtual_models") {
+            let mut vms = vms.clone();
+            if let (Some(obj), Some(f)) = (vms.as_object_mut(), route_filter) {
+                obj.retain(|k, _| k == f);
+            }
+            out.insert("virtual_models".to_string(), vms);
+        }
+    }
+    if detail >= Detail::Full {
+        keep("providers", &mut out);
+        keep("recent_requests", &mut out);
+    }
+    serde_json::Value::Object(out)
+}
+
 async fn run_status(
     host: &str,
     port: u16,
     json: bool,
     width_override: Option<usize>,
+    verbose: u8,
+    route: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
     let url = format!("{}/status", cli_base_url(host, port));
     let res = match client.get(&url).send().await {
         Ok(r) => r,
         Err(e) if e.is_connect() => {
-            println!("oxllm is not running on http://127.0.0.1:{}", port);
-            println!("Start it with: oxllm serve");
+            println!("oxllm is not running on {}", cli_base_url(host, port));
+            println!("Start it with: oxllm serve   (or install it as a service: oxllm install)");
             std::process::exit(1);
         },
         Err(e) => return Err(e.into()),
@@ -1250,371 +1651,23 @@ async fn run_status(
     if !res.status().is_success() {
         return Err(format!("Server returned error status: {}", res.status()).into());
     }
-
-    let body = res.text().await?;
+    let status: serde_json::Value = serde_json::from_str(&res.text().await?)?;
+    let detail = Detail::from_verbosity(verbose);
 
     if json {
-        let parsed: serde_json::Value = serde_json::from_str(&body)?;
-        println!("{}", serde_json::to_string_pretty(&parsed)?);
+        let reduced = status_json_at(&status, detail, route.as_deref());
+        println!("{}", serde_json::to_string_pretty(&reduced)?);
         return Ok(());
     }
-
-    #[derive(serde::Deserialize)]
-    struct ProviderStatus {
-        name: String,
-        models: String,
-        circuit: String,
-        failures: u32,
-        rate_limited: bool,
-        #[serde(default)]
-        admin_disabled: bool,
-        requests: u64,
-        successes: u64,
-        tokens_input: u64,
-        tokens_output: u64,
-        last_request: String,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct RouteEntry {
-        provider: String,
-        model: String,
-        circuit: String,
-        requests: u64,
-        successes: u64,
-        #[serde(default)]
-        tokens_input: u64,
-        #[serde(default)]
-        tokens_output: u64,
-        #[serde(default)]
-        ttft_p50_ms: Option<u64>,
-        #[serde(default)]
-        latency_p50_ms: Option<u64>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct RouteSummary {
-        route: String,
-        policy: String,
-        requests: u64,
-        successes: u64,
-        failures: u64,
-        tokens_input: u64,
-        tokens_output: u64,
-        latency_p50_ms: Option<u64>,
-        latency_p95_ms: Option<u64>,
-        latency_p99_ms: Option<u64>,
-        ttft_p50_ms: Option<u64>,
-    }
-
-    #[derive(serde::Deserialize, Default)]
-    struct ReloadHealth {
-        #[serde(default)]
-        last_error: Option<String>,
-        #[serde(default)]
-        restart_warnings: Vec<String>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct StatusResponse {
-        #[serde(default)]
-        version: Option<String>,
-        uptime_secs: u64,
-        total_requests: u64,
-        #[serde(default)]
-        reload: ReloadHealth,
-        providers: Vec<ProviderStatus>,
-        virtual_models: std::collections::HashMap<String, Vec<RouteEntry>>,
-        #[serde(default)]
-        routes: Vec<RouteSummary>,
-        #[serde(default)]
-        recent_requests: Vec<serde_json::Value>,
-    }
-
-    let status: StatusResponse = serde_json::from_str(&body)?;
-    let max_width = status_width(width_override);
-
-    println!(
-        "\nDaemon: {}  |  Uptime: {}m {}s  |  Total Requests: {}",
-        status
-            .version
-            .as_deref()
-            .unwrap_or("unknown (daemon older than v0.1.24)"),
-        status.uptime_secs / 60,
-        status.uptime_secs % 60,
-        status.total_requests
-    );
-    if let Some(error) = &status.reload.last_error {
-        println!(
-            "Last reload FAILED, previous config still serving: {}",
-            error
-        );
-    }
-    for warning in &status.reload.restart_warnings {
-        println!("Reload warning: {}", warning);
-    }
-
-    // Per-virtual-model routing tables. Counters are per (provider, model), so
-    // two virtual models backed by different models on one provider no longer
-    // show each other's traffic.
-    let mut vms: Vec<(&String, &Vec<RouteEntry>)> = status.virtual_models.iter().collect();
-    vms.sort_by(|a, b| a.0.cmp(b.0));
-
-    for (vm_name, routes) in vms {
-        println!("\nVirtual Model: {}", vm_name);
-        let rows: Vec<Vec<String>> = routes
-            .iter()
-            .map(|e| {
-                vec![
-                    e.provider.clone(),
-                    e.model.clone(),
-                    e.circuit.clone(),
-                    e.requests.to_string(),
-                    e.successes.to_string(),
-                    e.tokens_input.to_string(),
-                    e.tokens_output.to_string(),
-                    fmt_ms(e.ttft_p50_ms),
-                    fmt_ms(e.latency_p50_ms),
-                ]
-            })
-            .collect();
-        println!(
-            "{}",
-            render_table(
-                &[
-                    TableColumn {
-                        header: "Provider",
-                        right_align: false,
-                        optional: false
-                    },
-                    TableColumn {
-                        header: "Model",
-                        right_align: false,
-                        optional: false
-                    },
-                    TableColumn {
-                        header: "Circuit",
-                        right_align: false,
-                        optional: true
-                    },
-                    TableColumn {
-                        header: "Requests",
-                        right_align: true,
-                        optional: false
-                    },
-                    TableColumn {
-                        header: "Success",
-                        right_align: true,
-                        optional: false
-                    },
-                    TableColumn {
-                        header: "Tokens In",
-                        right_align: true,
-                        optional: true
-                    },
-                    TableColumn {
-                        header: "Tokens Out",
-                        right_align: true,
-                        optional: true
-                    },
-                    TableColumn {
-                        header: "TTFT p50",
-                        right_align: true,
-                        optional: true
-                    },
-                    TableColumn {
-                        header: "Lat p50",
-                        right_align: true,
-                        optional: true
-                    },
-                ],
-                &rows,
-                max_width,
-            )
-        );
-    }
-
-    // Per-route rollup with latency distributions (one row per virtual model,
-    // regardless of how many providers back it).
-    if !status.routes.is_empty() {
-        println!("\nRoutes");
-        let rows: Vec<Vec<String>> = status
-            .routes
-            .iter()
-            .map(|r| {
-                vec![
-                    r.route.clone(),
-                    r.policy.clone(),
-                    r.requests.to_string(),
-                    r.successes.to_string(),
-                    r.failures.to_string(),
-                    r.tokens_input.to_string(),
-                    r.tokens_output.to_string(),
-                    fmt_ms(r.ttft_p50_ms),
-                    fmt_ms(r.latency_p50_ms),
-                    fmt_ms(r.latency_p95_ms),
-                    fmt_ms(r.latency_p99_ms),
-                ]
-            })
-            .collect();
-        println!(
-            "{}",
-            render_table(
-                &[
-                    TableColumn {
-                        header: "Route",
-                        right_align: false,
-                        optional: false
-                    },
-                    TableColumn {
-                        header: "Policy",
-                        right_align: false,
-                        optional: true
-                    },
-                    TableColumn {
-                        header: "Req",
-                        right_align: true,
-                        optional: false
-                    },
-                    TableColumn {
-                        header: "OK",
-                        right_align: true,
-                        optional: false
-                    },
-                    TableColumn {
-                        header: "Fail",
-                        right_align: true,
-                        optional: true
-                    },
-                    TableColumn {
-                        header: "Tok In",
-                        right_align: true,
-                        optional: true
-                    },
-                    TableColumn {
-                        header: "Tok Out",
-                        right_align: true,
-                        optional: true
-                    },
-                    TableColumn {
-                        header: "TTFT50",
-                        right_align: true,
-                        optional: true
-                    },
-                    TableColumn {
-                        header: "p50",
-                        right_align: true,
-                        optional: true
-                    },
-                    TableColumn {
-                        header: "p95",
-                        right_align: true,
-                        optional: true
-                    },
-                    TableColumn {
-                        header: "p99",
-                        right_align: true,
-                        optional: true
-                    },
-                ],
-                &rows,
-                max_width,
-            )
-        );
-    }
-
-    // Per-provider totals (all models on that provider combined).
-    println!("\nProviders");
-    let rows: Vec<Vec<String>> = status
-        .providers
-        .iter()
-        .map(|s| {
-            vec![
-                s.name.clone(),
-                s.models.clone(),
-                if s.admin_disabled {
-                    "Offline (admin)".to_string()
-                } else {
-                    s.circuit.clone()
-                },
-                s.failures.to_string(),
-                if s.rate_limited { "Yes" } else { "No" }.to_string(),
-                s.requests.to_string(),
-                s.successes.to_string(),
-                s.tokens_input.to_string(),
-                s.tokens_output.to_string(),
-                s.last_request.clone(),
-            ]
-        })
-        .collect();
-    println!(
+    print!(
         "{}",
-        render_table(
-            &[
-                TableColumn {
-                    header: "Provider",
-                    right_align: false,
-                    optional: false
-                },
-                TableColumn {
-                    header: "Models",
-                    right_align: false,
-                    optional: true
-                },
-                TableColumn {
-                    header: "Circuit",
-                    right_align: false,
-                    optional: true
-                },
-                TableColumn {
-                    header: "Failures",
-                    right_align: true,
-                    optional: true
-                },
-                TableColumn {
-                    header: "Rate Limited",
-                    right_align: false,
-                    optional: true
-                },
-                TableColumn {
-                    header: "Requests",
-                    right_align: true,
-                    optional: false
-                },
-                TableColumn {
-                    header: "Successes",
-                    right_align: true,
-                    optional: false
-                },
-                TableColumn {
-                    header: "Tokens In",
-                    right_align: true,
-                    optional: true
-                },
-                TableColumn {
-                    header: "Tokens Out",
-                    right_align: true,
-                    optional: true
-                },
-                TableColumn {
-                    header: "Last Request",
-                    right_align: false,
-                    optional: true
-                },
-            ],
-            &rows,
-            max_width,
+        render_status(
+            &status,
+            detail,
+            route.as_deref(),
+            status_width(width_override)
         )
     );
-
-    if !status.recent_requests.is_empty() {
-        println!("\nRecent Requests (last {})", status.recent_requests.len());
-        for rec in status.recent_requests.iter().rev().take(10) {
-            print_request_record(rec);
-        }
-    }
-    println!();
-
     Ok(())
 }
 
@@ -1857,8 +1910,13 @@ async fn run_tail(host: &str, port: u16, recent: usize) -> Result<(), Box<dyn st
     Ok(())
 }
 
-/// Renders one request record as a compact single line.
+/// Prints one request record as a compact single line.
 fn print_request_record(rec: &serde_json::Value) {
+    println!("{}", format_request_record(rec));
+}
+
+/// Renders one request record as a compact single line.
+fn format_request_record(rec: &serde_json::Value) -> String {
     let ts = rec["ts_ms"].as_u64().unwrap_or(0) / 1000;
     let (h, m, sec) = ((ts / 3600) % 24, (ts / 60) % 60, ts % 60);
     let endpoint = rec["endpoint"].as_str().unwrap_or("?");
@@ -1890,7 +1948,7 @@ fn print_request_record(rec: &serde_json::Value) {
     if let Some(error) = error {
         line.push_str(&format!("  {}", truncate_str(error, 60)));
     }
-    println!("{}", line);
+    line
 }
 
 fn truncate_str(s: &str, max: usize) -> String {
@@ -2359,8 +2417,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             port,
             json,
             width,
+            verbose,
+            route,
         } => {
-            run_status(&host, port, json, width).await?;
+            run_status(&host, port, json, width, verbose, route).await?;
         },
         Commands::Reload { host, port, pid } => {
             run_reload(&host, port, pid).await?;
@@ -5674,7 +5734,7 @@ vm = [
             axum::serve(listener, router).await.unwrap();
         });
 
-        run_status("::1", port, true, None)
+        run_status("::1", port, true, None, 0, None)
             .await
             .expect("status must reach the IPv6-bound daemon");
     }
@@ -7344,5 +7404,206 @@ grp = [{ provider = "p1", model = "m-down" }, { provider = "p1", model = "m-up" 
         assert_eq!(*state.providers[0].consecutive_failures.read().await, 1);
         let health = state.providers[0].model_health.get("m1");
         assert_eq!(*health.consecutive_failures.read().await, 0);
+    }
+
+    // ---- tiered status rendering ----------------------------------------
+
+    fn sample_status() -> serde_json::Value {
+        serde_json::json!({
+            "version": "9.9.9",
+            "uptime_secs": 3725,
+            "total_requests": 42,
+            "health": {
+                "state": "degraded",
+                "problems": [
+                    {"scope":"route","name":"pool-docs","kind":"degraded","detail":"1 of 2 entries available"},
+                    {"scope":"provider","name":"claude-ext","kind":"down","detail":"aws/claude-sonnet-5-5 (open), retry in 20s"}
+                ]
+            },
+            "reload": {"last_error": null, "restart_warnings": []},
+            "routes": [
+                {"route":"pool-docs","policy":"priority","strategy":"priority: configured order, first healthy wins; failover on error",
+                 "targets":2,"available":1,"state":"degraded","requests":10,"successes":9,"failures":1,
+                 "tokens_input":100,"tokens_output":50,"latency_p50_ms":900,"latency_p95_ms":2000,"latency_p99_ms":3000,"ttft_p50_ms":700},
+                {"route":"pool-easy","policy":"cheapest","strategy":"cheapest: lowest cost_per_mtok first, latency breaks ties",
+                 "targets":1,"available":1,"state":"ok","requests":5,"successes":5,"failures":0,
+                 "tokens_input":10,"tokens_output":5,"latency_p50_ms":300,"latency_p95_ms":400,"latency_p99_ms":500,"ttft_p50_ms":200}
+            ],
+            "virtual_models": {
+                "pool-docs": [
+                    {"provider":"claude-ext","model":"aws/claude-sonnet-5-5","circuit":"Open (20s cooldown)","availability":"open","retry_in_secs":20,
+                     "api":"anthropic","priority":1,"requests":6,"successes":5,"tokens_input":60,"tokens_output":30,"ttft_p50_ms":800},
+                    {"provider":"claude-int","model":"aws/claude-sonnet-5-5","circuit":"Closed (Healthy)","availability":"healthy",
+                     "api":"anthropic","weight":3,"requests":4,"successes":4,"tokens_input":40,"tokens_output":20,"ttft_p50_ms":600}
+                ],
+                "pool-easy": [
+                    {"provider":"cb","model":"m","circuit":"Closed (Healthy)","availability":"healthy","api":"openai",
+                     "requests":5,"successes":5,"tokens_input":10,"tokens_output":5}
+                ]
+            },
+            "providers": [
+                {"name":"claude-ext","models":"aws/claude-sonnet-5-5","circuit":"Closed (Healthy)","failures":0,"rate_limited":false,
+                 "admin_disabled":false,"requests":6,"successes":5,"tokens_input":60,"tokens_output":30,"last_request":"Just now"}
+            ],
+            "recent_requests": [
+                {"ts_ms":1793788091000u64,"endpoint":"messages","route":"pool-docs","provider":"claude-int","status":200,"latency_ms":812,"attempts":2,"ttft_ms":700,"error":null}
+            ]
+        })
+    }
+
+    #[test]
+    fn test_status_summary_shows_problems_and_routes_only() {
+        let out = render_status(&sample_status(), Detail::Summary, None, 120);
+        assert!(out.contains("DEGRADED"), "got:\n{out}");
+        assert!(out.contains("1h 02m"), "uptime formatted: {out}");
+        let problems_at = out.find("pool-docs").unwrap();
+        let table_at = out.find("Routes").unwrap();
+        assert!(problems_at < table_at, "problems precede the table:\n{out}");
+        assert!(out.contains("claude-ext") && out.contains("retry in 20s"));
+        assert!(out.contains("pool-easy"));
+        // Summary does not include per-target or provider tables.
+        assert!(!out.contains("Providers (reachability"));
+        assert!(!out.contains("| Provider "));
+        // And it says how to get more.
+        assert!(out.contains("oxllm status -v"), "next-step hint: {out}");
+    }
+
+    #[test]
+    fn test_status_verbose_adds_targets_with_tier_and_state() {
+        let out = render_status(&sample_status(), Detail::Targets, None, 140);
+        assert!(out.contains("| Provider"), "targets table: {out}");
+        assert!(
+            out.contains("open 20s"),
+            "entry state with countdown: {out}"
+        );
+        assert!(out.contains("p1"), "priority shown: {out}");
+        assert!(out.contains("w3"), "weight shown: {out}");
+        assert!(out.contains("anthropic"));
+        assert!(
+            out.contains("cheapest: lowest cost_per_mtok"),
+            "strategy text: {out}"
+        );
+        assert!(!out.contains("Providers (reachability"));
+        assert!(out.contains("-vv"));
+    }
+
+    #[test]
+    fn test_status_very_verbose_adds_providers_and_recent_requests() {
+        let out = render_status(&sample_status(), Detail::Full, None, 160);
+        assert!(out.contains("Providers (reachability"), "got: {out}");
+        assert!(out.contains("Recent requests"), "got: {out}");
+        assert!(
+            out.contains("attempt 2"),
+            "retry visible in recent line: {out}"
+        );
+        assert!(out.contains("p99"));
+    }
+
+    #[test]
+    fn test_status_route_filter_narrows_everything() {
+        let out = render_status(&sample_status(), Detail::Targets, Some("pool-easy"), 140);
+        assert!(out.contains("pool-easy"));
+        assert!(!out.contains("claude-int"), "other route leaked: {out}");
+        let unknown = render_status(&sample_status(), Detail::Summary, Some("nope"), 140);
+        assert!(unknown.contains("No route named 'nope'"), "got: {unknown}");
+        assert!(
+            unknown.contains("pool-docs"),
+            "lists valid routes: {unknown}"
+        );
+    }
+
+    #[test]
+    fn test_status_tolerates_an_older_daemon_without_health() {
+        let old = serde_json::json!({
+            "uptime_secs": 5, "total_requests": 1, "providers": [], "virtual_models": {},
+            "routes": [{"route":"r","policy":"priority","requests":1,"successes":1,"failures":0}]
+        });
+        let out = render_status(&old, Detail::Summary, None, 120);
+        assert!(out.contains("older than v0.1.24"), "got: {out}");
+        assert!(out.contains("| r "), "route still listed: {out}");
+    }
+
+    #[test]
+    fn test_status_json_tiers_match_the_table_tiers() {
+        let s = sample_status();
+        let keys = |v: &serde_json::Value| -> Vec<String> {
+            let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+            k.sort();
+            k
+        };
+        let summary = status_json_at(&s, Detail::Summary, None);
+        assert!(keys(&summary).contains(&"health".to_string()));
+        assert!(!keys(&summary).contains(&"virtual_models".to_string()));
+        assert!(!keys(&summary).contains(&"providers".to_string()));
+        let targets = status_json_at(&s, Detail::Targets, None);
+        assert!(keys(&targets).contains(&"virtual_models".to_string()));
+        assert!(!keys(&targets).contains(&"providers".to_string()));
+        let full = status_json_at(&s, Detail::Full, None);
+        assert!(keys(&full).contains(&"providers".to_string()));
+        assert!(keys(&full).contains(&"recent_requests".to_string()));
+        // Route filter applies to both routes and targets.
+        let one = status_json_at(&s, Detail::Targets, Some("pool-easy"));
+        assert_eq!(one["routes"].as_array().unwrap().len(), 1);
+        assert_eq!(one["virtual_models"].as_object().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_fmt_duration_boundaries() {
+        assert_eq!(fmt_duration(0), "0s");
+        assert_eq!(fmt_duration(59), "59s");
+        assert_eq!(fmt_duration(60), "1m 00s");
+        assert_eq!(fmt_duration(3599), "59m 59s");
+        assert_eq!(fmt_duration(3600), "1h 00m");
+    }
+
+    // ---- /status contract from a live router ------------------------------
+
+    /// /status reports per-entry availability, the route strategy and a
+    /// problems list that names a model whose circuit is open.
+    #[tokio::test]
+    async fn test_status_endpoint_reports_health_strategy_and_problems() {
+        let addr = spawn_raw_recording_upstream(
+            vec![http_json("500 Internal Server Error", "{}")],
+            Default::default(),
+        )
+        .await;
+        let mut p = test_provider("flaky", addr, ApiFormat::Openai);
+        p.tuning.circuit_failure_threshold = Some(1);
+        let (_proxy, state) =
+            spawn_proxy_with_targets(vec![p], vec![target("flaky", "m1")], vec![]).await;
+        // Trip the model's circuit directly, then read /status through the real handler.
+        state.providers[0]
+            .model_health
+            .get("m1")
+            .circuit
+            .write()
+            .await
+            .clone_from(&CircuitState::Open {
+                until: Instant::now() + Duration::from_secs(30),
+            });
+        let status = routes::get_status(axum::extract::State((state.clone(), Instant::now())))
+            .await
+            .into_response();
+        let bytes = axum::body::to_bytes(status.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["health"]["state"], "down");
+        assert_eq!(v["routes"][0]["state"], "down");
+        assert_eq!(v["routes"][0]["available"], 0);
+        assert!(v["routes"][0]["strategy"]
+            .as_str()
+            .unwrap()
+            .starts_with("priority"));
+        let entry = &v["virtual_models"]["vm"][0];
+        assert_eq!(entry["availability"], "open");
+        assert_eq!(entry["api"], "openai");
+        let problems = v["health"]["problems"].as_array().unwrap();
+        assert!(problems
+            .iter()
+            .any(|p| p["kind"] == "down" && p["name"] == "vm"));
+        assert!(problems.iter().any(
+            |p| p["scope"] == "provider" && p["detail"].as_str().unwrap().contains("retry in")
+        ));
     }
 }

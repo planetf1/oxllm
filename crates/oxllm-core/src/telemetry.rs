@@ -14,6 +14,7 @@ use tracing::warn;
 pub enum TelemetryEvent {
     RecordTransaction {
         operation: String, // "chat" or "embeddings"
+        route: String,     // virtual model the client addressed
         provider: String,  // "groq", "sambanova", etc.
         model: String,
         input_tokens: u64,
@@ -125,6 +126,13 @@ impl TelemetryWorker {
                     .f64_histogram("llm_proxy.request.duration")
                     .with_description("Total transaction lifecycle duration")
                     .with_unit("ms")
+                    // Default OTel buckets stop at 10 s, so slow LLM calls land
+                    // in the +Inf overflow bucket, which some backends (otelite)
+                    // refuse to store. Extend to 10 minutes.
+                    .with_boundaries(vec![
+                        5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0,
+                        10_000.0, 30_000.0, 60_000.0, 120_000.0, 300_000.0, 600_000.0,
+                    ])
                     .build();
                 let tokens_consumed_counter = meter
                     .u64_counter("llm_proxy.tokens.consumed")
@@ -179,6 +187,7 @@ impl TelemetryWorker {
                 },
                 TelemetryEvent::RecordTransaction {
                     operation,
+                    route,
                     provider,
                     model,
                     input_tokens,
@@ -252,11 +261,16 @@ impl TelemetryWorker {
                     ));
                     attributes.push(KeyValue::new("proxy.attempts_required", attempts as i64));
 
+                    let terminal_failure = matches!(
+                        failure_reason.as_deref(),
+                        Some("all_providers_failed" | "no_available_provider" | "stream_failed")
+                    );
                     if let Some(reason) = failure_reason {
                         attributes.push(KeyValue::new("proxy.initial_failure_reason", reason));
                     }
 
                     attributes.push(KeyValue::new("proxy.request_id", request_id));
+                    attributes.push(KeyValue::new("proxy.route", route));
 
                     // Synthesize and explicitly end the span to flush to batch processor
                     let mut span = if let Some(ref cx) = parent_ctx {
@@ -265,6 +279,11 @@ impl TelemetryWorker {
                         tracer.build(span_builder)
                     };
                     span.set_attributes(attributes);
+                    if terminal_failure {
+                        span.set_status(opentelemetry::trace::Status::error(
+                            "request failed after all attempts",
+                        ));
+                    }
                     span.end_with_timestamp(std::time::SystemTime::now());
                 },
             }
