@@ -195,7 +195,7 @@ impl RoutingStrategy for AdaptivePriorityStrategy {
             *last_attempt = Some(now);
 
             // Handle Failures
-            if status_code == Some(429) {
+            if matches!(status_code, Some(429) | Some(529)) {
                 // Rate-limited: extract or apply default backoff
                 let cooldown = retry_after
                     .unwrap_or_else(|| Duration::from_secs(self.circuit.rate_limit_fallback_secs));
@@ -380,6 +380,7 @@ mod tests {
             models: vec!["gpt-4".to_string()],
             upstream_timeout_secs: None,
             cost_per_mtok: None,
+            api: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),

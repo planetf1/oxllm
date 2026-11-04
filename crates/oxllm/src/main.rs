@@ -268,6 +268,7 @@ fn build_app_state(config: Config, previous: Option<&AppState>) -> Result<AppSta
             models: p.models,
             upstream_timeout_secs: p.upstream_timeout_secs,
             cost_per_mtok: p.cost_per_mtok,
+            api: p.api,
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -468,7 +469,8 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// Rejects /v1/* requests when `server.api_keys` is non-empty and the
-/// `Authorization: Bearer <key>` header matches none of them. Empty list
+/// `Authorization: Bearer <key>` header (or `x-api-key` on /v1/messages)
+/// matches none of them. Empty list
 /// keeps the proxy open (loopback deployments). Admin routes stay
 /// localhost-only regardless.
 async fn require_api_key(
@@ -483,11 +485,19 @@ async fn require_api_key(
         return next.run(req).await;
     }
 
+    // Anthropic SDK clients send the key as `x-api-key`; accept it on the
+    // Messages routes alongside the usual Bearer token.
+    let is_messages = req.uri().path().starts_with("/v1/messages");
     let presented = req
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .or_else(|| {
+            is_messages
+                .then(|| req.headers().get("x-api-key").and_then(|v| v.to_str().ok()))
+                .flatten()
+        });
 
     let authorized = presented.is_some_and(|key| {
         api_keys
@@ -499,6 +509,13 @@ async fn require_api_key(
         next.run(req).await
     } else {
         warn!(target: "oxllm::security", "Rejected /v1 request with invalid or missing API key");
+        if is_messages {
+            return routes::anthropic_error_response(
+                "Missing or invalid API key",
+                "authentication_error",
+                StatusCode::UNAUTHORIZED,
+            );
+        }
         let body = serde_json::json!({
             "error": {
                 "message": "Missing or invalid API key",
@@ -910,6 +927,20 @@ async fn run_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         .route(
             "/v1/chat/completions",
             post(routes::create_chat_completions).layer(middleware::from_fn_with_state(
+                state_for_middleware.clone(),
+                require_api_key,
+            )),
+        )
+        .route(
+            "/v1/messages",
+            post(routes::create_messages).layer(middleware::from_fn_with_state(
+                state_for_middleware.clone(),
+                require_api_key,
+            )),
+        )
+        .route(
+            "/v1/messages/count_tokens",
+            post(routes::count_tokens).layer(middleware::from_fn_with_state(
                 state_for_middleware.clone(),
                 require_api_key,
             )),
@@ -2357,7 +2388,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod integration_tests {
     use super::*;
-    use oxllm_core::config::VirtualModelTarget;
+    use oxllm_core::config::{ApiFormat, VirtualModelTarget};
     use serde_json::Value;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -2415,6 +2446,7 @@ mod integration_tests {
             models: vec!["gpt-4-upstream".to_string()],
             upstream_timeout_secs: None,
             cost_per_mtok: None,
+            api: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -2435,6 +2467,7 @@ mod integration_tests {
             models: vec!["gpt-4-upstream".to_string()],
             upstream_timeout_secs: None,
             cost_per_mtok: None,
+            api: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -2557,6 +2590,7 @@ mod integration_tests {
             models: vec!["gpt-4-upstream".to_string()],
             upstream_timeout_secs: None,
             cost_per_mtok: None,
+            api: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -2734,6 +2768,7 @@ mod integration_tests {
             models: vec!["granite-4.1-3b-4bit".to_string()],
             upstream_timeout_secs: None,
             cost_per_mtok: None,
+            api: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -2943,6 +2978,7 @@ mod integration_tests {
             models: vec!["small".to_string()],
             upstream_timeout_secs: None,
             cost_per_mtok: None,
+            api: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -3101,6 +3137,7 @@ mod integration_tests {
             models: vec!["m".to_string()],
             upstream_timeout_secs: Some(2),
             cost_per_mtok: None,
+            api: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -3233,6 +3270,7 @@ mod integration_tests {
             models: vec!["m".to_string()],
             upstream_timeout_secs: None,
             cost_per_mtok: None,
+            api: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -3367,6 +3405,7 @@ mod integration_tests {
             models: vec!["model".into()],
             upstream_timeout_secs: None,
             cost_per_mtok: None,
+            api: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -3387,6 +3426,7 @@ mod integration_tests {
             models: vec!["model".into()],
             upstream_timeout_secs: None,
             cost_per_mtok: None,
+            api: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -3444,6 +3484,7 @@ mod integration_tests {
             models: vec!["model".into()],
             upstream_timeout_secs: None,
             cost_per_mtok: None,
+            api: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -3580,6 +3621,7 @@ mod integration_tests {
             models: vec!["model".into()],
             upstream_timeout_secs: None,
             cost_per_mtok: None,
+            api: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -3600,6 +3642,7 @@ mod integration_tests {
             models: vec!["model".into()],
             upstream_timeout_secs: None,
             cost_per_mtok: None,
+            api: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -3723,6 +3766,7 @@ mod integration_tests {
             models: vec!["model".into()],
             upstream_timeout_secs: None,
             cost_per_mtok: None,
+            api: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -3860,6 +3904,7 @@ mod integration_tests {
             models: vec!["model".into()],
             upstream_timeout_secs: None,
             cost_per_mtok: None,
+            api: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -3971,6 +4016,7 @@ mod integration_tests {
             models: vec!["real-model".into()],
             upstream_timeout_secs: None,
             cost_per_mtok: None,
+            api: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -4072,6 +4118,7 @@ mod integration_tests {
             models: vec!["model".into()],
             upstream_timeout_secs: None,
             cost_per_mtok: None,
+            api: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -4186,6 +4233,7 @@ mod integration_tests {
             models: vec!["model".into()],
             upstream_timeout_secs: None,
             cost_per_mtok: None,
+            api: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -4305,6 +4353,7 @@ mod integration_tests {
             models: vec!["model".into()],
             upstream_timeout_secs: None,
             cost_per_mtok: None,
+            api: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -5356,6 +5405,7 @@ vm = [
             models: vec!["m".to_string()],
             upstream_timeout_secs: None,
             cost_per_mtok: None,
+            api: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -5580,6 +5630,7 @@ vm = [
             models: vec!["m".to_string()],
             upstream_timeout_secs: None,
             cost_per_mtok: None,
+            api: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -5701,6 +5752,7 @@ vm = [
                 models: vec!["m".to_string()],
                 upstream_timeout_secs: None,
                 cost_per_mtok: None,
+                api: Default::default(),
                 circuit: Arc::new(RwLock::new(CircuitState::Closed)),
                 consecutive_failures: Arc::new(RwLock::new(0)),
                 rate_limited_until: Arc::new(RwLock::new(None)),
@@ -6061,5 +6113,638 @@ vm = [
             .collect();
         assert!(ids.contains(&"test"), "target vm must be listed: {:?}", ids);
         assert!(ids.contains(&"gpt-4o"), "alias must be listed: {:?}", ids);
+    }
+
+    // ---- Anthropic Messages API ------------------------------------------
+
+    /// Upstream that records each full raw request (request line, headers,
+    /// body) and answers connection N with `responses[N]` (last one repeats).
+    async fn spawn_raw_recording_upstream(
+        responses: Vec<String>,
+        recorded: Arc<tokio::sync::Mutex<Vec<String>>>,
+    ) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut idx = 0usize;
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let recorded = recorded.clone();
+                let response = responses[idx.min(responses.len() - 1)].clone();
+                idx += 1;
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    let mut expected: Option<usize> = None;
+                    loop {
+                        match stream.read(&mut tmp).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        }
+                        if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                            let len = head
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length:"))
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                                .unwrap_or(0);
+                            expected = Some(end + 4 + len);
+                        }
+                        if expected.is_some_and(|e| buf.len() >= e) {
+                            break;
+                        }
+                    }
+                    recorded
+                        .lock()
+                        .await
+                        .push(String::from_utf8_lossy(&buf).to_string());
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.flush().await;
+                });
+            }
+        });
+        addr
+    }
+
+    fn http_json(status_line: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            status_line,
+            body.len(),
+            body
+        )
+    }
+
+    fn test_provider(name: &str, addr: SocketAddr, api: ApiFormat) -> ProviderState {
+        ProviderState {
+            name: name.to_string(),
+            base_url: Url::parse(&format!("http://{}/v1/", addr)).unwrap(),
+            api_key: format!("key-{}", name),
+            models: vec!["m".to_string()],
+            upstream_timeout_secs: Some(2),
+            cost_per_mtok: None,
+            api,
+            circuit: Arc::new(RwLock::new(CircuitState::Closed)),
+            consecutive_failures: Arc::new(RwLock::new(0)),
+            rate_limited_until: Arc::new(RwLock::new(None)),
+            last_attempt_time: Arc::new(RwLock::new(None)),
+            probe_in_flight: Arc::new(AtomicBool::new(false)),
+            manual_disabled: AtomicBool::new(false),
+            requests: AtomicU64::new(0),
+            successes: AtomicU64::new(0),
+            tokens_input: AtomicU64::new(0),
+            tokens_output: AtomicU64::new(0),
+            model_stats: Arc::new(ModelStats::default()),
+        }
+    }
+
+    /// Serves the full public route set over one virtual model `vm` whose
+    /// targets are the given providers in order. Returns the proxy address
+    /// and the shared state.
+    async fn spawn_messages_proxy(
+        providers: Vec<ProviderState>,
+        api_keys: Vec<String>,
+    ) -> (SocketAddr, Arc<AppState>) {
+        let targets: Vec<VirtualModelTarget> = providers
+            .iter()
+            .map(|p| VirtualModelTarget {
+                provider: p.name.clone(),
+                model: format!("upstream-{}", p.name),
+                priority: None,
+                weight: None,
+            })
+            .collect();
+        let mut virtual_models = std::collections::HashMap::new();
+        virtual_models.insert("vm".to_string(), targets);
+        let app_state = Arc::new(AppState {
+            providers,
+            virtual_models,
+            aliases: Default::default(),
+            default_model: None,
+            circuit: CircuitConfig::default(),
+            server: test_server_config(),
+            reload_health: Default::default(),
+            request_log: Default::default(),
+            route_stats: Arc::new(ModelStats::default()),
+            policies: std::collections::HashMap::new(),
+            routing_calls: AtomicU64::new(0),
+            api_keys,
+            session_affinity: Arc::new(SessionAffinity::new(
+                std::time::Duration::from_secs(900),
+                1024,
+            )),
+            session_affinity_header: oxllm_core::state::DEFAULT_SESSION_HEADER.to_string(),
+            http_client: reqwest::Client::builder().build().unwrap(),
+            upstream_timeout_secs: 5,
+        });
+        let (ws, wr) = tokio::sync::watch::channel(app_state.clone());
+        let (ttx, _trx) = tokio::sync::mpsc::channel(1024);
+        let rs = ReloadableState {
+            app_state: wr,
+            telemetry: TelemetryClient::new(ttx),
+            start_time: Instant::now(),
+            reloader: Reloader {
+                sender: ws.clone(),
+                config_path: PathBuf::from("config.toml"),
+            },
+        };
+        let gate = || middleware::from_fn_with_state(rs.clone(), require_api_key);
+        let router = axum::Router::new()
+            .route(
+                "/v1/messages",
+                axum::routing::post(routes::create_messages).layer(gate()),
+            )
+            .route(
+                "/v1/messages/count_tokens",
+                axum::routing::post(routes::count_tokens).layer(gate()),
+            )
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(routes::create_chat_completions).layer(gate()),
+            )
+            .layer(middleware::from_fn(add_request_id))
+            .with_state(rs);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // Keep the watch sender alive for the server's lifetime.
+            let _ws = ws;
+            axum::serve(listener, router).await.unwrap();
+        });
+        (proxy_addr, app_state)
+    }
+
+    const MSG_OK: &str = r#"{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":100,"cache_creation_input_tokens":20}}"#;
+
+    fn messages_body() -> Value {
+        serde_json::json!({
+            "model": "vm",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hello"}]
+        })
+    }
+
+    #[tokio::test]
+    async fn test_messages_non_streaming_success() {
+        let rec = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let addr =
+            spawn_raw_recording_upstream(vec![http_json("200 OK", MSG_OK)], rec.clone()).await;
+        let (proxy, state) = spawn_messages_proxy(
+            vec![test_provider("a1", addr, ApiFormat::Anthropic)],
+            vec![],
+        )
+        .await;
+
+        let res = reqwest::Client::new()
+            .post(format!("http://{}/v1/messages", proxy))
+            .header("anthropic-beta", "prompt-caching-2024-07-31")
+            .json(&messages_body())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["id"], "msg_1");
+
+        let raw = rec.lock().await[0].to_ascii_lowercase();
+        assert!(raw.starts_with("post /v1/messages "), "got: {raw}");
+        assert!(raw.contains("x-api-key: key-a1"), "got: {raw}");
+        assert!(raw.contains("anthropic-version: 2023-06-01"), "got: {raw}");
+        assert!(
+            raw.contains("anthropic-beta: prompt-caching-2024-07-31"),
+            "got: {raw}"
+        );
+        assert!(!raw.contains("authorization:"), "got: {raw}");
+        assert!(raw.contains("\"model\":\"upstream-a1\""), "got: {raw}");
+
+        // Usage: input folds in cache reads and creations.
+        let p = &state.providers[0];
+        assert_eq!(
+            p.tokens_input.load(std::sync::atomic::Ordering::Relaxed),
+            130
+        );
+        assert_eq!(
+            p.tokens_output.load(std::sync::atomic::Ordering::Relaxed),
+            5
+        );
+        let snap = state.route_stats.snapshot("vm");
+        assert_eq!(snap.cached_tokens, 100);
+        assert_eq!(snap.successes, 1);
+    }
+
+    #[tokio::test]
+    async fn test_messages_forwards_client_anthropic_version() {
+        let rec = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let addr =
+            spawn_raw_recording_upstream(vec![http_json("200 OK", MSG_OK)], rec.clone()).await;
+        let (proxy, _s) = spawn_messages_proxy(
+            vec![test_provider("a1", addr, ApiFormat::Anthropic)],
+            vec![],
+        )
+        .await;
+        let res = reqwest::Client::new()
+            .post(format!("http://{}/v1/messages", proxy))
+            .header("anthropic-version", "2024-01-01")
+            .json(&messages_body())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let raw = rec.lock().await[0].to_ascii_lowercase();
+        assert!(raw.contains("anthropic-version: 2024-01-01"), "got: {raw}");
+        assert!(!raw.contains("2023-06-01"), "got: {raw}");
+    }
+
+    #[tokio::test]
+    async fn test_messages_streaming_success() {
+        let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":12,\"output_tokens\":1,\"cache_read_input_tokens\":40}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":9}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n{}",
+            sse
+        );
+        let rec = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let addr = spawn_raw_recording_upstream(vec![resp], rec).await;
+        let (proxy, state) = spawn_messages_proxy(
+            vec![test_provider("a1", addr, ApiFormat::Anthropic)],
+            vec![],
+        )
+        .await;
+
+        let mut body = messages_body();
+        body["stream"] = Value::Bool(true);
+        let res = reqwest::Client::new()
+            .post(format!("http://{}/v1/messages", proxy))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let text = res.text().await.unwrap();
+        assert_eq!(text, sse, "SSE must pass through byte-for-byte");
+
+        // Accounting runs after the stream closes.
+        let p = &state.providers[0];
+        for _ in 0..50 {
+            if p.successes.load(std::sync::atomic::Ordering::Relaxed) == 1
+                && p.tokens_output.load(std::sync::atomic::Ordering::Relaxed) == 9
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(p.successes.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(
+            p.tokens_input.load(std::sync::atomic::Ordering::Relaxed),
+            52
+        );
+        assert_eq!(
+            p.tokens_output.load(std::sync::atomic::Ordering::Relaxed),
+            9
+        );
+        assert_eq!(state.route_stats.snapshot("vm").cached_tokens, 40);
+    }
+
+    async fn failover_case(first_status: &str, extra_header: &str) {
+        let r1 = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let r2 = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let err = format!(
+            "HTTP/1.1 {}\r\n{}Content-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}",
+            first_status, extra_header
+        );
+        let a1 = spawn_raw_recording_upstream(vec![err], r1.clone()).await;
+        let a2 = spawn_raw_recording_upstream(vec![http_json("200 OK", MSG_OK)], r2.clone()).await;
+        let (proxy, state) = spawn_messages_proxy(
+            vec![
+                test_provider("a1", a1, ApiFormat::Anthropic),
+                test_provider("a2", a2, ApiFormat::Anthropic),
+            ],
+            vec![],
+        )
+        .await;
+        let res = reqwest::Client::new()
+            .post(format!("http://{}/v1/messages", proxy))
+            .json(&messages_body())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        // 429/529 cool the provider down at once; a plain 5xx is retried on
+        // the same provider until the breaker threshold, as on OpenAI routes.
+        assert!(!r1.lock().await.is_empty());
+        assert_eq!(r2.lock().await.len(), 1);
+        assert!(
+            *state.providers[0].consecutive_failures.read().await >= 1,
+            "failed provider must be penalised"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_messages_429_fails_over_and_honours_retry_after() {
+        failover_case("429 Too Many Requests", "Retry-After: 30\r\n").await;
+    }
+
+    #[tokio::test]
+    async fn test_messages_429_sets_retry_after_cooldown() {
+        let a1 = spawn_raw_recording_upstream(
+            vec![
+                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 30\r\nContent-Length: 0\r\n\r\n"
+                    .to_string(),
+            ],
+            Default::default(),
+        )
+        .await;
+        let a2 =
+            spawn_raw_recording_upstream(vec![http_json("200 OK", MSG_OK)], Default::default())
+                .await;
+        let (proxy, state) = spawn_messages_proxy(
+            vec![
+                test_provider("a1", a1, ApiFormat::Anthropic),
+                test_provider("a2", a2, ApiFormat::Anthropic),
+            ],
+            vec![],
+        )
+        .await;
+        let res = reqwest::Client::new()
+            .post(format!("http://{}/v1/messages", proxy))
+            .json(&messages_body())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let until = state.providers[0]
+            .rate_limited_until
+            .read()
+            .await
+            .expect("429 must set a rate-limit window");
+        let left = until.saturating_duration_since(Instant::now());
+        assert!(left > Duration::from_secs(20), "left: {:?}", left);
+    }
+
+    #[tokio::test]
+    async fn test_messages_529_fails_over() {
+        failover_case("529 Overloaded", "").await;
+    }
+
+    #[tokio::test]
+    async fn test_messages_500_fails_over() {
+        failover_case("500 Internal Server Error", "").await;
+    }
+
+    #[tokio::test]
+    async fn test_messages_401_not_failed_over() {
+        let r1 = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let r2 = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let err_body = r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#;
+        let a1 =
+            spawn_raw_recording_upstream(vec![http_json("401 Unauthorized", err_body)], r1.clone())
+                .await;
+        let a2 = spawn_raw_recording_upstream(vec![http_json("200 OK", MSG_OK)], r2.clone()).await;
+        let (proxy, state) = spawn_messages_proxy(
+            vec![
+                test_provider("a1", a1, ApiFormat::Anthropic),
+                test_provider("a2", a2, ApiFormat::Anthropic),
+            ],
+            vec![],
+        )
+        .await;
+        let res = reqwest::Client::new()
+            .post(format!("http://{}/v1/messages", proxy))
+            .json(&messages_body())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 401);
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["error"]["type"], "authentication_error");
+        assert!(r2.lock().await.is_empty(), "401 must not fail over");
+        assert_eq!(
+            *state.providers[0].consecutive_failures.read().await,
+            0,
+            "a client error must not count against provider health"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_messages_no_matching_candidate() {
+        let addr =
+            spawn_raw_recording_upstream(vec![http_json("200 OK", "{}")], Default::default()).await;
+        let (proxy, _s) =
+            spawn_messages_proxy(vec![test_provider("o1", addr, ApiFormat::Openai)], vec![]).await;
+        let res = reqwest::Client::new()
+            .post(format!("http://{}/v1/messages", proxy))
+            .json(&messages_body())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 400);
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("api = \"anthropic\""),
+            "got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_messages_all_providers_down_uses_anthropic_error_shape() {
+        let addr = spawn_raw_recording_upstream(
+            vec![http_json("529 Overloaded", "{}")],
+            Default::default(),
+        )
+        .await;
+        let (proxy, _s) = spawn_messages_proxy(
+            vec![test_provider("a1", addr, ApiFormat::Anthropic)],
+            vec![],
+        )
+        .await;
+        let res = reqwest::Client::new()
+            .post(format!("http://{}/v1/messages", proxy))
+            .json(&messages_body())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 502);
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "api_error");
+    }
+
+    #[tokio::test]
+    async fn test_mixed_virtual_model_routes_by_wire_format() {
+        let ro = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let ra = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let openai_ok = r#"{"choices":[{"message":{"role":"assistant","content":"x"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
+        // OpenAI provider first in order: the Messages route must skip it.
+        let o1 =
+            spawn_raw_recording_upstream(vec![http_json("200 OK", openai_ok)], ro.clone()).await;
+        let a1 = spawn_raw_recording_upstream(vec![http_json("200 OK", MSG_OK)], ra.clone()).await;
+        let (proxy, _s) = spawn_messages_proxy(
+            vec![
+                test_provider("o1", o1, ApiFormat::Openai),
+                test_provider("a1", a1, ApiFormat::Anthropic),
+            ],
+            vec![],
+        )
+        .await;
+        let client = reqwest::Client::new();
+
+        let res = client
+            .post(format!("http://{}/v1/messages", proxy))
+            .json(&messages_body())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        assert_eq!(ra.lock().await.len(), 1);
+        assert!(ro.lock().await.is_empty());
+
+        let res = client
+            .post(format!("http://{}/v1/chat/completions", proxy))
+            .json(&serde_json::json!({"model":"vm","messages":[{"role":"user","content":"x"}]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        assert_eq!(ro.lock().await.len(), 1);
+        assert_eq!(ra.lock().await.len(), 1, "chat must not reach anthropic");
+        let raw = ro.lock().await[0].to_ascii_lowercase();
+        assert!(raw.contains("authorization: bearer key-o1"), "got: {raw}");
+        assert!(!raw.contains("x-api-key"), "got: {raw}");
+    }
+
+    #[tokio::test]
+    async fn test_messages_inbound_x_api_key_auth() {
+        let rec = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let addr =
+            spawn_raw_recording_upstream(vec![http_json("200 OK", MSG_OK)], rec.clone()).await;
+        let (proxy, _s) = spawn_messages_proxy(
+            vec![test_provider("a1", addr, ApiFormat::Anthropic)],
+            vec!["sekrit".to_string()],
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let url = format!("http://{}/v1/messages", proxy);
+
+        let res = client
+            .post(&url)
+            .json(&messages_body())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 401);
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "authentication_error");
+
+        let res = client
+            .post(&url)
+            .header("x-api-key", "wrong")
+            .json(&messages_body())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 401);
+        assert!(rec.lock().await.is_empty());
+
+        let res = client
+            .post(&url)
+            .header("x-api-key", "sekrit")
+            .json(&messages_body())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+
+        // Bearer still works on /v1/messages.
+        let res = client
+            .post(&url)
+            .header("Authorization", "Bearer sekrit")
+            .json(&messages_body())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+
+        // x-api-key is not accepted on the OpenAI routes.
+        let res = client
+            .post(format!("http://{}/v1/chat/completions", proxy))
+            .header("x-api-key", "sekrit")
+            .json(&messages_body())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn test_count_tokens_routes_to_anthropic() {
+        let rec = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let addr = spawn_raw_recording_upstream(
+            vec![http_json("200 OK", r#"{"input_tokens":7}"#)],
+            rec.clone(),
+        )
+        .await;
+        let (proxy, _s) = spawn_messages_proxy(
+            vec![test_provider("a1", addr, ApiFormat::Anthropic)],
+            vec![],
+        )
+        .await;
+        let res = reqwest::Client::new()
+            .post(format!("http://{}/v1/messages/count_tokens", proxy))
+            .json(&messages_body())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["input_tokens"], 7);
+        let raw = rec.lock().await[0].to_ascii_lowercase();
+        assert!(
+            raw.starts_with("post /v1/messages/count_tokens "),
+            "got: {raw}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_messages_metadata_user_id_pins_session() {
+        let a1 =
+            spawn_raw_recording_upstream(vec![http_json("200 OK", MSG_OK)], Default::default())
+                .await;
+        let a2 =
+            spawn_raw_recording_upstream(vec![http_json("200 OK", MSG_OK)], Default::default())
+                .await;
+        let (proxy, state) = spawn_messages_proxy(
+            vec![
+                test_provider("a1", a1, ApiFormat::Anthropic),
+                test_provider("a2", a2, ApiFormat::Anthropic),
+            ],
+            vec![],
+        )
+        .await;
+        let mut body = messages_body();
+        body["metadata"] = serde_json::json!({"user_id": "sess-42"});
+        let res = reqwest::Client::new()
+            .post(format!("http://{}/v1/messages", proxy))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        assert_eq!(
+            state.session_affinity.pinned_provider("sess-42").as_deref(),
+            Some("a1")
+        );
     }
 }

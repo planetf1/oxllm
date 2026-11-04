@@ -1,4 +1,4 @@
-use crate::config::{ServerConfig, VirtualModelTarget};
+use crate::config::{ApiFormat, ServerConfig, VirtualModelTarget};
 use reqwest::Url;
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
@@ -176,6 +176,8 @@ pub struct ProviderState {
     pub upstream_timeout_secs: Option<u64>,
     /// Cost per 1M output tokens; `None` = free / unknown.
     pub cost_per_mtok: Option<f64>,
+    /// Wire format this provider speaks.
+    pub api: ApiFormat,
 
     // Protects volatile metrics without needing a write lock on the entire pool vector
     pub circuit: Arc<RwLock<CircuitState>>,
@@ -625,6 +627,17 @@ impl AppState {
     /// ones; with no priorities set anywhere this is exactly the
     /// configured array order. Weights ride along for the routing policies.
     pub fn resolve_candidates(&self, virtual_model: &str) -> Vec<RouteCandidate<'_>> {
+        self.resolve_candidates_for(virtual_model, None)
+    }
+
+    /// Like `resolve_candidates`, but when `api` is set keeps only providers
+    /// speaking that wire format, so one virtual model can mix OpenAI and
+    /// Anthropic providers without either route seeing the other's.
+    pub fn resolve_candidates_for(
+        &self,
+        virtual_model: &str,
+        api: Option<ApiFormat>,
+    ) -> Vec<RouteCandidate<'_>> {
         let targets = match self.virtual_models.get(virtual_model) {
             Some(t) => t,
             None => return Vec::new(),
@@ -633,6 +646,9 @@ impl AppState {
         let mut candidates: Vec<RouteCandidate> = Vec::new();
         for target in targets {
             if let Some(provider) = self.providers.iter().find(|p| p.name == target.provider) {
+                if api.is_some_and(|a| a != provider.api) {
+                    continue;
+                }
                 candidates.push(RouteCandidate {
                     provider,
                     model: target.model.clone(),
@@ -757,5 +773,97 @@ mod affinity_tests {
         aff.pin("s1", "a");
         aff.unpin("s1");
         assert_eq!(aff.pinned_provider("s1"), None);
+    }
+
+    fn provider_with_api(name: &str, api: ApiFormat) -> ProviderState {
+        ProviderState {
+            name: name.to_string(),
+            base_url: Url::parse("http://127.0.0.1:9/v1/").unwrap(),
+            api_key: "k".to_string(),
+            models: vec!["m".to_string()],
+            upstream_timeout_secs: None,
+            cost_per_mtok: None,
+            api,
+            circuit: Arc::new(RwLock::new(CircuitState::Closed)),
+            consecutive_failures: Arc::new(RwLock::new(0)),
+            rate_limited_until: Arc::new(RwLock::new(None)),
+            last_attempt_time: Arc::new(RwLock::new(None)),
+            probe_in_flight: Arc::new(AtomicBool::new(false)),
+            manual_disabled: AtomicBool::new(false),
+            requests: AtomicU64::new(0),
+            successes: AtomicU64::new(0),
+            tokens_input: AtomicU64::new(0),
+            tokens_output: AtomicU64::new(0),
+            model_stats: Arc::new(ModelStats::default()),
+        }
+    }
+
+    #[test]
+    fn test_resolve_candidates_for_filters_by_wire_format() {
+        let target = |p: &str| VirtualModelTarget {
+            provider: p.to_string(),
+            model: "m".to_string(),
+            priority: None,
+            weight: None,
+        };
+        let mut virtual_models = HashMap::new();
+        virtual_models.insert(
+            "vm".to_string(),
+            vec![target("o"), target("a1"), target("a2")],
+        );
+        let state = AppState {
+            providers: vec![
+                provider_with_api("o", ApiFormat::Openai),
+                provider_with_api("a1", ApiFormat::Anthropic),
+                provider_with_api("a2", ApiFormat::Anthropic),
+            ],
+            virtual_models,
+            aliases: HashMap::new(),
+            default_model: None,
+            circuit: CircuitConfig::default(),
+            route_stats: Arc::new(ModelStats::default()),
+            policies: HashMap::new(),
+            routing_calls: AtomicU64::new(0),
+            api_keys: Vec::new(),
+            session_affinity: Arc::new(SessionAffinity::new(
+                std::time::Duration::from_secs(900),
+                16,
+            )),
+            session_affinity_header: DEFAULT_SESSION_HEADER.to_string(),
+            http_client: reqwest::Client::new(),
+            upstream_timeout_secs: 5,
+            server: ServerConfig {
+                host: "127.0.0.1".to_string(),
+                port: 0,
+                otel_endpoint: String::new(),
+                upstream_timeout_secs: 5,
+                bind_family: "ipv4".to_string(),
+                api_keys: Vec::new(),
+                session_affinity_header: DEFAULT_SESSION_HEADER.to_string(),
+                session_affinity_ttl_secs: 900,
+                session_affinity_capacity: 16,
+                circuit_failure_threshold: 3,
+                circuit_base_cooldown_secs: 60,
+                rate_limit_fallback_secs: 30,
+                shutdown_timeout_secs: 30,
+                watch_config: false,
+                request_log_capacity: 0,
+                default_model: None,
+            },
+            reload_health: Default::default(),
+            request_log: Default::default(),
+        };
+        let names = |api: Option<ApiFormat>| -> Vec<String> {
+            state
+                .resolve_candidates_for("vm", api)
+                .iter()
+                .map(|c| c.provider.name.clone())
+                .collect()
+        };
+        assert_eq!(names(None), ["o", "a1", "a2"]);
+        assert_eq!(names(Some(ApiFormat::Openai)), ["o"]);
+        assert_eq!(names(Some(ApiFormat::Anthropic)), ["a1", "a2"]);
+        // The unfiltered entry point is unchanged.
+        assert_eq!(state.resolve_candidates("vm").len(), 3);
     }
 }

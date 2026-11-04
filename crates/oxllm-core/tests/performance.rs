@@ -18,6 +18,7 @@ async fn test_routing_loop_latency_performance() {
             models: vec!["model-a".to_string()],
             upstream_timeout_secs: None,
             cost_per_mtok: None,
+            api: Default::default(),
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),

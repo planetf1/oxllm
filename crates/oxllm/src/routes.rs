@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, warn};
 
+use oxllm_core::config::ApiFormat;
 use oxllm_core::router::{
     latency_band, order_by_cost, order_by_latency, rotate_within_band, weighted_lottery,
     AdaptivePriorityStrategy, LatencyCandidate, RoutingStrategy,
@@ -367,8 +368,8 @@ pub async fn tail_requests(
 /// EWMA TTFT in 20% bands (with periodic exploration), so the order only
 /// changes when one provider is meaningfully quicker.
 /// Extracts the routing session key for a request: the configured header
-/// first (default `x-session-id`), then the body's `prompt_cache_key` field.
-/// `None` means the request is keyless and follows policy ordering only.
+/// first (default `x-session-id`), then the body's `prompt_cache_key` field,
+/// then (Anthropic Messages bodies) `metadata.user_id`. `None` means the request is keyless and follows policy ordering only.
 fn session_key(app_state: &AppState, headers: &HeaderMap, payload: &Value) -> Option<String> {
     let from_header = (!app_state.session_affinity_header.is_empty())
         .then(|| {
@@ -379,13 +380,22 @@ fn session_key(app_state: &AppState, headers: &HeaderMap, payload: &Value) -> Op
                 .map(String::from)
         })
         .flatten();
-    from_header.or_else(|| {
-        payload
-            .get("prompt_cache_key")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(String::from)
-    })
+    from_header
+        .or_else(|| {
+            payload
+                .get("prompt_cache_key")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+        })
+        .or_else(|| {
+            payload
+                .get("metadata")
+                .and_then(|m| m.get("user_id"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+        })
 }
 
 /// Applies sticky affinity (when a session key is present and its pin is
@@ -518,6 +528,10 @@ struct EndpointSpec {
     failure_noun: &'static str,
     /// Whether `stream: true` requests forward as SSE.
     streaming: bool,
+    /// Wire format of this endpoint. Only providers with a matching `api`
+    /// are candidates; it also selects upstream auth headers, the error
+    /// body shape and usage parsing.
+    api: ApiFormat,
 }
 
 /// The shared proxy loop behind every public endpoint (issue #11): JSON
@@ -539,7 +553,8 @@ async fn proxy_request(
     let mut payload: Value = match serde_json::from_slice(&body) {
         Ok(p) => p,
         Err(e) => {
-            return json_error_response(
+            return error_response(
+                spec.api,
                 &format!("Invalid JSON payload: {}", e),
                 "invalid_request_error",
                 StatusCode::BAD_REQUEST,
@@ -550,7 +565,8 @@ async fn proxy_request(
     let requested_model = match payload.get("model").and_then(|m| m.as_str()) {
         Some(m) => m,
         None => {
-            return json_error_response(
+            return error_response(
+                spec.api,
                 "Missing required 'model' field",
                 "invalid_request_error",
                 StatusCode::BAD_REQUEST,
@@ -564,17 +580,29 @@ async fn proxy_request(
     let route_name = match app_state.resolve_route(requested_model) {
         Some(route) => route.to_string(),
         None => {
-            return json_error_response(
+            return error_response(
+                spec.api,
                 &format!("Invalid or unmapped virtual model: {}", requested_model),
                 "invalid_request_error",
                 StatusCode::BAD_REQUEST,
             )
         },
     };
-    let candidates = app_state.resolve_candidates(&route_name);
+    // Providers speaking another wire format are skipped, not errored on.
+    let candidates = app_state.resolve_candidates_for(&route_name, Some(spec.api));
     if candidates.is_empty() {
-        return json_error_response(
-            &format!("Invalid or unmapped virtual model: {}", requested_model),
+        let message = if app_state.resolve_candidates(&route_name).is_empty() {
+            format!("Invalid or unmapped virtual model: {}", requested_model)
+        } else {
+            format!(
+                "Virtual model '{}' has no provider configured with api = \"{}\" for this endpoint",
+                route_name,
+                spec.api.as_str()
+            )
+        };
+        return error_response(
+            spec.api,
+            &message,
             "invalid_request_error",
             StatusCode::BAD_REQUEST,
         );
@@ -655,8 +683,25 @@ async fn proxy_request(
                     .upstream_timeout_secs
                     .unwrap_or(app_state.upstream_timeout_secs),
             ))
-            .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {}", selected.api_key));
+            .header("Content-Type", "application/json");
+        req = match spec.api {
+            ApiFormat::Openai => {
+                req.header("Authorization", format!("Bearer {}", selected.api_key))
+            },
+            ApiFormat::Anthropic => {
+                let version = headers
+                    .get("anthropic-version")
+                    .cloned()
+                    .unwrap_or_else(|| HeaderValue::from_static(DEFAULT_ANTHROPIC_VERSION));
+                let mut r = req
+                    .header("x-api-key", selected.api_key.as_str())
+                    .header("anthropic-version", version);
+                if let Some(beta) = headers.get("anthropic-beta") {
+                    r = r.header("anthropic-beta", beta);
+                }
+                r
+            },
+        };
 
         // Propagate tracing headers if present
         if let Some(traceparent) = headers.get("traceparent") {
@@ -706,6 +751,7 @@ async fn proxy_request(
                         request_id.clone(),
                         start_time,
                         attempts,
+                        spec.api,
                     )
                     .into_response();
                 }
@@ -740,26 +786,12 @@ async fn proxy_request(
                     },
                 };
 
-                // Parse token counts from the upstream response. Field names
-                // differ by endpoint family: OpenAI-style prompt/completion
-                // tokens, or systemone's input/output tokens.
-                let (input_tokens, output_tokens) = serde_json::from_slice::<Value>(&res_body)
-                    .map(|v| {
-                        let usage = v.get("usage");
-                        let input = usage
-                            .and_then(|u| u.get("prompt_tokens").or_else(|| u.get("input_tokens")))
-                            .and_then(|t| t.as_u64())
-                            .unwrap_or(0);
-                        let output = usage
-                            .and_then(|u| {
-                                u.get("completion_tokens")
-                                    .or_else(|| u.get("output_tokens"))
-                            })
-                            .and_then(|t| t.as_u64())
-                            .unwrap_or(0);
-                        (input, output)
-                    })
-                    .unwrap_or((0, 0));
+                // Parse token counts from the upstream response; field names
+                // differ by wire format and endpoint family.
+                let usage = serde_json::from_slice::<Value>(&res_body)
+                    .map(|v| parse_usage(&v, spec.api))
+                    .unwrap_or_default();
+                let (input_tokens, output_tokens) = (usage.input, usage.output);
 
                 // Report Success feedback
                 let target_provider_state = app_state
@@ -813,6 +845,9 @@ async fn proxy_request(
                         // Non-streaming: first byte is indistinguishable from the
                         // whole response, so total latency is the TTFT sample.
                         counters.record_ttft(elapsed_ms * 1000);
+                        counters
+                            .cached_tokens
+                            .fetch_add(usage.cached, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
 
@@ -864,6 +899,44 @@ async fn proxy_request(
 
                 // Extract Retry-After before consuming the response body
                 let retry_after = extract_retry_after(res.headers());
+
+                // Anthropic client errors (auth, invalid_request, ...) are
+                // the caller's to see: another provider would not fix them,
+                // and they say nothing about this provider's health. Pass
+                // them through verbatim without failover or breaker penalty.
+                if spec.api == ApiFormat::Anthropic && is_passthrough_client_error(status_code) {
+                    let upstream_headers = res.headers().clone();
+                    let error_body = res.bytes().await.unwrap_or_default();
+                    if selected.is_probe {
+                        // Release the lock-free probe permit; the circuit
+                        // stays HalfOpen so the next request probes again.
+                        if let Some(p) =
+                            app_state.providers.iter().find(|p| p.name == selected.name)
+                        {
+                            p.probe_in_flight
+                                .store(false, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
+                    app_state.request_log.record(RequestRecord {
+                        ts_ms: unix_millis(),
+                        endpoint: spec.operation.to_string(),
+                        route: route_name.clone(),
+                        model: target_model.clone(),
+                        provider: selected.name.clone(),
+                        status: status_code,
+                        attempts,
+                        latency_ms: start_time.elapsed().as_millis() as u64,
+                        ttft_ms: None,
+                        streamed: false,
+                        error: Some(String::from_utf8_lossy(&error_body).to_string()),
+                        request_id: request_id.clone(),
+                    });
+                    let mut response = Response::new(Body::from(error_body));
+                    *response.status_mut() =
+                        StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_REQUEST);
+                    copy_response_headers(&upstream_headers, response.headers_mut());
+                    return response;
+                }
 
                 // Best-effort: read upstream error body for final 502 response
                 let error_body = match res.bytes().await {
@@ -970,7 +1043,7 @@ async fn proxy_request(
         error: Some(last_upstream_error),
         request_id: request_id.clone(),
     });
-    json_error_response(&message, "server_error", StatusCode::BAD_GATEWAY)
+    error_response(spec.api, &message, "server_error", StatusCode::BAD_GATEWAY)
 }
 
 const EMBEDDINGS_SPEC: EndpointSpec = EndpointSpec {
@@ -978,6 +1051,7 @@ const EMBEDDINGS_SPEC: EndpointSpec = EndpointSpec {
     operation: "embeddings",
     failure_noun: "embeddings",
     streaming: false,
+    api: ApiFormat::Openai,
 };
 
 /// POST /v1/embeddings
@@ -1006,6 +1080,7 @@ const SYSTEMONE_SPEC: EndpointSpec = EndpointSpec {
     operation: "systemone",
     failure_noun: "systemone",
     streaming: false,
+    api: ApiFormat::Openai,
 };
 
 /// POST /v1/systemone
@@ -1037,6 +1112,7 @@ const COMPLETIONS_SPEC: EndpointSpec = EndpointSpec {
     operation: "completions",
     failure_noun: "completions",
     streaming: true,
+    api: ApiFormat::Openai,
 };
 
 /// POST /v1/completions
@@ -1066,6 +1142,7 @@ const CHAT_SPEC: EndpointSpec = EndpointSpec {
     operation: "chat",
     failure_noun: "chat completions",
     streaming: true,
+    api: ApiFormat::Openai,
 };
 
 /// POST /v1/chat/completions
@@ -1080,6 +1157,64 @@ pub async fn create_chat_completions(
 ) -> impl IntoResponse {
     proxy_request(&CHAT_SPEC, app_state, telemetry, request_id, headers, body).await
 }
+const MESSAGES_SPEC: EndpointSpec = EndpointSpec {
+    path: "messages",
+    operation: "messages",
+    failure_noun: "messages",
+    streaming: true,
+    api: ApiFormat::Anthropic,
+};
+
+/// POST /v1/messages
+///
+/// Anthropic Messages API passthrough (no body translation) with SSE
+/// streaming, routed to `api = "anthropic"` providers only.
+pub async fn create_messages(
+    State((app_state, telemetry)): State<(Arc<AppState>, TelemetryClient)>,
+    Extension(request_id): Extension<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    proxy_request(
+        &MESSAGES_SPEC,
+        app_state,
+        telemetry,
+        request_id,
+        headers,
+        body,
+    )
+    .await
+}
+
+const COUNT_TOKENS_SPEC: EndpointSpec = EndpointSpec {
+    path: "messages/count_tokens",
+    operation: "count_tokens",
+    failure_noun: "count_tokens",
+    streaming: false,
+    api: ApiFormat::Anthropic,
+};
+
+/// POST /v1/messages/count_tokens
+///
+/// Anthropic token counting; same routing and failover as `/v1/messages`,
+/// response passed through verbatim.
+pub async fn count_tokens(
+    State((app_state, telemetry)): State<(Arc<AppState>, TelemetryClient)>,
+    Extension(request_id): Extension<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    proxy_request(
+        &COUNT_TOKENS_SPEC,
+        app_state,
+        telemetry,
+        request_id,
+        headers,
+        body,
+    )
+    .await
+}
+
 /// for telemetry: 0 = Healthy, 1 = Cooldown, 2 = Tripped.
 /// Forwards an upstream SSE body to the client chunk-by-chunk (never buffered),
 /// and defers circuit-breaker feedback until the stream ends so that a failure
@@ -1101,6 +1236,7 @@ fn stream_upstream_body(
     request_id: String,
     start_time: Instant,
     attempts: u32,
+    api: ApiFormat,
 ) -> Response {
     let duration = start_time.elapsed();
 
@@ -1110,10 +1246,14 @@ fn stream_upstream_body(
     tokio::spawn(async move {
         let mut reqwest_stream = res.bytes_stream();
         let mut stream_success = true;
+        let mut usage_scan = SseUsageScanner::default();
 
         while let Some(chunk_result) = reqwest_stream.next().await {
             match chunk_result {
                 Ok(chunk) => {
+                    if api == ApiFormat::Anthropic {
+                        usage_scan.feed(&chunk);
+                    }
                     if tx.send(Ok(chunk)).await.is_err() {
                         // Client disconnected
                         stream_success = false;
@@ -1154,6 +1294,30 @@ fn stream_upstream_body(
                     .successes
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
+            provider_state
+                .tokens_input
+                .fetch_add(usage_scan.usage.input, std::sync::atomic::Ordering::Relaxed);
+            provider_state.tokens_output.fetch_add(
+                usage_scan.usage.output,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            let model_counters = provider_state
+                .model_stats
+                .counters(&ModelStats::key(&provider_name, &model_name));
+            let route_counters = app_state.route_stats.counters(&route_name);
+            for counters in [&model_counters, &route_counters] {
+                counters
+                    .tokens_input
+                    .fetch_add(usage_scan.usage.input, std::sync::atomic::Ordering::Relaxed);
+                counters.tokens_output.fetch_add(
+                    usage_scan.usage.output,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                counters.cached_tokens.fetch_add(
+                    usage_scan.usage.cached,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
         }
 
         // Push Telemetry Metrics
@@ -1161,8 +1325,8 @@ fn stream_upstream_body(
             operation: operation.to_string(),
             provider: provider_name.clone(),
             model: model_name.clone(),
-            input_tokens: 0,
-            output_tokens: 0,
+            input_tokens: usage_scan.usage.input,
+            output_tokens: usage_scan.usage.output,
             duration,
             attempts,
             failure_reason: if stream_success {
@@ -1271,6 +1435,152 @@ fn extract_retry_after(headers: &HeaderMap) -> Option<Duration> {
     None
 }
 
+/// `anthropic-version` sent upstream when the client supplies none.
+const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
+
+/// Client errors that are returned to the caller as-is on Anthropic routes:
+/// 4xx except 408 (timeout) and 429 (rate limit), which fail over.
+fn is_passthrough_client_error(status: u16) -> bool {
+    (400..500).contains(&status) && status != 408 && status != 429
+}
+
+/// Token usage extracted from an upstream response.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Usage {
+    input: u64,
+    output: u64,
+    /// Prompt tokens served from the upstream cache.
+    cached: u64,
+}
+
+/// Reads token usage from a response body (or SSE event payload). OpenAI
+/// style reports `prompt_tokens`/`completion_tokens` (systemone uses
+/// `input_tokens`/`output_tokens`). Anthropic reports `input_tokens`
+/// excluding cache traffic, so cache reads and creations are added to the
+/// input total and the reads are also surfaced as `cached`.
+fn parse_usage(v: &Value, api: ApiFormat) -> Usage {
+    let usage = v.get("usage");
+    let field = |name: &str| -> u64 {
+        usage
+            .and_then(|u| u.get(name))
+            .and_then(|t| t.as_u64())
+            .unwrap_or(0)
+    };
+    match api {
+        ApiFormat::Openai => Usage {
+            input: usage
+                .and_then(|u| u.get("prompt_tokens").or_else(|| u.get("input_tokens")))
+                .and_then(|t| t.as_u64())
+                .unwrap_or(0),
+            output: usage
+                .and_then(|u| {
+                    u.get("completion_tokens")
+                        .or_else(|| u.get("output_tokens"))
+                })
+                .and_then(|t| t.as_u64())
+                .unwrap_or(0),
+            cached: 0,
+        },
+        ApiFormat::Anthropic => {
+            let cached = field("cache_read_input_tokens");
+            Usage {
+                input: field("input_tokens") + cached + field("cache_creation_input_tokens"),
+                output: field("output_tokens"),
+                cached,
+            }
+        },
+    }
+}
+
+/// Incremental scanner over an Anthropic SSE stream that picks usage out of
+/// `message_start` (input and cache tokens) and `message_delta` (cumulative
+/// output tokens) events while the bytes are forwarded untouched.
+#[derive(Default)]
+struct SseUsageScanner {
+    pending: Vec<u8>,
+    usage: Usage,
+}
+
+impl SseUsageScanner {
+    fn feed(&mut self, chunk: &[u8]) {
+        self.pending.extend_from_slice(chunk);
+        while let Some(pos) = self.pending.iter().position(|b| *b == b'\n') {
+            let line: Vec<u8> = self.pending.drain(..=pos).collect();
+            self.scan_line(&line);
+        }
+        // A line that never ends must not grow without bound.
+        if self.pending.len() > 1 << 20 {
+            self.pending.clear();
+        }
+    }
+
+    fn scan_line(&mut self, line: &[u8]) {
+        let Ok(text) = std::str::from_utf8(line) else {
+            return;
+        };
+        let Some(data) = text.trim_end().strip_prefix("data:") else {
+            return;
+        };
+        let Ok(event) = serde_json::from_str::<Value>(data.trim_start()) else {
+            return;
+        };
+        match event.get("type").and_then(|t| t.as_str()) {
+            Some("message_start") => {
+                if let Some(message) = event.get("message") {
+                    let start = parse_usage(message, ApiFormat::Anthropic);
+                    self.usage.input = start.input;
+                    self.usage.cached = start.cached;
+                    self.usage.output = start.output;
+                }
+            },
+            Some("message_delta") => {
+                let delta = parse_usage(&event, ApiFormat::Anthropic);
+                if delta.output > 0 {
+                    self.usage.output = delta.output;
+                }
+            },
+            _ => {},
+        }
+    }
+}
+
+/// Error response in the shape of the endpoint's wire format: OpenAI's
+/// `{"error": {...}}` or Anthropic's `{"type": "error", "error": {...}}`.
+fn error_response(api: ApiFormat, message: &str, error_type: &str, status: StatusCode) -> Response {
+    match api {
+        ApiFormat::Openai => json_error_response(message, error_type, status),
+        ApiFormat::Anthropic => anthropic_error_response(message, error_type, status),
+    }
+}
+
+/// Anthropic error body. OpenAI-flavoured type names map to Anthropic's
+/// (`server_error` -> `api_error`).
+pub(crate) fn anthropic_error_response(
+    message: &str,
+    error_type: &str,
+    status: StatusCode,
+) -> Response {
+    let error_type = match error_type {
+        "server_error" => "api_error",
+        other => other,
+    };
+    let body = serde_json::json!({
+        "type": "error",
+        "error": {"type": error_type, "message": message}
+    });
+    let bytes = match serde_json::to_vec(&body) {
+        Ok(b) => b,
+        Err(_) => return (status, message.to_string()).into_response(),
+    };
+    let mut response = Response::new(Body::from(bytes));
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response
+}
+
 /// Returns a structured JSON error response matching the OpenAI error format.
 fn json_error_response(message: &str, error_type: &str, status: StatusCode) -> Response {
     let body = serde_json::json!({
@@ -1365,5 +1675,83 @@ pub async fn admin_reset(
             StatusCode::NOT_FOUND,
             format!("Provider '{}' not found", name),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_usage_openai_shapes() {
+        let chat = serde_json::json!({"usage": {"prompt_tokens": 3, "completion_tokens": 4}});
+        assert_eq!(
+            parse_usage(&chat, ApiFormat::Openai),
+            Usage {
+                input: 3,
+                output: 4,
+                cached: 0
+            }
+        );
+        let systemone = serde_json::json!({"usage": {"input_tokens": 5, "output_tokens": 6}});
+        let u = parse_usage(&systemone, ApiFormat::Openai);
+        assert_eq!((u.input, u.output), (5, 6));
+        assert_eq!(
+            parse_usage(&serde_json::json!({}), ApiFormat::Openai),
+            Usage::default()
+        );
+    }
+
+    #[test]
+    fn test_parse_usage_anthropic_folds_cache_into_input() {
+        let v = serde_json::json!({"usage": {
+            "input_tokens": 10, "output_tokens": 5,
+            "cache_read_input_tokens": 100, "cache_creation_input_tokens": 20
+        }});
+        assert_eq!(
+            parse_usage(&v, ApiFormat::Anthropic),
+            Usage {
+                input: 130,
+                output: 5,
+                cached: 100
+            }
+        );
+    }
+
+    #[test]
+    fn test_sse_scanner_handles_events_split_across_chunks() {
+        let mut scan = SseUsageScanner::default();
+        let stream = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":7,\"output_tokens\":1}}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42}}\n\n";
+        // Feed in awkward 5-byte slices.
+        for piece in stream.as_bytes().chunks(5) {
+            scan.feed(piece);
+        }
+        assert_eq!(scan.usage.input, 7);
+        assert_eq!(scan.usage.output, 42);
+    }
+
+    #[test]
+    fn test_passthrough_client_errors_exclude_retryable_4xx() {
+        for ok in [400, 401, 403, 404, 413, 422] {
+            assert!(is_passthrough_client_error(ok), "{ok}");
+        }
+        for retry in [408, 429, 500, 502, 529] {
+            assert!(!is_passthrough_client_error(retry), "{retry}");
+        }
+    }
+
+    #[test]
+    fn test_anthropic_error_shape() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let res = anthropic_error_response("boom", "server_error", StatusCode::BAD_GATEWAY);
+            let bytes = axum::body::to_bytes(res.into_body(), 4096).await.unwrap();
+            let v: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(v["type"], "error");
+            assert_eq!(v["error"]["type"], "api_error");
+            assert_eq!(v["error"]["message"], "boom");
+        });
     }
 }

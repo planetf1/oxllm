@@ -64,6 +64,29 @@ pub struct ServerConfig {
     pub default_model: Option<String>,
 }
 
+/// Wire format a provider speaks. Requests only route to providers whose
+/// format matches the inbound endpoint: the OpenAI routes use `openai`,
+/// `/v1/messages` uses `anthropic`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ApiFormat {
+    /// OpenAI-style (`Authorization: Bearer`, `chat/completions`, ...).
+    #[default]
+    Openai,
+    /// Anthropic Messages (`x-api-key`, `anthropic-version`, `messages`).
+    Anthropic,
+}
+
+impl ApiFormat {
+    /// The config-file spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ApiFormat::Openai => "openai",
+            ApiFormat::Anthropic => "anthropic",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub name: String,
@@ -80,6 +103,11 @@ pub struct ProviderConfig {
     /// providers are treated as free.
     #[serde(default)]
     pub cost_per_mtok: Option<f64>,
+    /// Wire format the upstream speaks (`"openai"` default, or
+    /// `"anthropic"`). Selects the upstream path and auth headers, and which
+    /// inbound routes may use this provider.
+    #[serde(default)]
+    pub api: ApiFormat,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -451,5 +479,64 @@ vm = [{ provider = "p", model = "m" }]
         assert_eq!(server.circuit_base_cooldown_secs, 60);
         assert_eq!(server.rate_limit_fallback_secs, 30);
         assert_eq!(server.default_model, None);
+    }
+
+    #[test]
+    fn test_provider_api_defaults_to_openai() {
+        let config = minimal_config();
+        assert_eq!(config.providers[0].api, ApiFormat::Openai);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn test_provider_api_anthropic_parses() {
+        let config: Config = toml::from_str(
+            r#"
+[server]
+host = "127.0.0.1"
+port = 8080
+otel_endpoint = "http://127.0.0.1:4318"
+
+[[providers]]
+name = "claude"
+enabled = true
+base_url = "http://127.0.0.1:9/v1/"
+api_key = "k"
+models = ["m"]
+api = "anthropic"
+
+[virtual_models]
+vm = [{ provider = "claude", model = "m" }]
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.providers[0].api, ApiFormat::Anthropic);
+        assert_eq!(config.providers[0].api.as_str(), "anthropic");
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn test_provider_api_rejects_unknown_value() {
+        let err = toml::from_str::<Config>(
+            r#"
+[server]
+host = "127.0.0.1"
+port = 8080
+otel_endpoint = "http://127.0.0.1:4318"
+
+[[providers]]
+name = "p"
+enabled = true
+base_url = "http://127.0.0.1:9/v1/"
+api_key = "k"
+models = ["m"]
+api = "gemini"
+
+[virtual_models]
+vm = [{ provider = "p", model = "m" }]
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("gemini"), "got: {}", err);
     }
 }
