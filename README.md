@@ -21,6 +21,7 @@ Built to operate entirely in memory with zero local disk persistence, `oxllm` is
 * **Routing Policies**: Per-virtual-model `priority` (configuration order), `fastest` (lowest measured time-to-first-byte), or `cheapest` (lowest configured cost) selection among healthy candidates.
 * **Session Affinity**: Requests carrying a session key stay on one provider while it is healthy, keeping upstream prompt-prefix caches warm. Bounded LRU, idle TTL, automatic break-and-re-pin on failure.
 * **Optional Inbound Auth**: `server.api_keys` gates the public `/v1/*` routes behind constant-time `Authorization: Bearer` checks. Admin routes are always localhost-only.
+* **Anthropic Messages API**: `POST /v1/messages` (SSE streaming) and `/v1/messages/count_tokens` pass through to providers marked `api = "anthropic"`, with the same circuit breaking, failover, and session affinity as the OpenAI routes. See [Anthropic Messages API](#-anthropic-messages-api).
 * **Raw Completions Route**: `POST /v1/completions` (with SSE streaming) for fill-in-the-middle clients such as editor autocomplete.
 * **Hot Config Reloading**: the daemon watches `config.toml` and hot-reloads on change (invalid edits are rejected, the old config keeps serving). Also available on demand via `POST /reload` or `SIGHUP` — hot-swaps the provider pool via `tokio::sync::watch` without dropping connections, preserving circuit state, counters, and session pins for providers that keep their name.
 * **Model Aliases & Default Route**: `[aliases]` maps client-facing names (`gpt-4o = "smart"`) onto virtual models, and `server.default_model` routes unknown names instead of 400 — point unmodified OpenAI clients straight at it.
@@ -55,6 +56,88 @@ Leaving it empty is appropriate for loopback-only deployments. Administrative
 routes (`/status`, `/reload`, `/health`, `/admin/*`) are localhost-restricted
 regardless of this setting, and a request rejected for a bad key never reaches an
 upstream provider.
+
+## 🧠 Anthropic Messages API
+
+Clients that speak the Anthropic wire format (the Anthropic SDKs, `pi`, Claude
+Code) can use `POST /v1/messages` and `POST /v1/messages/count_tokens`. Requests
+are forwarded unchanged apart from the `model` rewrite, so the upstream must
+speak Anthropic natively (Anthropic itself, or a LiteLLM proxy exposing
+`/v1/messages`).
+
+Mark such providers with `api = "anthropic"` (default `"openai"`, so existing
+configs are unaffected). A request only ever reaches providers whose `api`
+matches its route; non-matching targets in a virtual model are skipped, so one
+virtual model can hold both kinds.
+
+```toml
+[[providers]]
+name = "anthropic-direct"
+enabled = true
+base_url = "https://api.anthropic.com/v1/"   # keep the trailing slash
+api_key = "${ANTHROPIC_API_KEY}"
+models = ["claude-sonnet-5-5"]
+api = "anthropic"
+
+[[providers]]
+name = "litellm-claude"
+enabled = true
+base_url = "https://litellm.example.com/v1/"
+api_key = "${LITELLM_KEY}"
+models = ["claude-sonnet-5-5"]
+api = "anthropic"
+
+[virtual_models]
+claude = [
+  { provider = "anthropic-direct", model = "claude-sonnet-5-5" },
+  { provider = "litellm-claude", model = "claude-sonnet-5-5" },
+]
+```
+
+```bash
+curl http://127.0.0.1:8080/v1/messages \
+  -H "x-api-key: $OXLLM_CLIENT_KEY" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "content-type: application/json" \
+  -d '{"model": "claude", "max_tokens": 256, "messages": [{"role": "user", "content": "Hello"}]}'
+```
+
+```python
+import anthropic
+
+client = anthropic.Anthropic(base_url="http://127.0.0.1:8080", api_key="unused-if-no-api_keys")
+msg = client.messages.create(
+    model="claude", max_tokens=256, messages=[{"role": "user", "content": "Hello"}]
+)
+```
+
+Behaviour specific to this route:
+
+* **Upstream auth**: `x-api-key: <provider api_key>`. `anthropic-version` is
+  forwarded from the client (default `2023-06-01`); `anthropic-beta` is forwarded
+  when present.
+* **Inbound auth**: with `server.api_keys` set, `/v1/messages*` accepts the key
+  as `x-api-key` or `Authorization: Bearer` (constant-time compare). The OpenAI
+  routes still take Bearer only.
+* **Failover**: 429 and 529 (`overloaded_error`) put the provider on cooldown
+  (honouring `retry-after`); 5xx and connection errors count towards the circuit
+  threshold; all fail over to the next candidate. Other 4xx (auth,
+  `invalid_request_error`) are returned to the caller untouched, with no failover
+  and no health penalty.
+* **Errors oxllm generates** (unknown model, no `anthropic` candidate, all
+  providers down) use the Anthropic shape
+  `{"type":"error","error":{"type":...,"message":...}}`.
+* **Streaming**: SSE passes through byte-for-byte. A failure mid-stream counts
+  against the provider when the stream ends; there is no hot-swap.
+* **Usage**: `/status` and `oxllm tail` read `usage` from the response (or from
+  `message_start`/`message_delta` events when streaming). Input tokens include
+  `cache_read_input_tokens` and `cache_creation_input_tokens`; cache reads also
+  feed the cached-token counter.
+* **Session affinity**: `x-session-id` as usual, falling back to
+  `metadata.user_id` from the body.
+
+OpenAI-to-Anthropic body translation is not implemented; it is a possible
+follow-up.
 
 ## 🌐 CORS Support
 

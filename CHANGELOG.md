@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Anthropic Messages API**: `POST /v1/messages` (SSE streaming) and
+  `POST /v1/messages/count_tokens`, forwarded verbatim (apart from the `model`
+  rewrite) to providers configured with the new `api = "anthropic"` field
+  (default `"openai"`, so existing configs are unchanged). Upstream auth uses
+  `x-api-key` with `anthropic-version` (default `2023-06-01`) and
+  `anthropic-beta` forwarded. Requests only reach providers of the matching
+  wire format, so one virtual model can mix both. 429 and 529 trigger a
+  rate-limit cooldown honouring `retry-after`; 5xx fail over; other 4xx return
+  to the caller untouched. Errors oxllm generates use the Anthropic error
+  shape. Inbound `server.api_keys` are accepted via `x-api-key` on these
+  routes, and `metadata.user_id` is a session-affinity fallback. Usage stats
+  read Anthropic `usage` (cache tokens included), streamed or not.
+
 ## [0.1.24] - 2026-11-03
 
 ### Added
