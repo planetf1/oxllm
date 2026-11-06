@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.27] - 2026-11-06
+
 ### Fixed
 - **Apple Silicon release binaries build again**: GitHub retired the
   `macos-14` arm64 runner image, which cancelled the aarch64-apple-darwin
