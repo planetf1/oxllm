@@ -11,3 +11,7 @@ publish-jobs = ["homebrew"]
 pr-run-mode = "plan"
 install-updater = false
 allow-dirty = ["ci"]
+
+[dist.github-custom-runners]
+# GitHub retired the macos-14 arm64 image (2026-11: "configuration macos-14-arm64-us-default is not supported").
+aarch64-apple-darwin = "macos-15"

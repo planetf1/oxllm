@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Apple Silicon release binaries build again**: GitHub retired the
+  `macos-14` arm64 runner image, which cancelled the aarch64-apple-darwin
+  build and left v0.1.26 without GitHub release binaries or a Homebrew update
+  (it is on crates.io). That target now builds on `macos-15`, so this release
+  ships the v0.1.26 features with all four binaries and the Homebrew formula.
+
 ## [0.1.26] - 2026-11-06
 
 ### Added
