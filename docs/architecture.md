@@ -53,6 +53,7 @@
 9. `POST /admin/providers/{name}/online` – Re-enable a manually disabled provider. Localhost-restricted.
 10. `POST /admin/providers/{name}/reset` – Reset a provider's circuit-breaker state and failure counters. Localhost-restricted.
 11. `POST /v1/messages` and `POST /v1/messages/count_tokens` – Anthropic Messages API passthrough (SSE streaming for `/v1/messages`). See below.
+12. `/v1/responses` (create, `compact`, `input_tokens`, `{id}`, `{id}/input_items`, `{id}/cancel`) and `/v1/conversations` (create, `{id}`, `{id}/items`, `{id}/items/{item_id}`) – OpenAI Responses and Conversations API passthrough with provider-pinned state. See §6.
 
 **Wire formats.** Every provider has an `api` value (`openai`, the default, or `anthropic`). Each `EndpointSpec` in `routes.rs` carries the format it speaks, and `proxy_request` resolves candidates with `AppState::resolve_candidates_for`, which skips providers of the other format, so a virtual model may mix both. The format also selects the upstream auth headers (`Authorization: Bearer` vs `x-api-key` + `anthropic-version`/`anthropic-beta`), the shape of errors oxllm itself generates, and usage parsing (including `cache_read_input_tokens`/`cache_creation_input_tokens` and SSE `message_start`/`message_delta` events). The circuit breaker is format-agnostic: 429 triggers a rate-limit cooldown (honouring `retry-after`); 5xx (including 529), and transport errors are retried on the same provider until the failure threshold opens the circuit, and on Anthropic routes other 4xx are returned to the caller without failover or health penalty. An upstream that times out opens its circuit immediately: a hang costs every caller a full timeout, so waiting for the failure threshold would multiply that cost. Each (provider, model) pool entry is tried at most once per request, so a provider listed twice with different models falls back from its first entry to its second. Bodies are forwarded verbatim apart from the `model` rewrite; OpenAI-to-Anthropic translation is a possible follow-up.
 
@@ -129,6 +130,8 @@ api_keys = []            # Non-empty gates /v1/* behind Authorization: Bearer <k
 # session_affinity_header = "x-session-id"  # Session key source ("" disables)
 # session_affinity_ttl_secs = 900           # Idle pin lifetime
 # session_affinity_capacity = 1024          # Max concurrent session pins (LRU)
+# response_affinity_ttl_secs = 2592000      # Responses API id -> provider pin lifetime (30 days)
+# response_affinity_capacity = 4096         # Max tracked Responses API ids (LRU)
 
 [[providers]]
 name = "google-ai-studio"
@@ -228,9 +231,39 @@ Every routed transaction generates an OpenTelemetry Span containing the official
 
 ---
 
-## 5. Execution & Lifecycle Management
+## 6. Stateful Conversation APIs
 
-### 5.1. Command Line Interface (CLI)
+### 6.1. Current design: provider-pinned passthrough
+
+The OpenAI Responses and Conversations APIs hold conversation state upstream (`previous_response_id`, `conversation`, conversation objects and their items). That state exists only on the provider that created it, which conflicts with failover. oxllm keeps itself stateless and treats those ids as hard routing constraints:
+
+* `EndpointSpec::stateful` marks the generation-style routes (`responses`, `responses/compact`, `responses/input_tokens`, `conversations` create). On success, `proxy_request` records `id` and `conversation.id` from the body (non-streaming) or from the `response.created` SSE event (streaming, via `SseUsageScanner`) in `AppState::response_affinity`, a separate `SessionAffinity` table with a 30-day TTL and 4096-entry LRU cap. It survives hot reloads but not restarts.
+* `EndpointSpec::model` (`ModelField`) covers bodies without a required `model`: `Optional` for compact/input_tokens, `Absent` for conversation create, where the route comes from the `x-oxllm-model` header or `server.default_model` and the body is never rewritten.
+* A request referencing a recorded id has its candidate list cut to the owning provider before the failover loop runs. It still gets the circuit-breaker checks, but exhausting that one provider returns 502; it never moves elsewhere.
+* An id with no record triggers `discover_state_owner`: a `GET /{responses|conversations}/{id}` against each candidate provider (skipping offline ones and those with an open provider circuit, with no circuit feedback), pinning the first 2xx. This rebuilds the table lazily after a restart, so long-lived conversations survive one. Each lookup costs at most one round trip per provider, and only on the first request naming an unknown id.
+* Sub-resource calls (`forward_to_state_owner`) bypass the pool loop entirely and go to the owner, with ids and item ids restricted to `[A-Za-z0-9_-]` before being joined onto the upstream URL. Deleting the object itself drops its record.
+
+Session pins (§3.2) are soft hints for cache warmth; response pins are hard because an id is meaningless anywhere else. The two tables are kept separate so session churn cannot evict a conversation.
+
+### 6.2. Future option: proxy-owned state
+
+A possible later change is for oxllm to own the conversation history, so stateful requests regain failover. Notes for whoever picks this up:
+
+* **Mechanism.** Store each request's input items and the response's output items keyed by the returned id (or an oxllm-minted id). On a follow-up, expand `previous_response_id` into the full item list and send a stateless request (`store: false`) to any provider in the pool. The client-facing id must then be oxllm's, not the upstream's, and sub-resource endpoints are served from the local store.
+* **Storage.** Needs durable storage with retention and garbage collection. `rusqlite` pulls in C (a problem for the musl/OpenWrt target); `redb` is pure Rust. Flash-backed edge devices also need write-volume limits.
+* **Isolation.** Stored conversations must be scoped to the inbound API key so one client cannot read or continue another's. With `server.api_keys` empty this has no meaningful boundary.
+* **Semantics to replicate.** Output item types (messages, reasoning items including encrypted reasoning, function calls and outputs), `instructions` not carrying over between turns, `truncation`, `store`, `background` responses and cancellation, and the Conversations API's long-lived objects.
+* **Translation.** To fail over to providers that only speak chat completions or Anthropic Messages, Responses items need translating to those formats and back. oxllm forwards bodies verbatim today; this would be its first body translation and the largest single piece of work.
+* **Hard limits.** Hosted tools (`file_search`, `code_interpreter`, `web_search`, vector stores, uploaded `file_id`s) execute on, and reference objects held by, one vendor. Those requests stay pinned whatever the design.
+* **Cost.** It turns a stateless edge proxy into a stateful service that holds sensitive user data. Worth doing only if clients need failover and cannot resend history themselves; for most clients `store: false` with full history is the simpler answer and already works.
+
+The OpenAI Assistants API (`/assistants`, `/threads`, runs) is out of scope for both designs: OpenAI shut it down on 2026-08-26, with Responses and Conversations as its replacement.
+
+Anthropic's equivalent, the Managed Agents sessions API (`/v1/sessions`, beta), is not proxied either. It is a server-hosted agent runtime (sessions bound to agents and environments, event streams, tool execution in a managed sandbox) rather than a model API, so a routing proxy has little to add. If needed, it fits the same provider-pinned pattern: record session ids from `POST /v1/sessions`, then pin `/v1/sessions/{id}/**` to the owner.
+
+## 7. Execution & Lifecycle Management
+
+### 7.1. Command Line Interface (CLI)
 The binary supports clean POSIX subcommands for daemon management and operational debugging:
 * `oxllm serve --config /path/to/config.toml` (Starts the proxy. Use `-v` for per-request routing info, `-vv` for full trace.)
 * `oxllm validate --config /path/to/config.toml` (Parses configuration syntax, resolves environment variables, checks upstream network paths, then exits)
@@ -238,15 +271,15 @@ The binary supports clean POSIX subcommands for daemon management and operationa
 * `oxllm stop` (Gracefully stops the daemon via SIGTERM — drains in-flight SSE streams before exiting)
 * `oxllm reload` (Asks the running daemon to reload via `POST /reload` on `-p PORT` (default 8080); prints the daemon's error and exits non-zero if the config is rejected or no daemon is running. `--pid <pid>` signals a chosen process with SIGHUP instead)
 
-### 5.2. Admin Route Protection
+### 7.2. Admin Route Protection
 To prevent external network actors from auditing provider credentials or configurations, all administrative endpoints (like `/status`, `/health`, `/reload`, `/admin/tail`, and `/admin/providers/*`) are **localhost-restricted**. `/admin/tail` streams recent request records (metadata only) over SSE for `oxllm tail`. The `localhost_only` middleware accepts both IPv4 loopback (`127.0.0.1`) and IPv6-mapped IPv4 addresses (e.g., `::ffff:127.0.0.1`, added in v0.1.8). External callers receive an immediate `403 Forbidden`.
 
-### 5.3. Cross-Origin Resource Sharing (CORS)
+### 7.3. Cross-Origin Resource Sharing (CORS)
 All public endpoints (`/v1/chat/completions`, `/v1/embeddings`, `/v1/models`) return
 CORS headers allowing cross-origin requests from any origin. This enables browser-based
 OpenAI SDKs (JavaScript, Vercel AI SDK) to call the proxy directly.
 
-### 5.4. Daemon Configuration (Service Mode)
+### 7.4. Daemon Configuration (Service Mode)
 
 `oxllm install` automates this as a **user-level** service (launchd agent at
 `~/Library/LaunchAgents/org.oxllm.proxy.plist` on macOS, systemd user unit at

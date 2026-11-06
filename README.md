@@ -143,6 +143,55 @@ Behaviour specific to this route:
 OpenAI-to-Anthropic body translation is not implemented; it is a possible
 follow-up.
 
+## 🧵 OpenAI Responses and Conversations APIs (stateful)
+
+The full OpenAI Responses and Conversations surface is proxied to
+`api = "openai"` providers:
+
+* `POST /v1/responses` (SSE streaming supported), `POST /v1/responses/compact`,
+  `POST /v1/responses/input_tokens`
+* `GET`/`DELETE /v1/responses/{id}`, `GET /v1/responses/{id}/input_items`,
+  `POST /v1/responses/{id}/cancel`
+* `POST /v1/conversations`, `GET`/`POST`/`DELETE /v1/conversations/{id}`
+* `GET`/`POST /v1/conversations/{id}/items`,
+  `GET`/`DELETE /v1/conversations/{id}/items/{item_id}`
+
+These APIs keep conversation state upstream: a follow-up sends
+`previous_response_id` (or `conversation`) instead of resending the history.
+Only the provider that created that id can resolve it, so oxllm records which
+provider returned each response `id`, `conversation.id` and conversation `id`,
+and sends everything that names one of those ids to that provider.
+
+* **New state** (a response with no `previous_response_id`/`conversation`, or
+  a new conversation) routes and fails over like chat completions.
+* **Follow-ups naming a known id** go only to the provider holding it. If that
+  provider is down, the request fails with 502. **There is no failover**: no
+  other provider could continue the conversation.
+* **Ids oxllm has no record of** (after a restart, created through another
+  proxy, or evicted) are looked up: oxllm asks each of the route's OpenAI
+  providers for the object (`GET /responses/{id}` or `/conversations/{id}`)
+  and pins the first that has it. If none does, a generation routes by policy
+  and the upstream's own error comes back; a sub-resource call gets 404.
+* **Upstream 4xx** (other than 408 and 429) pass through verbatim, with no
+  failover or health penalty, as on `/v1/messages`.
+* **Choosing a model for `POST /v1/conversations`**: its body has no `model`,
+  so name the virtual model in an `x-oxllm-model` header, or set
+  `server.default_model`. The body is forwarded untouched. The same header is
+  the fallback for `compact` and `input_tokens`, where `model` is optional.
+* **Deleting** a response or conversation drops its record; deleting an item
+  does not.
+* **Record table**: in memory, kept across reloads, rebuilt by lookup after a
+  restart. `server.response_affinity_ttl_secs` (default 30 days, matching
+  OpenAI's response retention) and `server.response_affinity_capacity`
+  (default 4096, LRU). Conversations don't expire upstream, so a long-idle
+  conversation falls out of the table and is found again by lookup on next use.
+
+If you need failover for multi-turn conversations, keep the client stateless:
+send the full history each turn with `store: false`, or use chat completions.
+The Assistants API (`/v1/assistants`, `/v1/threads`) is not proxied: OpenAI
+shut it down on 2026-08-26, with Responses and Conversations as the
+replacement.
+
 ## 🌐 CORS Support
 
 All public endpoints return `Access-Control-Allow-Origin: *`

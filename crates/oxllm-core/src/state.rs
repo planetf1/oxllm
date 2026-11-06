@@ -412,6 +412,13 @@ struct AffinityInner {
     entries: std::collections::VecDeque<(String, String, std::time::Instant)>,
 }
 
+impl Default for SessionAffinity {
+    /// Responses-id defaults: OpenAI's 30-day retention, 4096 entries.
+    fn default() -> Self {
+        Self::new(std::time::Duration::from_secs(30 * 24 * 3600), 4096)
+    }
+}
+
 impl SessionAffinity {
     pub fn new(ttl: std::time::Duration, capacity: usize) -> Self {
         Self {
@@ -745,6 +752,10 @@ pub struct AppState {
     /// Header consulted for the session key (body `prompt_cache_key` is the
     /// fallback). Empty string disables header-based affinity.
     pub session_affinity_header: String,
+    /// Responses API id (`resp_...`, `conv_...`) -> provider that holds its
+    /// state. Unlike session pins these are hard: a follow-up naming the id
+    /// can only be served by that provider, so it is never failed over.
+    pub response_affinity: Arc<SessionAffinity>,
     pub http_client: reqwest::Client,
     pub upstream_timeout_secs: u64,
     /// The server section this state was built from. Hot-reload diffs
@@ -1020,6 +1031,7 @@ mod affinity_tests {
                 16,
             )),
             session_affinity_header: DEFAULT_SESSION_HEADER.to_string(),
+            response_affinity: Default::default(),
             http_client: reqwest::Client::new(),
             upstream_timeout_secs: 5,
             server: ServerConfig {
@@ -1032,6 +1044,8 @@ mod affinity_tests {
                 session_affinity_header: DEFAULT_SESSION_HEADER.to_string(),
                 session_affinity_ttl_secs: 900,
                 session_affinity_capacity: 16,
+                response_affinity_ttl_secs: 3600,
+                response_affinity_capacity: 16,
                 circuit_failure_threshold: 3,
                 circuit_base_cooldown_secs: 60,
                 rate_limit_fallback_secs: 30,

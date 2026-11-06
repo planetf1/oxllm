@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **OpenAI Responses and Conversations APIs**: the full surface is proxied.
+  Responses: `POST /v1/responses` (with SSE streaming), `compact`,
+  `input_tokens`, `GET`/`DELETE /v1/responses/{id}`, `input_items` and
+  `cancel`. Conversations: create, `GET`/`POST`/`DELETE /v1/conversations/{id}`,
+  and list/add/get/delete items. New responses and conversations route and fail
+  over as usual. oxllm records which provider returned each response `id`,
+  `conversation.id` and conversation `id`, and anything naming one of them goes
+  only to that provider, **without failover**, since no other provider holds the
+  state. Ids with no record (after a restart, say) are found by asking each of
+  the route's providers for the object. `POST /v1/conversations` has no `model`
+  in its body: name the virtual model in an `x-oxllm-model` header or rely on
+  `server.default_model`. Upstream 4xx pass through verbatim. CORS now allows
+  `DELETE`. The record table is in memory (kept across reloads) and bounded by
+  `server.response_affinity_ttl_secs` (default 30 days) and
+  `server.response_affinity_capacity` (default 4096). The retired Assistants
+  API is not proxied. Proxy-owned state, which would restore failover, is
+  written up as a future option in `docs/architecture.md` §6.2.
+
 ## [0.1.25] - 2026-11-04
 
 ### Added

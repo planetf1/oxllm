@@ -32,6 +32,13 @@ pub struct ServerConfig {
     /// Maximum number of concurrent session pins.
     #[serde(default = "default_session_affinity_capacity")]
     pub session_affinity_capacity: usize,
+    /// How long a Responses API id stays pinned to the provider that
+    /// created it (seconds). Default 30 days, OpenAI's default retention.
+    #[serde(default = "default_response_affinity_ttl_secs")]
+    pub response_affinity_ttl_secs: u64,
+    /// Maximum number of Responses API ids tracked (LRU beyond that).
+    #[serde(default = "default_response_affinity_capacity")]
+    pub response_affinity_capacity: usize,
     /// Consecutive failures before a provider's circuit opens.
     #[serde(default = "default_circuit_failure_threshold")]
     pub circuit_failure_threshold: u32,
@@ -474,6 +481,14 @@ fn default_session_affinity_ttl_secs() -> u64 {
 
 fn default_session_affinity_capacity() -> usize {
     1024
+}
+
+fn default_response_affinity_ttl_secs() -> u64 {
+    30 * 24 * 3600
+}
+
+fn default_response_affinity_capacity() -> usize {
+    4096
 }
 
 fn default_circuit_failure_threshold() -> u32 {

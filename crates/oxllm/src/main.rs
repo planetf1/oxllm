@@ -63,7 +63,7 @@ mod routes;
     long_about = "oxllm sits between your clients and your LLM providers. Clients ask for a \
 virtual model name; oxllm picks a provider for it, fails over when one is slow or down, and \
 reports what happened.\n\nEndpoints: /v1/chat/completions, /v1/completions, /v1/embeddings, \
-/v1/messages (Anthropic), /v1/models.",
+/v1/messages (Anthropic), /v1/responses (OpenAI, provider-pinned), /v1/models.",
     after_help = "Getting started:\n  1. oxllm validate -c config.toml   check a config\n  2. oxllm serve -c config.toml      run in the foreground\n  3. oxllm status                    what is healthy, what is not\n\nRunning as a service:\n  oxllm install -c config.toml       launchd (macOS) / systemd (Linux), starts at login\n  oxllm reload                       apply config edits without dropping connections\n\nWhen something is wrong:\n  oxllm status -v                    per-route targets and why each is out\n  oxllm tail -r 20                   the last 20 requests, then live\n  oxllm provider offline NAME        take a provider out of rotation\n  oxllm provider reset NAME          clear its circuit and failure count\n\nDocs: README.md (config reference), docs/architecture.md (design)."
 )]
 struct Cli {
@@ -406,6 +406,15 @@ fn build_app_state(config: Config, previous: Option<&AppState>) -> Result<AppSta
                 ))
             }),
         session_affinity_header: config.server.session_affinity_header.clone(),
+        // Carried across reloads: losing an id breaks the conversation.
+        response_affinity: previous
+            .map(|p| p.response_affinity.clone())
+            .unwrap_or_else(|| {
+                Arc::new(SessionAffinity::new(
+                    std::time::Duration::from_secs(config.server.response_affinity_ttl_secs),
+                    config.server.response_affinity_capacity,
+                ))
+            }),
         server: config.server,
         reload_health: previous
             .map(|p| p.reload_health.clone())
@@ -720,6 +729,18 @@ fn server_config_restart_warnings(old: &ServerConfig, new: &ServerConfig) -> Vec
         new.session_affinity_capacity.to_string(),
     );
     note(
+        old.response_affinity_ttl_secs != new.response_affinity_ttl_secs,
+        "response_affinity_ttl_secs",
+        old.response_affinity_ttl_secs.to_string(),
+        new.response_affinity_ttl_secs.to_string(),
+    );
+    note(
+        old.response_affinity_capacity != new.response_affinity_capacity,
+        "response_affinity_capacity",
+        old.response_affinity_capacity.to_string(),
+        new.response_affinity_capacity.to_string(),
+    );
+    note(
         old.shutdown_timeout_secs != new.shutdown_timeout_secs,
         "shutdown_timeout_secs",
         old.shutdown_timeout_secs.to_string(),
@@ -998,6 +1019,80 @@ async fn run_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             )),
         )
         .route(
+            "/v1/responses",
+            post(routes::create_responses).layer(middleware::from_fn_with_state(
+                state_for_middleware.clone(),
+                require_api_key,
+            )),
+        )
+        .route(
+            "/v1/responses/{id}",
+            get(routes::response_by_id)
+                .delete(routes::response_by_id)
+                .layer(middleware::from_fn_with_state(
+                    state_for_middleware.clone(),
+                    require_api_key,
+                )),
+        )
+        .route(
+            "/v1/responses/{id}/{action}",
+            get(routes::response_action)
+                .post(routes::response_action)
+                .layer(middleware::from_fn_with_state(
+                    state_for_middleware.clone(),
+                    require_api_key,
+                )),
+        )
+        .route(
+            "/v1/responses/compact",
+            post(routes::compact_responses).layer(middleware::from_fn_with_state(
+                state_for_middleware.clone(),
+                require_api_key,
+            )),
+        )
+        .route(
+            "/v1/responses/input_tokens",
+            post(routes::count_response_input_tokens).layer(middleware::from_fn_with_state(
+                state_for_middleware.clone(),
+                require_api_key,
+            )),
+        )
+        .route(
+            "/v1/conversations",
+            post(routes::create_conversation).layer(middleware::from_fn_with_state(
+                state_for_middleware.clone(),
+                require_api_key,
+            )),
+        )
+        .route(
+            "/v1/conversations/{id}",
+            get(routes::conversation_by_id)
+                .post(routes::conversation_by_id)
+                .delete(routes::conversation_by_id)
+                .layer(middleware::from_fn_with_state(
+                    state_for_middleware.clone(),
+                    require_api_key,
+                )),
+        )
+        .route(
+            "/v1/conversations/{id}/items",
+            get(routes::conversation_items)
+                .post(routes::conversation_items)
+                .layer(middleware::from_fn_with_state(
+                    state_for_middleware.clone(),
+                    require_api_key,
+                )),
+        )
+        .route(
+            "/v1/conversations/{id}/items/{item_id}",
+            get(routes::conversation_item)
+                .delete(routes::conversation_item)
+                .layer(middleware::from_fn_with_state(
+                    state_for_middleware.clone(),
+                    require_api_key,
+                )),
+        )
+        .route(
             "/status",
             get(routes::get_status).layer(middleware::from_fn(localhost_only)),
         )
@@ -1032,6 +1127,8 @@ async fn run_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
                 .allow_methods([
                     axum::http::Method::GET,
                     axum::http::Method::POST,
+                    // Responses / Conversations deletes.
+                    axum::http::Method::DELETE,
                     axum::http::Method::OPTIONS,
                 ])
                 .allow_headers(Any),
@@ -2621,6 +2718,7 @@ mod integration_tests {
                 1024,
             )),
             session_affinity_header: oxllm_core::state::DEFAULT_SESSION_HEADER.to_string(),
+            response_affinity: Default::default(),
             http_client,
             upstream_timeout_secs: 5,
         });
@@ -2741,6 +2839,7 @@ mod integration_tests {
                 1024,
             )),
             session_affinity_header: oxllm_core::state::DEFAULT_SESSION_HEADER.to_string(),
+            response_affinity: Default::default(),
             http_client,
             upstream_timeout_secs: 5,
         });
@@ -2921,6 +3020,7 @@ mod integration_tests {
                 1024,
             )),
             session_affinity_header: oxllm_core::state::DEFAULT_SESSION_HEADER.to_string(),
+            response_affinity: Default::default(),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         })
@@ -3144,6 +3244,7 @@ mod integration_tests {
                 1024,
             )),
             session_affinity_header: oxllm_core::state::DEFAULT_SESSION_HEADER.to_string(),
+            response_affinity: Default::default(),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -3296,6 +3397,7 @@ mod integration_tests {
                 1024,
             )),
             session_affinity_header: oxllm_core::state::DEFAULT_SESSION_HEADER.to_string(),
+            response_affinity: Default::default(),
             api_keys: vec!["sekrit".to_string()],
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
@@ -3442,6 +3544,7 @@ mod integration_tests {
                 64,
             )),
             session_affinity_header: "x-session-id".to_string(),
+            response_affinity: Default::default(),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -3667,6 +3770,7 @@ mod integration_tests {
                 1024,
             )),
             session_affinity_header: oxllm_core::state::DEFAULT_SESSION_HEADER.to_string(),
+            response_affinity: Default::default(),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -3828,6 +3932,7 @@ mod integration_tests {
                 1024,
             )),
             session_affinity_header: oxllm_core::state::DEFAULT_SESSION_HEADER.to_string(),
+            response_affinity: Default::default(),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -3947,6 +4052,7 @@ mod integration_tests {
                 1024,
             )),
             session_affinity_header: oxllm_core::state::DEFAULT_SESSION_HEADER.to_string(),
+            response_affinity: Default::default(),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -4088,6 +4194,7 @@ mod integration_tests {
                 1024,
             )),
             session_affinity_header: oxllm_core::state::DEFAULT_SESSION_HEADER.to_string(),
+            response_affinity: Default::default(),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -4202,6 +4309,7 @@ mod integration_tests {
                 1024,
             )),
             session_affinity_header: oxllm_core::state::DEFAULT_SESSION_HEADER.to_string(),
+            response_affinity: Default::default(),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -4307,6 +4415,7 @@ mod integration_tests {
                 1024,
             )),
             session_affinity_header: oxllm_core::state::DEFAULT_SESSION_HEADER.to_string(),
+            response_affinity: Default::default(),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -4425,6 +4534,7 @@ mod integration_tests {
                 1024,
             )),
             session_affinity_header: oxllm_core::state::DEFAULT_SESSION_HEADER.to_string(),
+            response_affinity: Default::default(),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -4545,6 +4655,7 @@ mod integration_tests {
                 1024,
             )),
             session_affinity_header: oxllm_core::state::DEFAULT_SESSION_HEADER.to_string(),
+            response_affinity: Default::default(),
             server: test_server_config(),
             reload_health: Default::default(),
             request_log: Default::default(),
@@ -4974,6 +5085,8 @@ mod integration_tests {
             session_affinity_header: "x-session-id".to_string(),
             session_affinity_ttl_secs: 900,
             session_affinity_capacity: 1024,
+            response_affinity_ttl_secs: 3600,
+            response_affinity_capacity: 1024,
             circuit_failure_threshold: 3,
             circuit_base_cooldown_secs: 60,
             rate_limit_fallback_secs: 30,
@@ -5614,6 +5727,7 @@ vm = [
                 1024,
             )),
             session_affinity_header: oxllm_core::state::DEFAULT_SESSION_HEADER.to_string(),
+            response_affinity: Default::default(),
             server: test_server_config(),
             reload_health: Default::default(),
             request_log: Default::default(),
@@ -5838,6 +5952,7 @@ vm = [
                 1024,
             )),
             session_affinity_header: "".to_string(),
+            response_affinity: Default::default(),
             server: test_server_config(),
             reload_health: Default::default(),
             request_log: Default::default(),
@@ -5974,6 +6089,7 @@ vm = [
                 1024,
             )),
             session_affinity_header: "".to_string(),
+            response_affinity: Default::default(),
             server: test_server_config(),
             reload_health: Default::default(),
             request_log: Default::default(),
@@ -6416,6 +6532,7 @@ vm = [
                 1024,
             )),
             session_affinity_header: oxllm_core::state::DEFAULT_SESSION_HEADER.to_string(),
+            response_affinity: Default::default(),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -6443,6 +6560,53 @@ vm = [
             .route(
                 "/v1/chat/completions",
                 axum::routing::post(routes::create_chat_completions).layer(gate()),
+            )
+            .route(
+                "/v1/responses",
+                axum::routing::post(routes::create_responses).layer(gate()),
+            )
+            .route(
+                "/v1/responses/{id}",
+                axum::routing::get(routes::response_by_id)
+                    .delete(routes::response_by_id)
+                    .layer(gate()),
+            )
+            .route(
+                "/v1/responses/{id}/{action}",
+                axum::routing::get(routes::response_action)
+                    .post(routes::response_action)
+                    .layer(gate()),
+            )
+            .route(
+                "/v1/responses/compact",
+                axum::routing::post(routes::compact_responses).layer(gate()),
+            )
+            .route(
+                "/v1/responses/input_tokens",
+                axum::routing::post(routes::count_response_input_tokens).layer(gate()),
+            )
+            .route(
+                "/v1/conversations",
+                axum::routing::post(routes::create_conversation).layer(gate()),
+            )
+            .route(
+                "/v1/conversations/{id}",
+                axum::routing::get(routes::conversation_by_id)
+                    .post(routes::conversation_by_id)
+                    .delete(routes::conversation_by_id)
+                    .layer(gate()),
+            )
+            .route(
+                "/v1/conversations/{id}/items",
+                axum::routing::get(routes::conversation_items)
+                    .post(routes::conversation_items)
+                    .layer(gate()),
+            )
+            .route(
+                "/v1/conversations/{id}/items/{item_id}",
+                axum::routing::get(routes::conversation_item)
+                    .delete(routes::conversation_item)
+                    .layer(gate()),
             )
             .layer(middleware::from_fn(add_request_id))
             .with_state(rs);
@@ -7747,5 +7911,589 @@ grp = [{ provider = "p1", model = "m-down" }, { provider = "p1", model = "m-up" 
                 .name(),
             "healthy"
         );
+    }
+
+    // ---- OpenAI Responses API (stateful, provider-pinned) ----------------
+
+    fn responses_ok(id: &str) -> String {
+        http_json(
+            "200 OK",
+            &format!(
+                r#"{{"id":"{id}","object":"response","output":[],"usage":{{"input_tokens":4,"output_tokens":2}}}}"#
+            ),
+        )
+    }
+
+    fn responses_body(previous: Option<&str>) -> Value {
+        let mut body = serde_json::json!({"model": "vm", "input": "hi"});
+        if let Some(id) = previous {
+            body["previous_response_id"] = Value::String(id.to_string());
+        }
+        body
+    }
+
+    /// A follow-up naming `previous_response_id` goes only to the provider
+    /// that created the response, even when policy order prefers another.
+    #[tokio::test]
+    async fn test_responses_follow_up_pinned_to_creating_provider() {
+        let rec1 = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let rec2 = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let a1 = spawn_raw_recording_upstream(
+            vec![http_json("500 Internal Server Error", "{}")],
+            rec1.clone(),
+        )
+        .await;
+        let a2 = spawn_raw_recording_upstream(vec![responses_ok("resp_2")], rec2.clone()).await;
+        let (proxy, state) = spawn_messages_proxy(
+            vec![
+                test_provider("p1", a1, ApiFormat::Openai),
+                test_provider("p2", a2, ApiFormat::Openai),
+            ],
+            vec![],
+        )
+        .await;
+        let url = format!("http://{}/v1/responses", proxy);
+        let client = reqwest::Client::new();
+
+        // First turn: p1 fails, p2 creates resp_2.
+        let res = client
+            .post(&url)
+            .json(&responses_body(None))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        assert_eq!(
+            state.response_affinity.pinned_provider("resp_2").as_deref(),
+            Some("p2")
+        );
+        let raw = rec2.lock().await[0].to_ascii_lowercase();
+        assert!(raw.starts_with("post /v1/responses "), "got: {raw}");
+        assert!(raw.contains("authorization: bearer key-p2"), "got: {raw}");
+
+        // Second turn: p1 is still first by policy, but resp_2 lives on p2.
+        let res = client
+            .post(&url)
+            .json(&responses_body(Some("resp_2")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        assert_eq!(rec1.lock().await.len(), 1, "p1 must not see the follow-up");
+        assert_eq!(rec2.lock().await.len(), 2);
+    }
+
+    /// When the provider holding the state fails, the follow-up fails too:
+    /// no other provider could resolve the id.
+    #[tokio::test]
+    async fn test_responses_pinned_failure_does_not_fail_over() {
+        let rec1 = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let rec2 = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let a1 = spawn_raw_recording_upstream(
+            vec![
+                responses_ok("resp_1"),
+                http_json("500 Internal Server Error", "{}"),
+            ],
+            rec1.clone(),
+        )
+        .await;
+        let a2 = spawn_raw_recording_upstream(vec![responses_ok("resp_x")], rec2.clone()).await;
+        let (proxy, _state) = spawn_messages_proxy(
+            vec![
+                test_provider("p1", a1, ApiFormat::Openai),
+                test_provider("p2", a2, ApiFormat::Openai),
+            ],
+            vec![],
+        )
+        .await;
+        let url = format!("http://{}/v1/responses", proxy);
+        let client = reqwest::Client::new();
+        let res = client
+            .post(&url)
+            .json(&responses_body(None))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+
+        let res = client
+            .post(&url)
+            .json(&responses_body(Some("resp_1")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 502);
+        assert!(rec2.lock().await.is_empty(), "p2 must never be tried");
+    }
+
+    /// Upstream 4xx on the Responses route (e.g. an unknown
+    /// previous_response_id) reaches the client verbatim, without failover.
+    /// Neither provider claims the id at lookup, so the request routes by
+    /// policy to p1, whose 404 is returned as-is.
+    #[tokio::test]
+    async fn test_responses_client_error_passes_through() {
+        let rec2 = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let err = r#"{"error":{"message":"Previous response with id 'resp_gone' not found.","type":"invalid_request_error"}}"#;
+        let a1 =
+            spawn_raw_recording_upstream(vec![http_json("404 Not Found", err)], Default::default())
+                .await;
+        let a2 = spawn_raw_recording_upstream(
+            vec![http_json("404 Not Found", err), responses_ok("resp_x")],
+            rec2.clone(),
+        )
+        .await;
+        let (proxy, _state) = spawn_messages_proxy(
+            vec![
+                test_provider("p1", a1, ApiFormat::Openai),
+                test_provider("p2", a2, ApiFormat::Openai),
+            ],
+            vec![],
+        )
+        .await;
+        let res = reqwest::Client::new()
+            .post(format!("http://{}/v1/responses", proxy))
+            .json(&responses_body(Some("resp_gone")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 404);
+        let body: Value = res.json().await.unwrap();
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("resp_gone"));
+        let r2 = rec2.lock().await;
+        assert_eq!(r2.len(), 1, "p2 sees only the lookup, never the generation");
+        assert!(
+            r2[0].starts_with("GET /v1/responses/resp_gone "),
+            "got: {}",
+            r2[0]
+        );
+    }
+
+    /// Streaming: the id is learned from the `response.created` event and
+    /// usage from `response.completed`, while the bytes pass through.
+    #[tokio::test]
+    async fn test_responses_streaming_captures_id_and_usage() {
+        let sse = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_s\",\"conversation\":{\"id\":\"conv_9\"}}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_s\",\"usage\":{\"input_tokens\":11,\"output_tokens\":3}}}\n\n",
+        );
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+            sse.len(),
+            sse
+        );
+        let addr = spawn_raw_recording_upstream(vec![resp], Default::default()).await;
+        let (proxy, state) =
+            spawn_messages_proxy(vec![test_provider("p1", addr, ApiFormat::Openai)], vec![]).await;
+        let mut body = responses_body(None);
+        body["stream"] = Value::Bool(true);
+        let res = reqwest::Client::new()
+            .post(format!("http://{}/v1/responses", proxy))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let text = res.text().await.unwrap();
+        assert_eq!(text, sse, "stream must pass through unchanged");
+        // Usage and pins are recorded by the stream task after the last byte.
+        for _ in 0..50 {
+            if state.providers[0]
+                .tokens_output
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            state.response_affinity.pinned_provider("resp_s").as_deref(),
+            Some("p1")
+        );
+        assert_eq!(
+            state.response_affinity.pinned_provider("conv_9").as_deref(),
+            Some("p1")
+        );
+        let p = &state.providers[0];
+        assert_eq!(
+            p.tokens_input.load(std::sync::atomic::Ordering::Relaxed),
+            11
+        );
+        assert_eq!(
+            p.tokens_output.load(std::sync::atomic::Ordering::Relaxed),
+            3
+        );
+    }
+
+    /// GET / DELETE / cancel / input_items on a known id go to its owner;
+    /// unknown or malformed ids are rejected locally.
+    #[tokio::test]
+    async fn test_responses_subresources_route_to_owner() {
+        let rec = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let addr = spawn_raw_recording_upstream(
+            vec![
+                responses_ok("resp_7"),
+                responses_ok("resp_7"),
+                http_json("200 OK", r#"{"object":"list","data":[]}"#),
+                http_json(
+                    "200 OK",
+                    r#"{"id":"resp_7","object":"response.deleted","deleted":true}"#,
+                ),
+            ],
+            rec.clone(),
+        )
+        .await;
+        let (proxy, state) =
+            spawn_messages_proxy(vec![test_provider("p1", addr, ApiFormat::Openai)], vec![]).await;
+        let base = format!("http://{}/v1/responses", proxy);
+        let client = reqwest::Client::new();
+        let res = client
+            .post(&base)
+            .json(&responses_body(None))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+
+        let res = client.get(format!("{base}/resp_7")).send().await.unwrap();
+        assert_eq!(res.status(), 200);
+        let res = client
+            .get(format!("{base}/resp_7/input_items?limit=5"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let res = client
+            .delete(format!("{base}/resp_7"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+
+        let recorded = rec.lock().await;
+        let lines: Vec<String> = recorded
+            .iter()
+            .map(|r| r.lines().next().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(lines[1], "GET /v1/responses/resp_7 HTTP/1.1");
+        assert_eq!(
+            lines[2],
+            "GET /v1/responses/resp_7/input_items?limit=5 HTTP/1.1"
+        );
+        assert_eq!(lines[3], "DELETE /v1/responses/resp_7 HTTP/1.1");
+        assert!(recorded[1]
+            .to_ascii_lowercase()
+            .contains("authorization: bearer key-p1"));
+        drop(recorded);
+        assert_eq!(
+            state.response_affinity.pinned_provider("resp_7"),
+            None,
+            "a successful DELETE drops the pin"
+        );
+
+        // Malformed paths stay local: no upstream call.
+        let before = rec.lock().await.len();
+        let res = client
+            .get(format!("{base}/resp_7/bogus"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 404);
+        let res = client
+            .get(format!("{base}/resp%2F.."))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 400);
+        assert_eq!(rec.lock().await.len(), before, "no upstream calls");
+    }
+
+    /// An id oxllm has no record of (e.g. after a restart) is located by
+    /// asking each candidate provider for it; the owner is pinned and the
+    /// follow-up goes only there.
+    #[tokio::test]
+    async fn test_responses_unknown_id_owner_discovered() {
+        let rec1 = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let rec2 = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let a1 = spawn_raw_recording_upstream(
+            vec![http_json(
+                "404 Not Found",
+                r#"{"error":{"message":"nope"}}"#,
+            )],
+            rec1.clone(),
+        )
+        .await;
+        let a2 = spawn_raw_recording_upstream(
+            vec![responses_ok("resp_old"), responses_ok("resp_new")],
+            rec2.clone(),
+        )
+        .await;
+        let (proxy, state) = spawn_messages_proxy(
+            vec![
+                test_provider("p1", a1, ApiFormat::Openai),
+                test_provider("p2", a2, ApiFormat::Openai),
+            ],
+            vec![],
+        )
+        .await;
+        let res = reqwest::Client::new()
+            .post(format!("http://{}/v1/responses", proxy))
+            .json(&responses_body(Some("resp_old")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let r1 = rec1.lock().await;
+        assert_eq!(r1.len(), 1, "p1 only sees the lookup");
+        assert!(
+            r1[0].starts_with("GET /v1/responses/resp_old "),
+            "got: {}",
+            r1[0]
+        );
+        let r2 = rec2.lock().await;
+        assert!(
+            r2[0].starts_with("GET /v1/responses/resp_old "),
+            "got: {}",
+            r2[0]
+        );
+        assert!(r2[1].starts_with("POST /v1/responses "), "got: {}", r2[1]);
+        assert_eq!(
+            state
+                .response_affinity
+                .pinned_provider("resp_old")
+                .as_deref(),
+            Some("p2")
+        );
+    }
+
+    /// Sub-resource call for an unknown id that no provider recognizes.
+    #[tokio::test]
+    async fn test_responses_unknown_id_not_found_anywhere() {
+        let rec = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let a1 = spawn_raw_recording_upstream(
+            vec![http_json(
+                "404 Not Found",
+                r#"{"error":{"message":"nope"}}"#,
+            )],
+            rec.clone(),
+        )
+        .await;
+        let (proxy, _s) =
+            spawn_messages_proxy(vec![test_provider("p1", a1, ApiFormat::Openai)], vec![]).await;
+        let res = reqwest::Client::new()
+            .get(format!("http://{}/v1/responses/resp_zz", proxy))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 404);
+        assert_eq!(rec.lock().await.len(), 1, "exactly one lookup");
+    }
+
+    /// Conversations: create picks a provider from the virtual model named
+    /// in `x-oxllm-model` (failing over, since nothing exists yet), the body
+    /// is forwarded untouched, and every later use of the id goes to it.
+    #[tokio::test]
+    async fn test_conversations_create_pins_and_routes() {
+        let rec1 = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let rec2 = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let a1 = spawn_raw_recording_upstream(
+            vec![http_json("500 Internal Server Error", "{}")],
+            rec1.clone(),
+        )
+        .await;
+        let conv = r#"{"id":"conv_1","object":"conversation","created_at":1,"metadata":{}}"#;
+        let a2 = spawn_raw_recording_upstream(
+            vec![
+                http_json("200 OK", conv),
+                responses_ok("resp_c"),
+                http_json("200 OK", r#"{"object":"list","data":[]}"#),
+                http_json("200 OK", r#"{"object":"conversation"}"#),
+                http_json(
+                    "200 OK",
+                    r#"{"id":"conv_1","object":"conversation.deleted","deleted":true}"#,
+                ),
+            ],
+            rec2.clone(),
+        )
+        .await;
+        let (proxy, state) = spawn_messages_proxy(
+            vec![
+                test_provider("p1", a1, ApiFormat::Openai),
+                test_provider("p2", a2, ApiFormat::Openai),
+            ],
+            vec![],
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let base = format!("http://{}/v1", proxy);
+
+        let create = serde_json::json!({"items": [{"role": "user", "content": "hi"}]});
+        let res = client
+            .post(format!("{base}/conversations"))
+            .header("x-oxllm-model", "vm")
+            .json(&create)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        assert_eq!(
+            state.response_affinity.pinned_provider("conv_1").as_deref(),
+            Some("p2")
+        );
+        let raw = rec2.lock().await[0].clone();
+        assert!(raw.starts_with("POST /v1/conversations "), "got: {raw}");
+        assert!(
+            !raw.contains("\"model\""),
+            "create body must stay untouched: {raw}"
+        );
+
+        let mut body = responses_body(None);
+        body["conversation"] = Value::String("conv_1".to_string());
+        let res = client
+            .post(format!("{base}/responses"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let res = client
+            .get(format!("{base}/conversations/conv_1/items?order=asc"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let res = client
+            .delete(format!("{base}/conversations/conv_1/items/msg_1"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let res = client
+            .delete(format!("{base}/conversations/conv_1"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+
+        let lines: Vec<String> = rec2
+            .lock()
+            .await
+            .iter()
+            .map(|r| r.lines().next().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(lines[1], "POST /v1/responses HTTP/1.1");
+        assert_eq!(
+            lines[2],
+            "GET /v1/conversations/conv_1/items?order=asc HTTP/1.1"
+        );
+        assert_eq!(
+            lines[3],
+            "DELETE /v1/conversations/conv_1/items/msg_1 HTTP/1.1"
+        );
+        assert_eq!(lines[4], "DELETE /v1/conversations/conv_1 HTTP/1.1");
+        assert_eq!(rec1.lock().await.len(), 1, "p1 only saw the failed create");
+        assert_eq!(state.response_affinity.pinned_provider("conv_1"), None);
+    }
+
+    /// Without `x-oxllm-model` and with no default model there is no way
+    /// to choose a provider for a new conversation.
+    #[tokio::test]
+    async fn test_conversations_create_needs_a_model() {
+        let addr = spawn_raw_recording_upstream(
+            vec![http_json("200 OK", r#"{"id":"conv_x"}"#)],
+            Default::default(),
+        )
+        .await;
+        let (proxy, _s) =
+            spawn_messages_proxy(vec![test_provider("p1", addr, ApiFormat::Openai)], vec![]).await;
+        let res = reqwest::Client::new()
+            .post(format!("http://{}/v1/conversations", proxy))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 400);
+        let body: Value = res.json().await.unwrap();
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("x-oxllm-model"));
+    }
+
+    /// compact and input_tokens follow the same pinning as create.
+    #[tokio::test]
+    async fn test_responses_compact_and_input_tokens_pinned() {
+        let rec1 = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let rec2 = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let a1 = spawn_raw_recording_upstream(
+            vec![http_json("500 Internal Server Error", "{}")],
+            rec1.clone(),
+        )
+        .await;
+        let a2 = spawn_raw_recording_upstream(
+            vec![
+                responses_ok("resp_1"),
+                http_json(
+                    "200 OK",
+                    r#"{"object":"response.input_tokens","input_tokens":12}"#,
+                ),
+                responses_ok("resp_compacted"),
+            ],
+            rec2.clone(),
+        )
+        .await;
+        let (proxy, _state) = spawn_messages_proxy(
+            vec![
+                test_provider("p1", a1, ApiFormat::Openai),
+                test_provider("p2", a2, ApiFormat::Openai),
+            ],
+            vec![],
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let base = format!("http://{}/v1/responses", proxy);
+        let res = client
+            .post(&base)
+            .json(&responses_body(None))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let res = client
+            .post(format!("{base}/input_tokens"))
+            .json(&responses_body(Some("resp_1")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let res = client
+            .post(format!("{base}/compact"))
+            .json(&responses_body(Some("resp_1")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let r2 = rec2.lock().await;
+        assert!(
+            r2[1].starts_with("POST /v1/responses/input_tokens "),
+            "got: {}",
+            r2[1]
+        );
+        assert!(
+            r2[2].starts_with("POST /v1/responses/compact "),
+            "got: {}",
+            r2[2]
+        );
+        assert!(
+            r2[2].contains("\"model\":\"upstream-p2\""),
+            "got: {}",
+            r2[2]
+        );
+        assert_eq!(rec1.lock().await.len(), 1);
     }
 }

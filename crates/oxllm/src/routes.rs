@@ -734,7 +734,30 @@ struct EndpointSpec {
     /// are candidates; it also selects upstream auth headers, the error
     /// body shape and usage parsing.
     api: ApiFormat,
+    /// Stateful endpoint (OpenAI Responses / Conversations): ids the
+    /// upstream returns are recorded, follow-ups naming one are pinned to its
+    /// provider without failover, and upstream client errors pass through
+    /// verbatim.
+    stateful: bool,
+    /// Where the virtual model comes from.
+    model: ModelField,
 }
+
+/// How an endpoint names its virtual model.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModelField {
+    /// Body `model` is required and rewritten per target.
+    Required,
+    /// Body `model` if present, else the `x-oxllm-model` header, else the
+    /// default model; written into the body per target.
+    Optional,
+    /// The body has no `model` field (Conversations create): the header or
+    /// default model chooses the route and the body is not touched.
+    Absent,
+}
+
+/// Header naming the virtual model for endpoints whose body has none.
+const MODEL_HEADER: &str = "x-oxllm-model";
 
 /// The shared proxy loop behind every public endpoint (issue #11): JSON
 /// parse, model resolution (aliases, default model), trace-context
@@ -764,23 +787,58 @@ async fn proxy_request(
         },
     };
 
-    let requested_model = match payload.get("model").and_then(|m| m.as_str()) {
-        Some(m) => m,
-        None => {
-            return error_response(
-                spec.api,
-                "Missing required 'model' field",
-                "invalid_request_error",
-                StatusCode::BAD_REQUEST,
-            )
+    if spec.model != ModelField::Required && !payload.is_object() {
+        return error_response(
+            spec.api,
+            "Request body must be a JSON object",
+            "invalid_request_error",
+            StatusCode::BAD_REQUEST,
+        );
+    }
+    let body_model = payload
+        .get("model")
+        .and_then(|m| m.as_str())
+        .map(String::from);
+    let header_model = || {
+        headers
+            .get(MODEL_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    };
+    let requested_model = match spec.model {
+        ModelField::Required => match body_model {
+            Some(m) => m,
+            None => {
+                return error_response(
+                    spec.api,
+                    "Missing required 'model' field",
+                    "invalid_request_error",
+                    StatusCode::BAD_REQUEST,
+                )
+            },
         },
+        ModelField::Optional => body_model.or_else(header_model).unwrap_or_default(),
+        ModelField::Absent => header_model().unwrap_or_default(),
     };
 
     // Owned copy: `payload` is mutated per attempt, so the &str borrow cannot
     // live across the routing loop. Names resolve through aliases and the
     // configured default model before being rejected.
-    let route_name = match app_state.resolve_route(requested_model) {
+    let route_name = match app_state.resolve_route(&requested_model) {
         Some(route) => route.to_string(),
+        None if requested_model.is_empty() => {
+            return error_response(
+                spec.api,
+                &format!(
+                    "No model for this request: name a virtual model in the {} header, \
+                     or configure server.default_model",
+                    MODEL_HEADER
+                ),
+                "invalid_request_error",
+                StatusCode::BAD_REQUEST,
+            )
+        },
         None => {
             return error_response(
                 spec.api,
@@ -829,12 +887,55 @@ async fn proxy_request(
     let mut last_failed_status: u16 = 0;
 
     // Map candidate provider references for select strategy
-    let candidates = ordered_candidates(
+    let mut candidates = ordered_candidates(
         &app_state,
         &route_name,
         session_key(&app_state, &headers, &payload).as_deref(),
         &candidates,
     );
+
+    // Stateful follow-ups can only be served where the state lives. An id
+    // oxllm has no record of (created elsewhere, or forgotten on restart) is
+    // looked up on the route's providers; if none claims it, the request
+    // routes by policy and the upstream decides.
+    let refs = if spec.stateful {
+        referenced_state_ids(&payload)
+    } else {
+        Vec::new()
+    };
+    let mut pinned = refs.iter().find_map(|r| {
+        app_state
+            .response_affinity
+            .pinned_provider(&r.id)
+            .map(|provider| (r.id.clone(), provider))
+    });
+    if pinned.is_none() {
+        if let Some(r) = refs.first() {
+            let mut providers: Vec<&ProviderState> = Vec::new();
+            for c in &candidates {
+                if !providers.iter().any(|p| p.name == c.provider.name) {
+                    providers.push(c.provider);
+                }
+            }
+            if let Some(owner) = discover_state_owner(&app_state, r, &providers).await {
+                pinned = Some((r.id.clone(), owner));
+            }
+        }
+    }
+    if let Some((id, provider)) = &pinned {
+        candidates.retain(|c| &c.provider.name == provider);
+        if candidates.is_empty() {
+            return error_response(
+                spec.api,
+                &format!(
+                    "'{}' is held by provider '{}', which does not serve model '{}'",
+                    id, provider, route_name
+                ),
+                "invalid_request_error",
+                StatusCode::BAD_REQUEST,
+            );
+        }
+    }
 
     // Route-level counters: one row per virtual model, one request each,
     // regardless of how many provider attempts it takes.
@@ -863,7 +964,9 @@ async fn proxy_request(
         let held = (selected.is_probe, selected.model_probe);
 
         // 1. Rewrite model field in JSON body
-        payload["model"] = Value::String(target_model.clone());
+        if spec.model != ModelField::Absent {
+            payload["model"] = Value::String(target_model.clone());
+        }
         let rewritten_body = Bytes::from(serde_json::to_vec(&payload).unwrap());
 
         // 2. Safely parse base URL and join embeddings path (Url::joinTrailingSlashes mitigation)
@@ -997,6 +1100,7 @@ async fn proxy_request(
                         start_time,
                         attempts,
                         spec.api,
+                        spec.stateful,
                     )
                     .into_response();
                 }
@@ -1033,9 +1137,18 @@ async fn proxy_request(
 
                 // Parse token counts from the upstream response; field names
                 // differ by wire format and endpoint family.
-                let usage = serde_json::from_slice::<Value>(&res_body)
-                    .map(|v| parse_usage(&v, spec.api))
+                let parsed_body = serde_json::from_slice::<Value>(&res_body).ok();
+                let usage = parsed_body
+                    .as_ref()
+                    .map(|v| parse_usage(v, spec.api))
                     .unwrap_or_default();
+                if spec.stateful {
+                    if let Some(v) = &parsed_body {
+                        for id in created_state_ids(v) {
+                            app_state.response_affinity.pin(&id, &selected.name);
+                        }
+                    }
+                }
                 let (input_tokens, output_tokens) = (usage.input, usage.output);
 
                 // Report Success feedback
@@ -1150,7 +1263,9 @@ async fn proxy_request(
                 // the caller's to see: another provider would not fix them,
                 // and they say nothing about this provider's health. Pass
                 // them through verbatim without failover or breaker penalty.
-                if spec.api == ApiFormat::Anthropic && is_passthrough_client_error(status_code) {
+                if (spec.api == ApiFormat::Anthropic || spec.stateful)
+                    && is_passthrough_client_error(status_code)
+                {
                     let upstream_headers = res.headers().clone();
                     let error_body = res.bytes().await.unwrap_or_default();
                     // Release any lock-free probe permits; circuits stay as
@@ -1261,7 +1376,13 @@ async fn proxy_request(
         }
     }
 
-    let message = if !last_upstream_error.is_empty() {
+    let message = if let Some((id, provider)) = &pinned {
+        format!(
+            "Provider '{}' holds the state for '{}' and failed or is unavailable; \
+             stateful follow-ups cannot fail over. Last error ({}): {}",
+            provider, id, last_failed_status, last_upstream_error
+        )
+    } else if !last_upstream_error.is_empty() {
         format!(
             "All upstream {} providers failed or are rate-limited. Last error from {} ({}): {}",
             spec.failure_noun, last_failed_provider, last_failed_status, last_upstream_error
@@ -1321,6 +1442,8 @@ const EMBEDDINGS_SPEC: EndpointSpec = EndpointSpec {
     failure_noun: "embeddings",
     streaming: false,
     api: ApiFormat::Openai,
+    stateful: false,
+    model: ModelField::Required,
 };
 
 /// POST /v1/embeddings
@@ -1350,6 +1473,8 @@ const SYSTEMONE_SPEC: EndpointSpec = EndpointSpec {
     failure_noun: "systemone",
     streaming: false,
     api: ApiFormat::Openai,
+    stateful: false,
+    model: ModelField::Required,
 };
 
 /// POST /v1/systemone
@@ -1382,6 +1507,8 @@ const COMPLETIONS_SPEC: EndpointSpec = EndpointSpec {
     failure_noun: "completions",
     streaming: true,
     api: ApiFormat::Openai,
+    stateful: false,
+    model: ModelField::Required,
 };
 
 /// POST /v1/completions
@@ -1412,6 +1539,8 @@ const CHAT_SPEC: EndpointSpec = EndpointSpec {
     failure_noun: "chat completions",
     streaming: true,
     api: ApiFormat::Openai,
+    stateful: false,
+    model: ModelField::Required,
 };
 
 /// POST /v1/chat/completions
@@ -1432,6 +1561,8 @@ const MESSAGES_SPEC: EndpointSpec = EndpointSpec {
     failure_noun: "messages",
     streaming: true,
     api: ApiFormat::Anthropic,
+    stateful: false,
+    model: ModelField::Required,
 };
 
 /// POST /v1/messages
@@ -1461,6 +1592,8 @@ const COUNT_TOKENS_SPEC: EndpointSpec = EndpointSpec {
     failure_noun: "count_tokens",
     streaming: false,
     api: ApiFormat::Anthropic,
+    stateful: false,
+    model: ModelField::Required,
 };
 
 /// POST /v1/messages/count_tokens
@@ -1506,6 +1639,7 @@ fn stream_upstream_body(
     start_time: Instant,
     attempts: u32,
     api: ApiFormat,
+    stateful: bool,
 ) -> Response {
     let duration = start_time.elapsed();
 
@@ -1520,7 +1654,7 @@ fn stream_upstream_body(
         while let Some(chunk_result) = reqwest_stream.next().await {
             match chunk_result {
                 Ok(chunk) => {
-                    if api == ApiFormat::Anthropic {
+                    if api == ApiFormat::Anthropic || stateful {
                         usage_scan.feed(&chunk);
                     }
                     if tx.send(Ok(chunk)).await.is_err() {
@@ -1537,6 +1671,15 @@ fn stream_upstream_body(
                     break;
                 },
             }
+        }
+
+        // The upstream holds state for any id it announced, even if the
+        // stream later broke, so pin regardless of stream success.
+        for id in [&usage_scan.response_id, &usage_scan.conversation_id]
+            .into_iter()
+            .flatten()
+        {
+            app_state.response_affinity.pin(id, &provider_name);
         }
 
         // Deferred circuit-breaker feedback after stream completes
@@ -1778,6 +1921,9 @@ fn parse_usage(v: &Value, api: ApiFormat) -> Usage {
 struct SseUsageScanner {
     pending: Vec<u8>,
     usage: Usage,
+    /// Responses API: ids announced in `response.created`.
+    response_id: Option<String>,
+    conversation_id: Option<String>,
 }
 
 impl SseUsageScanner {
@@ -1816,6 +1962,19 @@ impl SseUsageScanner {
                 let delta = parse_usage(&event, ApiFormat::Anthropic);
                 if delta.output > 0 {
                     self.usage.output = delta.output;
+                }
+            },
+            // OpenAI Responses streaming events.
+            Some("response.created") => {
+                if let Some(response) = event.get("response") {
+                    let mut ids = created_state_ids(response).into_iter();
+                    self.response_id = ids.next();
+                    self.conversation_id = ids.next();
+                }
+            },
+            Some("response.completed" | "response.incomplete" | "response.failed") => {
+                if let Some(response) = event.get("response") {
+                    self.usage = parse_usage(response, ApiFormat::Openai);
                 }
             },
             _ => {},
@@ -1879,6 +2038,554 @@ fn json_error_response(message: &str, error_type: &str, status: StatusCode) -> R
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
     );
+    response
+}
+
+// ---------------------------------------------------------------------------
+// OpenAI Responses + Conversations APIs (stateful, provider-pinned)
+// ---------------------------------------------------------------------------
+
+const RESPONSES_SPEC: EndpointSpec = EndpointSpec {
+    path: "responses",
+    operation: "responses",
+    failure_noun: "responses",
+    streaming: true,
+    api: ApiFormat::Openai,
+    stateful: true,
+    model: ModelField::Required,
+};
+
+/// `model` is optional on compact and input_tokens; when absent oxllm
+/// takes the route from `x-oxllm-model` or the default model.
+const RESPONSES_COMPACT_SPEC: EndpointSpec = EndpointSpec {
+    path: "responses/compact",
+    operation: "responses.compact",
+    failure_noun: "responses compact",
+    streaming: false,
+    api: ApiFormat::Openai,
+    stateful: true,
+    model: ModelField::Optional,
+};
+
+const RESPONSES_INPUT_TOKENS_SPEC: EndpointSpec = EndpointSpec {
+    path: "responses/input_tokens",
+    operation: "responses.input_tokens",
+    failure_noun: "responses input_tokens",
+    streaming: false,
+    api: ApiFormat::Openai,
+    stateful: true,
+    model: ModelField::Optional,
+};
+
+/// A new conversation has no state yet, so it routes and fails over like
+/// any generation; the body has no `model`, so the route comes from
+/// `x-oxllm-model` or the default model.
+const CONVERSATIONS_SPEC: EndpointSpec = EndpointSpec {
+    path: "conversations",
+    operation: "conversations.create",
+    failure_noun: "conversations",
+    streaming: false,
+    api: ApiFormat::Openai,
+    stateful: true,
+    model: ModelField::Absent,
+};
+
+/// POST /v1/responses
+///
+/// OpenAI Responses API passthrough. New conversations route and fail over
+/// like chat; the returned `id` (and `conversation.id`) is recorded so that
+/// follow-ups carrying `previous_response_id` or `conversation` go to the
+/// provider that holds the state, with no failover.
+pub async fn create_responses(
+    State((app_state, telemetry)): State<(Arc<AppState>, TelemetryClient)>,
+    Extension(request_id): Extension<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    proxy_request(
+        &RESPONSES_SPEC,
+        app_state,
+        telemetry,
+        request_id,
+        headers,
+        body,
+    )
+    .await
+}
+
+/// POST /v1/responses/compact
+pub async fn compact_responses(
+    State((app_state, telemetry)): State<(Arc<AppState>, TelemetryClient)>,
+    Extension(request_id): Extension<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    proxy_request(
+        &RESPONSES_COMPACT_SPEC,
+        app_state,
+        telemetry,
+        request_id,
+        headers,
+        body,
+    )
+    .await
+}
+
+/// POST /v1/responses/input_tokens
+pub async fn count_response_input_tokens(
+    State((app_state, telemetry)): State<(Arc<AppState>, TelemetryClient)>,
+    Extension(request_id): Extension<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    proxy_request(
+        &RESPONSES_INPUT_TOKENS_SPEC,
+        app_state,
+        telemetry,
+        request_id,
+        headers,
+        body,
+    )
+    .await
+}
+
+/// POST /v1/conversations
+pub async fn create_conversation(
+    State((app_state, telemetry)): State<(Arc<AppState>, TelemetryClient)>,
+    Extension(request_id): Extension<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    proxy_request(
+        &CONVERSATIONS_SPEC,
+        app_state,
+        telemetry,
+        request_id,
+        headers,
+        body,
+    )
+    .await
+}
+
+/// Which upstream collection a state id lives in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StateKind {
+    Response,
+    Conversation,
+}
+
+impl StateKind {
+    fn collection(self) -> &'static str {
+        match self {
+            StateKind::Response => "responses",
+            StateKind::Conversation => "conversations",
+        }
+    }
+}
+
+/// A state id named by a request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StateRef {
+    id: String,
+    kind: StateKind,
+}
+
+/// Ids a Responses request refers to: `previous_response_id`, then
+/// `conversation` (a string or `{"id": ...}`).
+fn referenced_state_ids(payload: &Value) -> Vec<StateRef> {
+    let conversation = payload.get("conversation").and_then(|c| {
+        c.as_str()
+            .or_else(|| c.get("id").and_then(|id| id.as_str()))
+    });
+    [
+        (
+            payload.get("previous_response_id").and_then(|v| v.as_str()),
+            StateKind::Response,
+        ),
+        (conversation, StateKind::Conversation),
+    ]
+    .into_iter()
+    .filter_map(|(id, kind)| {
+        id.filter(|id| !id.is_empty()).map(|id| StateRef {
+            id: id.to_string(),
+            kind,
+        })
+    })
+    .collect()
+}
+
+/// Ids a Responses (or Conversations) object creates or extends: its `id`,
+/// then `conversation.id` when present.
+fn created_state_ids(response: &Value) -> Vec<String> {
+    [
+        response.get("id").and_then(|v| v.as_str()),
+        response
+            .get("conversation")
+            .and_then(|c| c.get("id"))
+            .and_then(|v| v.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|id| !id.is_empty())
+    .map(String::from)
+    .collect()
+}
+
+/// Upstream ids are opaque but path-safe (`resp_...`, `conv_...`,
+/// `msg_...`); anything else is refused rather than spliced into an
+/// upstream URL.
+fn valid_state_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 256
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Finds which provider holds an id oxllm has no record of (created before
+/// a restart, by another proxy, or evicted) by asking each candidate for
+/// it with a cheap `GET /{collection}/{id}`. The first provider answering
+/// 2xx is pinned and returned. Providers that are offline, or whose
+/// provider-level circuit is open, are skipped; lookups give no circuit
+/// feedback because a 404 says nothing about health.
+async fn discover_state_owner(
+    app_state: &AppState,
+    state: &StateRef,
+    providers: &[&ProviderState],
+) -> Option<String> {
+    if !valid_state_id(&state.id) {
+        return None;
+    }
+    for provider in providers {
+        if provider
+            .manual_disabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+            || provider.api != ApiFormat::Openai
+        {
+            continue;
+        }
+        if matches!(
+            *provider.circuit.read().await,
+            CircuitState::Open { until } if Instant::now() < until
+        ) {
+            continue;
+        }
+        let Ok(url) = provider
+            .base_url
+            .join(&format!("{}/{}", state.kind.collection(), state.id))
+        else {
+            continue;
+        };
+        let res = app_state
+            .http_client
+            .get(url.as_str())
+            .timeout(Duration::from_secs(
+                provider
+                    .upstream_timeout_secs
+                    .unwrap_or(app_state.upstream_timeout_secs),
+            ))
+            .header("Authorization", format!("Bearer {}", provider.api_key))
+            .send()
+            .await;
+        match res {
+            Ok(r) if r.status().is_success() => {
+                debug!("state id {} found on provider {}", state.id, provider.name);
+                app_state.response_affinity.pin(&state.id, &provider.name);
+                return Some(provider.name.clone());
+            },
+            Ok(r) => debug!(
+                "state id {} lookup on {}: {}",
+                state.id,
+                provider.name,
+                r.status()
+            ),
+            Err(e) => debug!(
+                "state id {} lookup on {} failed: {}",
+                state.id, provider.name, e
+            ),
+        }
+    }
+    None
+}
+
+/// GET or DELETE /v1/responses/{id}
+pub async fn response_by_id(
+    State((app_state, _telemetry)): State<(Arc<AppState>, TelemetryClient)>,
+    Extension(request_id): Extension<String>,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    body: Bytes,
+) -> Response {
+    let target = OwnerTarget {
+        kind: StateKind::Response,
+        id: &id,
+        rest: &[],
+    };
+    forward_to_state_owner(&app_state, &request_id, method, &uri, target, body).await
+}
+
+/// GET /v1/responses/{id}/input_items, POST /v1/responses/{id}/cancel
+pub async fn response_action(
+    State((app_state, _telemetry)): State<(Arc<AppState>, TelemetryClient)>,
+    Extension(request_id): Extension<String>,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+    axum::extract::Path((id, action)): axum::extract::Path<(String, String)>,
+    body: Bytes,
+) -> Response {
+    let allowed = matches!(
+        (&method, action.as_str()),
+        (&axum::http::Method::GET, "input_items") | (&axum::http::Method::POST, "cancel")
+    );
+    if !allowed {
+        return unknown_endpoint(&method, &format!("/v1/responses/{{id}}/{}", action));
+    }
+    let target = OwnerTarget {
+        kind: StateKind::Response,
+        id: &id,
+        rest: &[action.as_str()],
+    };
+    forward_to_state_owner(&app_state, &request_id, method, &uri, target, body).await
+}
+
+/// GET, POST (update metadata) or DELETE /v1/conversations/{id}
+pub async fn conversation_by_id(
+    State((app_state, _telemetry)): State<(Arc<AppState>, TelemetryClient)>,
+    Extension(request_id): Extension<String>,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    body: Bytes,
+) -> Response {
+    let target = OwnerTarget {
+        kind: StateKind::Conversation,
+        id: &id,
+        rest: &[],
+    };
+    forward_to_state_owner(&app_state, &request_id, method, &uri, target, body).await
+}
+
+/// GET (list) or POST (append) /v1/conversations/{id}/items
+pub async fn conversation_items(
+    State((app_state, _telemetry)): State<(Arc<AppState>, TelemetryClient)>,
+    Extension(request_id): Extension<String>,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    body: Bytes,
+) -> Response {
+    let target = OwnerTarget {
+        kind: StateKind::Conversation,
+        id: &id,
+        rest: &["items"],
+    };
+    forward_to_state_owner(&app_state, &request_id, method, &uri, target, body).await
+}
+
+/// GET or DELETE /v1/conversations/{id}/items/{item_id}
+pub async fn conversation_item(
+    State((app_state, _telemetry)): State<(Arc<AppState>, TelemetryClient)>,
+    Extension(request_id): Extension<String>,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+    axum::extract::Path((id, item_id)): axum::extract::Path<(String, String)>,
+    body: Bytes,
+) -> Response {
+    if !valid_state_id(&item_id) {
+        return json_error_response(
+            "Invalid item id",
+            "invalid_request_error",
+            StatusCode::BAD_REQUEST,
+        );
+    }
+    let target = OwnerTarget {
+        kind: StateKind::Conversation,
+        id: &id,
+        rest: &["items", item_id.as_str()],
+    };
+    forward_to_state_owner(&app_state, &request_id, method, &uri, target, body).await
+}
+
+fn unknown_endpoint(method: &axum::http::Method, path: &str) -> Response {
+    json_error_response(
+        &format!("Unknown endpoint: {} {}", method, path),
+        "invalid_request_error",
+        StatusCode::NOT_FOUND,
+    )
+}
+
+/// The upstream object a sub-resource call addresses:
+/// `{collection}/{id}/{rest...}`.
+#[derive(Clone, Copy)]
+struct OwnerTarget<'a> {
+    kind: StateKind,
+    id: &'a str,
+    /// Path segments after the id, already validated or fixed literals.
+    rest: &'a [&'a str],
+}
+
+/// Forwards a Responses / Conversations sub-resource call to the provider
+/// holding the id (found by lookup when oxllm has no record). There is no
+/// failover and no circuit feedback: only that provider can answer, and
+/// these are cheap metadata calls rather than generations.
+async fn forward_to_state_owner(
+    app_state: &AppState,
+    request_id: &str,
+    method: axum::http::Method,
+    uri: &axum::http::Uri,
+    target: OwnerTarget<'_>,
+    body: Bytes,
+) -> Response {
+    let id = target.id;
+    if !valid_state_id(id) {
+        return json_error_response(
+            "Invalid id",
+            "invalid_request_error",
+            StatusCode::BAD_REQUEST,
+        );
+    }
+    let provider_name = match app_state.response_affinity.pinned_provider(id) {
+        Some(name) => name,
+        None => {
+            let openai: Vec<&ProviderState> = app_state
+                .providers
+                .iter()
+                .filter(|p| p.api == ApiFormat::Openai)
+                .collect();
+            let state = StateRef {
+                id: id.to_string(),
+                kind: target.kind,
+            };
+            match discover_state_owner(app_state, &state, &openai).await {
+                Some(name) => name,
+                None => {
+                    return json_error_response(
+                        &format!("No configured provider holds '{}'", id),
+                        "invalid_request_error",
+                        StatusCode::NOT_FOUND,
+                    )
+                },
+            }
+        },
+    };
+    let Some(provider) = app_state.providers.iter().find(|p| p.name == provider_name) else {
+        return json_error_response(
+            &format!(
+                "Provider '{}' holding '{}' is no longer configured",
+                provider_name, id
+            ),
+            "server_error",
+            StatusCode::BAD_GATEWAY,
+        );
+    };
+    if provider
+        .manual_disabled
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return json_error_response(
+            &format!("Provider '{}' holding '{}' is offline", provider_name, id),
+            "server_error",
+            StatusCode::SERVICE_UNAVAILABLE,
+        );
+    }
+
+    let mut path = format!("{}/{}", target.kind.collection(), id);
+    for segment in target.rest {
+        path.push('/');
+        path.push_str(segment);
+    }
+    let mut url = match provider.base_url.join(&path) {
+        Ok(url) => url,
+        Err(e) => {
+            error!("Invalid base URL path join for {}: {}", provider.name, e);
+            return json_error_response(
+                "Invalid upstream URL",
+                "server_error",
+                StatusCode::BAD_GATEWAY,
+            );
+        },
+    };
+    url.set_query(uri.query());
+
+    let start = Instant::now();
+    let mut req = app_state
+        .http_client
+        .request(method.clone(), url.as_str())
+        .timeout(Duration::from_secs(
+            provider
+                .upstream_timeout_secs
+                .unwrap_or(app_state.upstream_timeout_secs),
+        ))
+        .header("Authorization", format!("Bearer {}", provider.api_key));
+    if !body.is_empty() {
+        req = req.header("Content-Type", "application/json").body(body);
+    }
+    let mut operation = target.kind.collection().to_string();
+    for segment in target.rest.iter().take(1) {
+        operation.push('.');
+        operation.push_str(segment);
+    }
+    operation.push('.');
+    operation.push_str(&method.as_str().to_ascii_lowercase());
+    let (status, upstream_headers, res_body, error) = match req.send().await {
+        Ok(res) => {
+            let status = res.status();
+            let headers = res.headers().clone();
+            match res.bytes().await {
+                Ok(b) => {
+                    let error =
+                        (!status.is_success()).then(|| String::from_utf8_lossy(&b).to_string());
+                    (status, headers, b, error)
+                },
+                Err(e) => (
+                    StatusCode::BAD_GATEWAY,
+                    HeaderMap::new(),
+                    Bytes::new(),
+                    Some(e.to_string()),
+                ),
+            }
+        },
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            HeaderMap::new(),
+            Bytes::new(),
+            Some(e.to_string()),
+        ),
+    };
+    app_state.request_log.record(RequestRecord {
+        ts_ms: unix_millis(),
+        endpoint: operation,
+        route: String::new(),
+        model: String::new(),
+        provider: provider.name.clone(),
+        status: status.as_u16(),
+        attempts: 1,
+        latency_ms: start.elapsed().as_millis() as u64,
+        ttft_ms: None,
+        streamed: false,
+        error: error.clone(),
+        request_id: request_id.to_string(),
+    });
+    if res_body.is_empty() && status == StatusCode::BAD_GATEWAY {
+        return json_error_response(
+            &format!(
+                "Provider '{}' holding '{}' failed: {}",
+                provider.name,
+                id,
+                error.unwrap_or_default()
+            ),
+            "server_error",
+            StatusCode::BAD_GATEWAY,
+        );
+    }
+    // Deleting the object itself (not one of its items) ends its life.
+    if method == axum::http::Method::DELETE && target.rest.is_empty() && status.is_success() {
+        app_state.response_affinity.unpin(id);
+    }
+    let mut response = Response::new(Body::from(res_body));
+    *response.status_mut() = status;
+    copy_response_headers(&upstream_headers, response.headers_mut());
     response
 }
 
@@ -2007,6 +2714,41 @@ mod tests {
         }
         assert_eq!(scan.usage.input, 7);
         assert_eq!(scan.usage.output, 42);
+    }
+
+    #[test]
+    fn test_responses_state_id_extraction() {
+        let req =
+            serde_json::json!({"previous_response_id": "resp_1", "conversation": {"id": "conv_1"}});
+        let refs = |v: &Value| -> Vec<(String, StateKind)> {
+            referenced_state_ids(v)
+                .into_iter()
+                .map(|r| (r.id, r.kind))
+                .collect()
+        };
+        assert_eq!(
+            refs(&req),
+            [
+                ("resp_1".to_string(), StateKind::Response),
+                ("conv_1".to_string(), StateKind::Conversation)
+            ]
+        );
+        let req = serde_json::json!({"conversation": "conv_2"});
+        assert_eq!(
+            refs(&req),
+            [("conv_2".to_string(), StateKind::Conversation)]
+        );
+        assert!(referenced_state_ids(&serde_json::json!({"input": "x"})).is_empty());
+        let res = serde_json::json!({"id": "resp_9", "conversation": {"id": "conv_9"}});
+        assert_eq!(created_state_ids(&res), ["resp_9", "conv_9"]);
+    }
+
+    #[test]
+    fn test_valid_state_id_rejects_path_tricks() {
+        assert!(valid_state_id("resp_abc-123"));
+        for bad in ["", "resp/..", "..", "resp?x=1", "resp%2F", "a b"] {
+            assert!(!valid_state_id(bad), "{bad}");
+        }
     }
 
     #[test]
