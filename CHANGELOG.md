@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.28] - 2026-11-09
+
 ### Added
 - **Custom upstream auth header**: an OpenAI-format provider can set
   `auth_header = "<Header-Name>"` to send its `api_key` raw in that header
