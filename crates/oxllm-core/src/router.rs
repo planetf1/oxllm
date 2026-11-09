@@ -322,6 +322,7 @@ impl AdaptivePriorityStrategy {
                     is_probe: provider_admit == Admit::Probe,
                     model_probe: model_admit == Admit::Probe,
                     upstream_timeout_secs: provider.upstream_timeout_secs,
+                    auth_header: provider.tuning.auth_header.clone(),
                 },
             ));
         }
@@ -419,6 +420,7 @@ impl RoutingStrategy for AdaptivePriorityStrategy {
                     is_probe: admit == Admit::Probe,
                     model_probe: false,
                     upstream_timeout_secs: provider.upstream_timeout_secs,
+                    auth_header: provider.tuning.auth_header.clone(),
                 });
             }
         }

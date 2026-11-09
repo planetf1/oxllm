@@ -306,6 +306,17 @@ fn build_app_state(config: Config, previous: Option<&AppState>) -> Result<AppSta
             )
         })?;
 
+        let auth_header = match p.auth_header.as_deref() {
+            Some(h) => Some(
+                reqwest::header::HeaderName::from_bytes(h.as_bytes()).map_err(|e| {
+                    format!(
+                        "Invalid auth_header '{}' for provider '{}': {}",
+                        h, p.name, e
+                    )
+                })?,
+            ),
+            None => None,
+        };
         let mut state = ProviderState {
             name: p.name,
             base_url: url,
@@ -318,6 +329,7 @@ fn build_app_state(config: Config, previous: Option<&AppState>) -> Result<AppSta
                 circuit_failure_threshold: p.circuit_failure_threshold,
                 circuit_base_cooldown_secs: p.circuit_base_cooldown_secs,
                 first_byte_timeout_secs: p.first_byte_timeout_secs,
+                auth_header,
             },
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
@@ -6999,6 +7011,29 @@ vm = [
         let raw = ro.lock().await[0].to_ascii_lowercase();
         assert!(raw.contains("authorization: bearer key-o1"), "got: {raw}");
         assert!(!raw.contains("x-api-key"), "got: {raw}");
+    }
+
+    /// A provider with `auth_header` set sends the raw key in that header
+    /// instead of `Authorization: Bearer` (some gateways reject Bearer tokens).
+    #[tokio::test]
+    async fn test_provider_auth_header_replaces_bearer() {
+        let rec = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let ok = r#"{"choices":[{"message":{"role":"assistant","content":"x"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
+        let addr = spawn_raw_recording_upstream(vec![http_json("200 OK", ok)], rec.clone()).await;
+        let mut p = test_provider("r1", addr, ApiFormat::Openai);
+        p.tuning.auth_header = Some(reqwest::header::HeaderName::from_static("x-api-key"));
+        let (proxy, _s) = spawn_messages_proxy(vec![p], vec![]).await;
+
+        let res = reqwest::Client::new()
+            .post(format!("http://{}/v1/chat/completions", proxy))
+            .json(&serde_json::json!({"model":"vm","messages":[{"role":"user","content":"x"}]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let raw = rec.lock().await[0].to_ascii_lowercase();
+        assert!(raw.contains("x-api-key: key-r1"), "got: {raw}");
+        assert!(!raw.contains("authorization:"), "got: {raw}");
     }
 
     #[tokio::test]

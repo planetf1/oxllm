@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Custom upstream auth header**: an OpenAI-format provider can set
+  `auth_header = "<Header-Name>"` to send its `api_key` raw in that header
+  instead of `Authorization: Bearer`, for gateways that reject Bearer tokens.
+  Applies to chat/completions routing and to Responses/Conversations state
+  lookups. The name is validated at config load; it is rejected on
+  `api = "anthropic"` providers.
+
 ## [0.1.27] - 2026-11-06
 
 ### Fixed

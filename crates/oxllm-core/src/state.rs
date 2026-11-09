@@ -338,11 +338,14 @@ impl ProviderState {
 }
 
 /// Per-provider overrides of the server-wide circuit and timeout settings.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProviderTuning {
     pub circuit_failure_threshold: Option<u32>,
     pub circuit_base_cooldown_secs: Option<u64>,
     pub first_byte_timeout_secs: Option<u64>,
+    /// Send the API key raw in this header instead of `Authorization: Bearer`
+    /// (OpenAI-format providers only). Validated at config load.
+    pub auth_header: Option<reqwest::header::HeaderName>,
 }
 
 #[derive(Debug)]
@@ -727,6 +730,8 @@ pub struct SelectedProvider {
     /// This selection holds the model's HalfOpen probe permit.
     pub model_probe: bool,
     pub upstream_timeout_secs: Option<u64>,
+    /// Header carrying the key instead of `Authorization: Bearer`.
+    pub auth_header: Option<reqwest::header::HeaderName>,
 }
 
 pub struct AppState {

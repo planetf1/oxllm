@@ -992,7 +992,7 @@ async fn proxy_request(
             .header("Content-Type", "application/json");
         req = match spec.api {
             ApiFormat::Openai => {
-                req.header("Authorization", format!("Bearer {}", selected.api_key))
+                with_provider_auth(req, selected.auth_header.as_ref(), &selected.api_key)
             },
             ApiFormat::Anthropic => {
                 let version = headers
@@ -2276,15 +2276,15 @@ async fn discover_state_owner(
         else {
             continue;
         };
-        let res = app_state
+        let req = app_state
             .http_client
             .get(url.as_str())
             .timeout(Duration::from_secs(
                 provider
                     .upstream_timeout_secs
                     .unwrap_or(app_state.upstream_timeout_secs),
-            ))
-            .header("Authorization", format!("Bearer {}", provider.api_key))
+            ));
+        let res = with_provider_auth(req, provider.tuning.auth_header.as_ref(), &provider.api_key)
             .send()
             .await;
         match res {
@@ -2516,8 +2516,8 @@ async fn forward_to_state_owner(
             provider
                 .upstream_timeout_secs
                 .unwrap_or(app_state.upstream_timeout_secs),
-        ))
-        .header("Authorization", format!("Bearer {}", provider.api_key));
+        ));
+    req = with_provider_auth(req, provider.tuning.auth_header.as_ref(), &provider.api_key);
     if !body.is_empty() {
         req = req.header("Content-Type", "application/json").body(body);
     }
@@ -2661,6 +2661,19 @@ pub async fn admin_reset(
             StatusCode::NOT_FOUND,
             format!("Provider '{}' not found", name),
         ),
+    }
+}
+
+/// Attaches an OpenAI-format provider's key: raw in its configured
+/// `auth_header`, else as `Authorization: Bearer`.
+fn with_provider_auth(
+    req: reqwest::RequestBuilder,
+    auth_header: Option<&reqwest::header::HeaderName>,
+    api_key: &str,
+) -> reqwest::RequestBuilder {
+    match auth_header {
+        Some(name) => req.header(name, api_key),
+        None => req.header("Authorization", format!("Bearer {api_key}")),
     }
 }
 

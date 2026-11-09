@@ -128,6 +128,10 @@ pub struct ProviderConfig {
     /// whose headers arrive only after the whole generation.
     #[serde(default)]
     pub first_byte_timeout_secs: Option<u64>,
+    /// OpenAI-format only: send `api_key` raw in this header instead of
+    /// `Authorization: Bearer` (e.g. `"X-Api-Key"` for gateways that reject Bearer).
+    #[serde(default)]
+    pub auth_header: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -320,6 +324,20 @@ impl Config {
                     "Provider '{}': first_byte_timeout_secs must be at least 1",
                     p.name
                 )));
+            }
+            if let Some(h) = &p.auth_header {
+                if p.api != ApiFormat::Openai {
+                    return Err(OxllmError::ConfigLoad(format!(
+                        "Provider '{}': auth_header applies only to api = \"openai\"",
+                        p.name
+                    )));
+                }
+                if reqwest::header::HeaderName::from_bytes(h.as_bytes()).is_err() {
+                    return Err(OxllmError::ConfigLoad(format!(
+                        "Provider '{}': auth_header '{}' is not a valid HTTP header name",
+                        p.name, h
+                    )));
+                }
             }
         }
 
@@ -807,6 +825,29 @@ vm = [{ provider = "p", model = "m" }]
             .unwrap_err()
             .to_string()
             .contains("first_byte_timeout_secs"));
+    }
+
+    #[test]
+    fn test_validate_auth_header() {
+        let mut config = minimal_config();
+        assert_eq!(config.providers[0].auth_header, None);
+        config.providers[0].auth_header = Some("X-Api-Key".into());
+        config.validate().unwrap();
+
+        config.providers[0].auth_header = Some("bad header".into());
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("not a valid HTTP header name"));
+
+        config.providers[0].auth_header = Some("X-Api-Key".into());
+        config.providers[0].api = ApiFormat::Anthropic;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("only to api"));
     }
 
     // ---- nested virtual models ------------------------------------------
