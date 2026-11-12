@@ -110,11 +110,29 @@ jobs:
         if: steps.preflight.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: v${{ steps.bump.outputs.new }}
+          REPO: ${{ github.repository }}
         run: |
-          gh workflow run release.yml \
-            --ref "v${{ steps.bump.outputs.new }}" \
-            --repo "${{ github.repository }}"
-          echo "Triggered release workflow for v${{ steps.bump.outputs.new }}"
+          # The dispatch API occasionally returns HTTP 500 (seen on v0.1.27),
+          # sometimes after the run was already created. Retry, but first
+          # check for an existing run so a retry never double-dispatches.
+          for attempt in 1 2 3 4; do
+            if gh workflow run release.yml --ref "$TAG" --repo "$REPO"; then
+              echo "Triggered release workflow for $TAG"
+              exit 0
+            fi
+            sleep $((attempt * 15))
+            existing=$(gh run list --workflow release.yml --repo "$REPO" \
+              --event workflow_dispatch --branch "$TAG" --limit 1 \
+              --json databaseId --jq '.[0].databaseId // empty')
+            if [ -n "$existing" ]; then
+              echo "Dispatch reported an error but run $existing exists for $TAG"
+              exit 0
+            fi
+            echo "::warning::release dispatch attempt $attempt failed, retrying"
+          done
+          echo "::error::could not dispatch release.yml for $TAG"
+          exit 1
 
       - name: Summary
         if: steps.preflight.outputs.skip != 'true'
