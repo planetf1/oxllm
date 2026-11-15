@@ -30,8 +30,8 @@ curl -X POST http://127.0.0.1:8080/v1/messages \
   -H "content-type: application/json" \
   -d '{"model": "claude", "max_tokens": 256, "messages": [{"role": "user", "content": "Hello"}]}'
 
-# Live dashboard — no collector needed
-curl http://127.0.0.1:8080/status
+# Check status — no collector needed
+oxllm status
 ```
 
 See [Quick Start](#-quick-start) for the full setup walkthrough.
@@ -398,8 +398,8 @@ curl -X POST http://127.0.0.1:8080/v1/completions \
   -H "Content-Type: application/json" \
   -d '{"model": "basic", "prompt": "def add(a, b):\n    ", "max_tokens": 16}'
 
-# Live dashboard (no external collector needed)
-curl http://127.0.0.1:8080/status
+# Check status — no collector needed
+oxllm status
 ```
 
 
