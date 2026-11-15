@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.30] - 2026-11-15
+
 ### Changed
 - **Dependency updates**: patch bumps via `cargo update` — `rustls-pki-types`,
   `rustls-webpki`, `webpki-roots`, `mio`, `syn`, `cc`, `mime`, `log`,
