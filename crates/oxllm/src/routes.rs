@@ -1167,7 +1167,8 @@ async fn proxy_request(
                         }
                     }
                 }
-                let (input_tokens, output_tokens) = (usage.input, usage.output);
+                let (input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens) =
+                    (usage.input, usage.output, usage.cached, usage.cache_creation);
 
                 // Report Success feedback
                 let target_provider_state = app_state
@@ -1236,6 +1237,8 @@ async fn proxy_request(
                     model: target_model.clone(),
                     input_tokens,
                     output_tokens,
+                    cache_read_tokens,
+                    cache_creation_tokens,
                     duration: start_time.elapsed(),
                     // Non-streaming: whole response = first byte.
                     ttft_ms: Some(elapsed_ttft_ms),
@@ -1429,6 +1432,8 @@ async fn proxy_request(
         model: last_failed_model.clone(),
         input_tokens: 0,
         output_tokens: 0,
+        cache_read_tokens: 0,
+        cache_creation_tokens: 0,
         duration: start_time.elapsed(),
         ttft_ms: None,
         attempts,
@@ -1766,6 +1771,8 @@ fn stream_upstream_body(
             model: model_name.clone(),
             input_tokens: usage_scan.usage.input,
             output_tokens: usage_scan.usage.output,
+            cache_read_tokens: usage_scan.usage.cached,
+            cache_creation_tokens: usage_scan.usage.cache_creation,
             duration,
             // For streaming, `duration` is the time captured before the spawn
             // (time to first upstream response headers), which is the true TTFT.
@@ -1896,8 +1903,10 @@ fn is_passthrough_client_error(status: u16) -> bool {
 struct Usage {
     input: u64,
     output: u64,
-    /// Prompt tokens served from the upstream cache.
+    /// Prompt tokens served from the upstream cache (cache_read_input_tokens).
     cached: u64,
+    /// Prompt tokens written to the upstream cache (cache_creation_input_tokens).
+    cache_creation: u64,
 }
 
 /// Reads token usage from a response body (or SSE event payload). OpenAI
@@ -1927,13 +1936,16 @@ fn parse_usage(v: &Value, api: ApiFormat) -> Usage {
                 .and_then(|t| t.as_u64())
                 .unwrap_or(0),
             cached: 0,
+            cache_creation: 0,
         },
         ApiFormat::Anthropic => {
             let cached = field("cache_read_input_tokens");
+            let cache_creation = field("cache_creation_input_tokens");
             Usage {
-                input: field("input_tokens") + cached + field("cache_creation_input_tokens"),
+                input: field("input_tokens") + cached + cache_creation,
                 output: field("output_tokens"),
                 cached,
+                cache_creation,
             }
         },
     }
@@ -1980,6 +1992,7 @@ impl SseUsageScanner {
                     let start = parse_usage(message, ApiFormat::Anthropic);
                     self.usage.input = start.input;
                     self.usage.cached = start.cached;
+                    self.usage.cache_creation = start.cache_creation;
                     self.usage.output = start.output;
                 }
             },
@@ -2714,7 +2727,8 @@ mod tests {
             Usage {
                 input: 3,
                 output: 4,
-                cached: 0
+                cached: 0,
+                cache_creation: 0,
             }
         );
         let systemone = serde_json::json!({"usage": {"input_tokens": 5, "output_tokens": 6}});

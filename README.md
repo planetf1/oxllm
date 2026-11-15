@@ -489,6 +489,33 @@ Clients ask for `general-med`; the runtime behind each model is a leaf detail yo
 8. **Idle decay**: every 5 minutes without traffic reduces the failure count by 1; below the threshold an open circuit closes again.
 9. Anthropic routes (`/v1/messages`) return 4xx other than 408/429 to the caller untouched: another provider would not fix a bad request or key, and it says nothing about provider health.
 
+### Endpoint Capability Mismatches
+
+Some endpoints are only supported by specific backends — `/v1/completions` FIM
+requires a model with fill-in-the-middle training; `/v1/decisions` (vLLM 0.33+)
+is not available on llama.cpp or most LiteLLM-proxied upstreams. When a virtual
+model pool mixes compatible and incompatible providers, an incompatible provider
+returns a 4xx that counts as a failure, opens its circuit, and causes a failover
+to the next — which may also not support the endpoint.
+
+The fix is to use a **dedicated virtual model** that lists only capable
+providers for such endpoints, rather than routing via a general pool:
+
+```toml
+[virtual_models]
+# FIM completions: only the provider whose checkpoint has FIM training.
+"granite-fim" = [{ provider = "llamacpp-local", model = "granite-4.1-3b-fim" }]
+
+# /v1/decisions: only vLLM backends — llama.cpp and LiteLLM proxies do not support it.
+"decisions-model" = [{ provider = "bv-vllm", model = "ibm-granite/granite-4.1-8b" }]
+```
+
+If you accidentally route an unsupported endpoint to a provider, the circuit
+breaker will open it after `circuit_failure_threshold` failures (default 3),
+so it will stop receiving traffic — but those first few requests will return
+errors to callers. Avoid mixing in `oxllm validate` by ensuring the virtual
+model's listed providers all support the endpoint you intend to call.
+
 ### Routing Policies
 
 By default a virtual model uses `priority`: strict configuration order with the
@@ -717,29 +744,33 @@ Every request produces one `oxllm.transaction` span. Standard attributes follow 
 [GenAI client inference conventions](https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/client-inference.md);
 `proxy.*` and `gen_ai.client.ttft_ms` are oxllm extensions.
 
-| Attribute | Example | Description |
+| Attribute | Example | Notes |
 |---|---|---|
 | `gen_ai.operation.name` | `chat` / `messages` | Endpoint family |
-| `gen_ai.provider.name` | `claude-ext` | Provider that served it (the last one tried, on failure) |
+| `gen_ai.provider.name` | `claude-ext` | Provider that served it (last tried on failure) |
 | `gen_ai.request.model` | `aws/claude-sonnet-5-5` | Upstream model used |
-| `gen_ai.usage.input_tokens` | `1420` | Input tokens (Anthropic: includes cache reads and creations) |
+| `gen_ai.usage.input_tokens` | `1420` | Total input tokens (Anthropic: includes cache reads and creations) |
 | `gen_ai.usage.output_tokens` | `312` | Output tokens |
+| `gen_ai.usage.cache_read.input_tokens` | `1100` | Tokens served from upstream prompt cache (Anthropic only; absent when 0) |
+| `gen_ai.usage.cache_creation.input_tokens` | `280` | Tokens written to upstream prompt cache (Anthropic only; absent when 0) |
+| `gen_ai.response.finish_reasons` | `stop` | Set to `stop` on success; absent on failure |
+| `gen_ai.client.ttft_ms` | `320` | Time to first token (ms). Streaming: time to first headers. Non-streaming: total latency. Absent on failure. *(oxllm extension)* |
+| `error.type` | `all_providers_failed` | Set on failure; value matches `proxy.initial_failure_reason` |
 | `proxy.route` | `pool-docs` | Virtual model the client asked for |
 | `proxy.attempts_required` | `2` | Pool entries tried |
-| `proxy.initial_failure_reason` | `all_providers_failed` | Set on a failed request (`all_providers_failed`, `no_available_provider`, `stream_failed`) |
-| `gen_ai.client.ttft_ms` | `320` | Time to first token (ms); for streaming: time to first upstream headers; for non-streaming: total latency. Absent on failed requests |
+| `proxy.initial_failure_reason` | `all_providers_failed` | Failure reason: `all_providers_failed`, `no_available_provider`, `stream_failed` |
 | `proxy.request_id` | `oxllm-3dc0...` | Matches the `x-request-id` response header |
 
-A request that fails after every entry (or whose stream breaks) gets span status `ERROR`, so `otelite traces list --status ERROR` finds it. Spans link to an incoming W3C `traceparent` when present. Find them by service: `otelite traces list --since 1h` and look for service `oxllm`.
+A request that fails after every entry (or whose stream breaks) gets span status `ERROR` and `error.type` set, so `otelite traces list --status ERROR` finds it immediately. Spans propagate an incoming W3C `traceparent` when present, linking upstream caller traces.
 
 ### Metrics
 
-| Metric | Type | Description |
-|---|---|---|
-| `llm_proxy.provider.status` | Gauge | `0` = healthy, `1` = rate-limited, `2` = circuit tripped (per provider) |
-| `llm_proxy.request.duration` | Histogram | Total request lifecycle (ms), buckets 5 ms – 10 min |
-| `llm_proxy.ttft` | Histogram | Time to first token (ms), buckets 50 ms – 60 s |
-| `llm_proxy.tokens.consumed` | Counter | Cumulative tokens by provider, model, and type |
+| Metric | Type | Tags | Description |
+|---|---|---|---|
+| `llm_proxy.provider.status` | Gauge | `provider.name` | `0` = healthy, `1` = rate-limited, `2` = circuit tripped |
+| `llm_proxy.request.duration` | Histogram | `gen_ai.*` | Total request lifecycle (ms), buckets 5 ms – 10 min |
+| `llm_proxy.ttft` | Histogram | `gen_ai.*` | Time to first token (ms), buckets 50 ms – 60 s |
+| `llm_proxy.tokens.consumed` | Counter | `gen_ai.*` + `type` | Cumulative tokens; `type` is `input`, `output`, `cache_read`, or `cache_creation` |
 
 Metrics are exported every 60 s by default. `otel_endpoint` is the collector's base URL; oxllm appends `/v1/traces` and `/v1/metrics` itself.
 

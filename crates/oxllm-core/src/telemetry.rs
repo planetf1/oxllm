@@ -19,6 +19,10 @@ pub enum TelemetryEvent {
         model: String,
         input_tokens: u64,
         output_tokens: u64,
+        /// Tokens served from the upstream prompt cache (Anthropic only).
+        cache_read_tokens: u64,
+        /// Tokens written to the upstream prompt cache (Anthropic only).
+        cache_creation_tokens: u64,
         duration: Duration,
         /// Time to first token in milliseconds. For streaming responses this is
         /// the time to first upstream response headers; for non-streaming it
@@ -209,6 +213,8 @@ impl TelemetryWorker {
                     model,
                     input_tokens,
                     output_tokens,
+                    cache_read_tokens,
+                    cache_creation_tokens,
                     duration,
                     ttft_ms,
                     attempts,
@@ -243,6 +249,18 @@ impl TelemetryWorker {
                         self.tokens_consumed_counter
                             .add(output_tokens, &output_attrs);
                     }
+                    if cache_read_tokens > 0 {
+                        let mut cache_read_attrs = common_attributes.clone();
+                        cache_read_attrs.push(KeyValue::new("type", "cache_read"));
+                        self.tokens_consumed_counter
+                            .add(cache_read_tokens, &cache_read_attrs);
+                    }
+                    if cache_creation_tokens > 0 {
+                        let mut cache_write_attrs = common_attributes.clone();
+                        cache_write_attrs.push(KeyValue::new("type", "cache_creation"));
+                        self.tokens_consumed_counter
+                            .add(cache_creation_tokens, &cache_write_attrs);
+                    }
 
                     // 2. Build Propagated Trace Span Context if present
                     let span_builder = tracer.span_builder("oxllm.transaction");
@@ -271,7 +289,7 @@ impl TelemetryWorker {
                         }
                     }
 
-                    // Append Formal GenAI Semantic Convention Attributes
+                    // Append GenAI Semantic Convention Attributes
                     let mut attributes = common_attributes;
                     attributes.push(KeyValue::new(
                         "gen_ai.usage.input_tokens",
@@ -281,6 +299,18 @@ impl TelemetryWorker {
                         "gen_ai.usage.output_tokens",
                         output_tokens as i64,
                     ));
+                    if cache_read_tokens > 0 {
+                        attributes.push(KeyValue::new(
+                            "gen_ai.usage.cache_read.input_tokens",
+                            cache_read_tokens as i64,
+                        ));
+                    }
+                    if cache_creation_tokens > 0 {
+                        attributes.push(KeyValue::new(
+                            "gen_ai.usage.cache_creation.input_tokens",
+                            cache_creation_tokens as i64,
+                        ));
+                    }
                     attributes.push(KeyValue::new("proxy.attempts_required", attempts as i64));
                     if let Some(ttft) = ttft_ms {
                         attributes.push(KeyValue::new("gen_ai.client.ttft_ms", ttft as i64));
@@ -290,8 +320,24 @@ impl TelemetryWorker {
                         failure_reason.as_deref(),
                         Some("all_providers_failed" | "no_available_provider" | "stream_failed")
                     );
-                    if let Some(reason) = failure_reason {
-                        attributes.push(KeyValue::new("proxy.initial_failure_reason", reason));
+                    if let Some(reason) = &failure_reason {
+                        attributes.push(KeyValue::new(
+                            "proxy.initial_failure_reason",
+                            reason.clone(),
+                        ));
+                    }
+                    // Set error.type on failures (OTel convention) and
+                    // gen_ai.response.finish_reasons = ["stop"] on success so
+                    // collectors can classify request outcomes.
+                    if terminal_failure {
+                        if let Some(reason) = failure_reason {
+                            attributes.push(KeyValue::new("error.type", reason));
+                        }
+                    } else {
+                        attributes.push(KeyValue::new(
+                            "gen_ai.response.finish_reasons",
+                            "stop",
+                        ));
                     }
 
                     attributes.push(KeyValue::new("proxy.request_id", request_id));
