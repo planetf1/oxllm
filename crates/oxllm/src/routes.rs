@@ -1002,16 +1002,34 @@ async fn proxy_request(
                 let mut r = req
                     .header("x-api-key", selected.api_key.as_str())
                     .header("anthropic-version", version);
-                if let Some(beta) = headers.get("anthropic-beta") {
-                    r = r.header("anthropic-beta", beta);
+                // Forward all anthropic-* request headers except anthropic-version
+                // (already set above). This covers anthropic-beta and any future
+                // beta feature headers without needing per-header additions.
+                for (key, value) in headers.iter() {
+                    let name = key.as_str();
+                    if name.starts_with("anthropic-") && name != "anthropic-version" {
+                        r = r.header(key.clone(), value.clone());
+                    }
                 }
                 r
             },
         };
 
-        // Propagate tracing headers if present
-        if let Some(traceparent) = headers.get("traceparent") {
-            req = req.header("traceparent", traceparent);
+        // Propagate tracing and accept headers if present. accept tells the
+        // upstream whether the client expects SSE or JSON, and x-* headers
+        // carry client-side tracing and debugging context.
+        for name in &["traceparent", "tracestate", "accept"] {
+            if let Some(value) = headers.get(*name) {
+                req = req.header(*name, value.clone());
+            }
+        }
+        for (key, value) in headers.iter() {
+            if key.as_str().starts_with("x-") {
+                // Skip x-api-key: auth is set per-provider above.
+                if key.as_str() != "x-api-key" {
+                    req = req.header(key.clone(), value.clone());
+                }
+            }
         }
 
         debug!(
