@@ -26,6 +26,109 @@ use oxllm_core::state::{
 use oxllm_core::telemetry::{TelemetryClient, TelemetryWorker};
 use reqwest::Url;
 
+/// Returns IPv4 nameservers from `scutil --dns`, in order, deduped.
+/// Falls back to an empty vec on any error.
+fn system_nameservers() -> Vec<String> {
+    let Ok(out) = std::process::Command::new("scutil")
+        .arg("--dns")
+        .output()
+    else {
+        return vec![];
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut seen = Vec::new();
+    for line in text.lines() {
+        // Lines look like: "  nameserver[0] : 192.168.100.254"
+        if let Some(rest) = line.trim().strip_prefix("nameserver[") {
+            if let Some(ip_part) = rest.splitn(2, ':').nth(1) {
+                let ip = ip_part.trim();
+                if ip.parse::<std::net::Ipv4Addr>().is_ok() && !seen.contains(&ip.to_owned()) {
+                    seen.push(ip.to_owned());
+                }
+            }
+        }
+    }
+    seen
+}
+
+/// Minimal UDP DNS A-record query sent directly to `resolver_ip:53`.
+/// Returns resolved `SocketAddr`s (port 443) or an empty vec on any failure.
+/// Never panics.
+fn udp_dns_lookup(hostname: &str, resolver_ip: &str, timeout: Duration) -> Vec<SocketAddr> {
+    use std::net::UdpSocket;
+
+    // Build a minimal DNS A-record query packet.
+    let tx_id: u16 = 1;
+    let flags: u16 = 0x0100; // recursion desired
+    let mut packet = Vec::with_capacity(512);
+    packet.extend_from_slice(&tx_id.to_be_bytes());
+    packet.extend_from_slice(&flags.to_be_bytes());
+    packet.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+    packet.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT
+    packet.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
+    packet.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
+    for label in hostname.trim_end_matches('.').split('.') {
+        let b = label.as_bytes();
+        packet.push(b.len() as u8);
+        packet.extend_from_slice(b);
+    }
+    packet.push(0u8); // root label
+    packet.extend_from_slice(&1u16.to_be_bytes()); // QTYPE A
+    packet.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
+
+    let Ok(sock) = UdpSocket::bind("0.0.0.0:0") else { return vec![] };
+    let _ = sock.set_read_timeout(Some(timeout));
+    let resolver = format!("{resolver_ip}:53");
+    if sock.send_to(&packet, &resolver).is_err() { return vec![]; }
+
+    let mut buf = [0u8; 512];
+    let Ok((len, _)) = sock.recv_from(&mut buf) else { return vec![] };
+    let data = &buf[..len];
+
+    if data.len() < 12 { return vec![]; }
+    let ancount = u16::from_be_bytes([data[6], data[7]]) as usize;
+    if ancount == 0 { return vec![]; }
+
+    // Skip question section.
+    let mut pos = 12usize;
+    loop {
+        if pos >= data.len() { return vec![]; }
+        let len = data[pos] as usize;
+        if len == 0 { pos += 1; break; }
+        pos += 1 + len;
+    }
+    pos += 4; // QTYPE + QCLASS
+
+    // Walk answer RRs.
+    let mut addrs = Vec::new();
+    for _ in 0..ancount {
+        if pos >= data.len() { break; }
+        // NAME: pointer (0xC0 xx) or inline labels.
+        if pos + 1 < data.len() && data[pos] & 0xC0 == 0xC0 {
+            pos += 2;
+        } else {
+            loop {
+                if pos >= data.len() { return addrs; }
+                let l = data[pos] as usize;
+                if l == 0 { pos += 1; break; }
+                pos += 1 + l;
+            }
+        }
+        if pos + 10 > data.len() { break; }
+        let rtype = u16::from_be_bytes([data[pos], data[pos + 1]]);
+        let rclass = u16::from_be_bytes([data[pos + 2], data[pos + 3]]);
+        let rdlen = u16::from_be_bytes([data[pos + 8], data[pos + 9]]) as usize;
+        pos += 10;
+        if pos + rdlen > data.len() { break; }
+        if rtype == 1 && rclass == 1 && rdlen == 4 {
+            let ip = std::net::Ipv4Addr::new(data[pos], data[pos+1], data[pos+2], data[pos+3]);
+            addrs.push(SocketAddr::from((IpAddr::V4(ip), 443u16)));
+        }
+        pos += rdlen;
+    }
+    addrs
+}
+
 /// Resolves the config file path using XDG base directory conventions.
 ///
 /// If the given path exists, returns it as-is.
@@ -371,10 +474,55 @@ fn build_app_state(config: Config, previous: Option<&AppState>) -> Result<AppSta
         providers.push(state);
     }
 
-    let http_client = reqwest::Client::builder()
-        .pool_idle_timeout(Duration::from_secs(90))
-        .build()
-        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+    let http_client = {
+        let mut builder = reqwest::Client::builder()
+            .pool_idle_timeout(Duration::from_secs(90));
+
+        // DNS fallback: for each unique provider hostname, attempt system DNS
+        // first. If that fails, query the LAN default gateway directly over UDP
+        // (same approach as vpnroute). Only populate .resolve() when the
+        // fallback is actually needed — normal DNS path is completely unchanged.
+        let hostnames: std::collections::HashSet<String> = providers
+            .iter()
+            .filter_map(|p| Url::parse(p.base_url.as_str()).ok())
+            .filter_map(|u| u.host_str().map(str::to_owned))
+            .filter(|h| !h.parse::<std::net::IpAddr>().is_ok()) // skip bare IPs
+            .collect();
+
+        // Build fallback resolver list: configured nameservers then 1.1.1.1.
+        let mut fallback_resolvers = system_nameservers();
+        let public_fallback = "1.1.1.1".to_owned();
+        if !fallback_resolvers.contains(&public_fallback) {
+            fallback_resolvers.push(public_fallback);
+        }
+
+        for hostname in &hostnames {
+            // Only activate the fallback when system DNS actually fails.
+            if std::net::ToSocketAddrs::to_socket_addrs(&(hostname.as_str(), 443u16)).is_ok() {
+                continue;
+            }
+            // Try each fallback resolver in order; stop at the first that answers.
+            let mut resolved = vec![];
+            for resolver in &fallback_resolvers {
+                resolved = udp_dns_lookup(hostname, resolver, Duration::from_secs(3));
+                if !resolved.is_empty() {
+                    warn!(
+                        "system DNS failed for {hostname}; using fallback IPs via {resolver}: {}",
+                        resolved.iter().map(|a| a.ip().to_string()).collect::<Vec<_>>().join(", ")
+                    );
+                    break;
+                }
+            }
+            if resolved.is_empty() {
+                warn!("system DNS failed for {hostname} and all fallback resolvers also failed");
+            }
+            for addr in resolved {
+                builder = builder.resolve(hostname, addr);
+            }
+        }
+
+        builder.build().map_err(|e| format!("Failed to build HTTP client: {}", e))?
+    };
 
     let policies: std::collections::HashMap<String, RoutingPolicy> = config
         .policies
