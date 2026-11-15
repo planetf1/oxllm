@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.33] - 2026-11-15
+
+### Added
+- **OTel circuit-breaker transition counter** (`llm_proxy.circuit.transitions`):
+  emitted on every circuit open/close with attributes `provider.name`,
+  `direction` (`opened`/`closed`), `gen_ai.request.model` (when model-scoped),
+  and `circuit.cooldown_secs` (when opening). Dashboards can now alert on
+  circuit trips without log parsing.
+
+### Fixed
+- Broken test `test_parse_usage_anthropic_folds_cache_into_input` was missing
+  the `cache_creation` field added in v0.1.31.
+
 ## [0.1.32] - 2026-11-15
 
 ### Added

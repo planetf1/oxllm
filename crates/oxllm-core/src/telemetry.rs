@@ -38,6 +38,19 @@ pub enum TelemetryEvent {
         provider: String,
         status: u64, // 0 = Healthy, 1 = Cooldown, 2 = Tripped
     },
+    /// A provider or model circuit opened or closed. Emitted on every
+    /// state transition so dashboards can track circuit health over time.
+    RecordCircuitTransition {
+        /// Provider name.
+        provider: String,
+        /// Upstream model name. Empty string means the transition is at
+        /// provider scope (connectivity failure), not model scope.
+        model: String,
+        /// true = circuit just opened; false = circuit just closed.
+        opened: bool,
+        /// Cooldown in seconds when opened; None when closed.
+        cooldown_secs: Option<u64>,
+    },
 }
 
 /// Lean, cloneable client handle exposed to the Axum router pipelines.
@@ -71,6 +84,7 @@ pub struct TelemetryWorker {
     request_duration_histogram: Histogram<f64>,
     ttft_histogram: Histogram<f64>,
     tokens_consumed_counter: Counter<u64>,
+    circuit_transitions_counter: Counter<u64>,
 }
 
 /// Full OTLP/HTTP URL for one signal. The exporter's `with_endpoint` uses the
@@ -158,6 +172,14 @@ impl TelemetryWorker {
                     .u64_counter("llm_proxy.tokens.consumed")
                     .with_description("Cumulative count of tokens processed")
                     .build();
+                let circuit_transitions_counter = meter
+                    .u64_counter("llm_proxy.circuit.transitions")
+                    .with_description(
+                        "Circuit breaker state transitions. \
+                         direction=opened means the circuit tripped; \
+                         direction=closed means it recovered.",
+                    )
+                    .build();
 
                 let mut worker = Self {
                     rx,
@@ -165,6 +187,7 @@ impl TelemetryWorker {
                     request_duration_histogram,
                     ttft_histogram,
                     tokens_consumed_counter,
+                    circuit_transitions_counter,
                 };
                 Ok(tokio::spawn(async move {
                     worker.run_loop().await;
@@ -234,8 +257,7 @@ impl TelemetryWorker {
                     self.request_duration_histogram
                         .record(duration_ms, &common_attributes);
                     if let Some(ttft) = ttft_ms {
-                        self.ttft_histogram
-                            .record(ttft as f64, &common_attributes);
+                        self.ttft_histogram.record(ttft as f64, &common_attributes);
                     }
 
                     if input_tokens > 0 {
@@ -334,10 +356,7 @@ impl TelemetryWorker {
                             attributes.push(KeyValue::new("error.type", reason));
                         }
                     } else {
-                        attributes.push(KeyValue::new(
-                            "gen_ai.response.finish_reasons",
-                            "stop",
-                        ));
+                        attributes.push(KeyValue::new("gen_ai.response.finish_reasons", "stop"));
                     }
 
                     attributes.push(KeyValue::new("proxy.request_id", request_id));
@@ -356,6 +375,25 @@ impl TelemetryWorker {
                         ));
                     }
                     span.end_with_timestamp(std::time::SystemTime::now());
+                },
+                TelemetryEvent::RecordCircuitTransition {
+                    provider,
+                    model,
+                    opened,
+                    cooldown_secs,
+                } => {
+                    let direction = if opened { "opened" } else { "closed" };
+                    let mut attrs = vec![
+                        KeyValue::new("provider.name", provider),
+                        KeyValue::new("direction", direction),
+                    ];
+                    if !model.is_empty() {
+                        attrs.push(KeyValue::new("gen_ai.request.model", model));
+                    }
+                    if let Some(secs) = cooldown_secs {
+                        attrs.push(KeyValue::new("circuit.cooldown_secs", secs as i64));
+                    }
+                    self.circuit_transitions_counter.add(1, &attrs);
                 },
             }
         }

@@ -29,10 +29,7 @@ use reqwest::Url;
 /// Returns IPv4 nameservers from `scutil --dns`, in order, deduped.
 /// Falls back to an empty vec on any error.
 fn system_nameservers() -> Vec<String> {
-    let Ok(out) = std::process::Command::new("scutil")
-        .arg("--dns")
-        .output()
-    else {
+    let Ok(out) = std::process::Command::new("scutil").arg("--dns").output() else {
         return vec![];
     };
     let text = String::from_utf8_lossy(&out.stdout);
@@ -40,7 +37,7 @@ fn system_nameservers() -> Vec<String> {
     for line in text.lines() {
         // Lines look like: "  nameserver[0] : 192.168.100.254"
         if let Some(rest) = line.trim().strip_prefix("nameserver[") {
-            if let Some(ip_part) = rest.splitn(2, ':').nth(1) {
+            if let Some((_, ip_part)) = rest.split_once(':') {
                 let ip = ip_part.trim();
                 if ip.parse::<std::net::Ipv4Addr>().is_ok() && !seen.contains(&ip.to_owned()) {
                     seen.push(ip.to_owned());
@@ -76,25 +73,40 @@ fn udp_dns_lookup(hostname: &str, resolver_ip: &str, timeout: Duration) -> Vec<S
     packet.extend_from_slice(&1u16.to_be_bytes()); // QTYPE A
     packet.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
 
-    let Ok(sock) = UdpSocket::bind("0.0.0.0:0") else { return vec![] };
+    let Ok(sock) = UdpSocket::bind("0.0.0.0:0") else {
+        return vec![];
+    };
     let _ = sock.set_read_timeout(Some(timeout));
     let resolver = format!("{resolver_ip}:53");
-    if sock.send_to(&packet, &resolver).is_err() { return vec![]; }
+    if sock.send_to(&packet, &resolver).is_err() {
+        return vec![];
+    }
 
     let mut buf = [0u8; 512];
-    let Ok((len, _)) = sock.recv_from(&mut buf) else { return vec![] };
+    let Ok((len, _)) = sock.recv_from(&mut buf) else {
+        return vec![];
+    };
     let data = &buf[..len];
 
-    if data.len() < 12 { return vec![]; }
+    if data.len() < 12 {
+        return vec![];
+    }
     let ancount = u16::from_be_bytes([data[6], data[7]]) as usize;
-    if ancount == 0 { return vec![]; }
+    if ancount == 0 {
+        return vec![];
+    }
 
     // Skip question section.
     let mut pos = 12usize;
     loop {
-        if pos >= data.len() { return vec![]; }
+        if pos >= data.len() {
+            return vec![];
+        }
         let len = data[pos] as usize;
-        if len == 0 { pos += 1; break; }
+        if len == 0 {
+            pos += 1;
+            break;
+        }
         pos += 1 + len;
     }
     pos += 4; // QTYPE + QCLASS
@@ -102,26 +114,38 @@ fn udp_dns_lookup(hostname: &str, resolver_ip: &str, timeout: Duration) -> Vec<S
     // Walk answer RRs.
     let mut addrs = Vec::new();
     for _ in 0..ancount {
-        if pos >= data.len() { break; }
+        if pos >= data.len() {
+            break;
+        }
         // NAME: pointer (0xC0 xx) or inline labels.
         if pos + 1 < data.len() && data[pos] & 0xC0 == 0xC0 {
             pos += 2;
         } else {
             loop {
-                if pos >= data.len() { return addrs; }
+                if pos >= data.len() {
+                    return addrs;
+                }
                 let l = data[pos] as usize;
-                if l == 0 { pos += 1; break; }
+                if l == 0 {
+                    pos += 1;
+                    break;
+                }
                 pos += 1 + l;
             }
         }
-        if pos + 10 > data.len() { break; }
+        if pos + 10 > data.len() {
+            break;
+        }
         let rtype = u16::from_be_bytes([data[pos], data[pos + 1]]);
         let rclass = u16::from_be_bytes([data[pos + 2], data[pos + 3]]);
         let rdlen = u16::from_be_bytes([data[pos + 8], data[pos + 9]]) as usize;
         pos += 10;
-        if pos + rdlen > data.len() { break; }
+        if pos + rdlen > data.len() {
+            break;
+        }
         if rtype == 1 && rclass == 1 && rdlen == 4 {
-            let ip = std::net::Ipv4Addr::new(data[pos], data[pos+1], data[pos+2], data[pos+3]);
+            let ip =
+                std::net::Ipv4Addr::new(data[pos], data[pos + 1], data[pos + 2], data[pos + 3]);
             addrs.push(SocketAddr::from((IpAddr::V4(ip), 443u16)));
         }
         pos += rdlen;
@@ -475,8 +499,7 @@ fn build_app_state(config: Config, previous: Option<&AppState>) -> Result<AppSta
     }
 
     let http_client = {
-        let mut builder = reqwest::Client::builder()
-            .pool_idle_timeout(Duration::from_secs(90));
+        let mut builder = reqwest::Client::builder().pool_idle_timeout(Duration::from_secs(90));
 
         // DNS pre-resolution: query all provider hostnames in parallel via
         // direct UDP, bypassing mDNSResponder's serialised VPN-DNS timeout
@@ -521,7 +544,10 @@ fn build_app_state(config: Config, previous: Option<&AppState>) -> Result<AppSta
                     })
                 })
                 .collect();
-            handles.into_iter().map(|h| h.join().unwrap_or_default()).collect()
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_default())
+                .collect()
         });
 
         for (hostname, resolved) in resolved_map {
@@ -536,7 +562,11 @@ fn build_app_state(config: Config, previous: Option<&AppState>) -> Result<AppSta
                 .ok()
                 .flatten();
             let udp_ips: Vec<String> = resolved.iter().map(|a| a.ip().to_string()).collect();
-            if os_ok.as_deref().map(|ip| !udp_ips.contains(&ip.to_owned())).unwrap_or(true) {
+            if os_ok
+                .as_deref()
+                .map(|ip| !udp_ips.contains(&ip.to_owned()))
+                .unwrap_or(true)
+            {
                 info!(
                     "DNS pre-resolved {hostname} → {} (OS resolver {})",
                     udp_ips.join(", "),
@@ -548,7 +578,9 @@ fn build_app_state(config: Config, previous: Option<&AppState>) -> Result<AppSta
             }
         }
 
-        builder.build().map_err(|e| format!("Failed to build HTTP client: {}", e))?
+        builder
+            .build()
+            .map_err(|e| format!("Failed to build HTTP client: {}", e))?
     };
 
     let policies: std::collections::HashMap<String, RoutingPolicy> = config

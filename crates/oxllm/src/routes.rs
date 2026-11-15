@@ -1079,13 +1079,22 @@ async fn proxy_request(
                     if let Some(state) =
                         app_state.providers.iter().find(|p| p.name == selected.name)
                     {
+                        let before = *state.circuit.read().await;
                         strategy
                             .feedback_entry(state, &target_model, held, Outcome::ModelTimeout, None)
                             .await;
+                        let after = *state.circuit.read().await;
                         telemetry.emit(TelemetryEvent::UpdateStatus {
                             provider: selected.name.clone(),
                             status: circuit_status(state).await,
                         });
+                        maybe_emit_transition(
+                            before,
+                            after,
+                            &selected.name,
+                            &target_model,
+                            &telemetry,
+                        );
                     }
                     continue;
                 },
@@ -1136,6 +1145,7 @@ async fn proxy_request(
                             .iter()
                             .find(|p| p.name == selected.name)
                             .unwrap();
+                        let before = *target_provider_state.circuit.read().await;
                         strategy
                             .feedback_entry(
                                 target_provider_state,
@@ -1145,10 +1155,18 @@ async fn proxy_request(
                                 None,
                             )
                             .await;
+                        let after = *target_provider_state.circuit.read().await;
                         telemetry.emit(TelemetryEvent::UpdateStatus {
                             provider: selected.name.clone(),
                             status: circuit_status(target_provider_state).await,
                         });
+                        maybe_emit_transition(
+                            before,
+                            after,
+                            &selected.name,
+                            &target_model,
+                            &telemetry,
+                        );
                         continue;
                     },
                 };
@@ -1167,8 +1185,12 @@ async fn proxy_request(
                         }
                     }
                 }
-                let (input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens) =
-                    (usage.input, usage.output, usage.cached, usage.cache_creation);
+                let (input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens) = (
+                    usage.input,
+                    usage.output,
+                    usage.cached,
+                    usage.cache_creation,
+                );
 
                 // Report Success feedback
                 let target_provider_state = app_state
@@ -1176,6 +1198,7 @@ async fn proxy_request(
                     .iter()
                     .find(|p| p.name == selected.name)
                     .unwrap();
+                let before = *target_provider_state.circuit.read().await;
                 strategy
                     .feedback_entry(
                         target_provider_state,
@@ -1185,10 +1208,12 @@ async fn proxy_request(
                         None,
                     )
                     .await;
+                let after = *target_provider_state.circuit.read().await;
                 telemetry.emit(TelemetryEvent::UpdateStatus {
                     provider: selected.name.clone(),
                     status: circuit_status(target_provider_state).await,
                 });
+                maybe_emit_transition(before, after, &selected.name, &target_model, &telemetry);
 
                 // Increment local counters
                 target_provider_state
@@ -1354,6 +1379,7 @@ async fn proxy_request(
                 } else {
                     Outcome::ModelError
                 };
+                let before = *target_provider_state.circuit.read().await;
                 strategy
                     .feedback_entry(
                         target_provider_state,
@@ -1363,10 +1389,12 @@ async fn proxy_request(
                         retry_after,
                     )
                     .await;
+                let after = *target_provider_state.circuit.read().await;
                 telemetry.emit(TelemetryEvent::UpdateStatus {
                     provider: selected.name.clone(),
                     status: circuit_status(target_provider_state).await,
                 });
+                maybe_emit_transition(before, after, &selected.name, &target_model, &telemetry);
             },
             Err(e) => {
                 warn!(
@@ -1389,13 +1417,16 @@ async fn proxy_request(
                 } else {
                     Outcome::Unreachable
                 };
+                let before = *target_provider_state.circuit.read().await;
                 strategy
                     .feedback_entry(target_provider_state, &target_model, held, outcome, None)
                     .await;
+                let after = *target_provider_state.circuit.read().await;
                 telemetry.emit(TelemetryEvent::UpdateStatus {
                     provider: selected.name.clone(),
                     status: circuit_status(target_provider_state).await,
                 });
+                maybe_emit_transition(before, after, &selected.name, &target_model, &telemetry);
             },
         }
     }
@@ -1749,6 +1780,7 @@ fn stream_upstream_body(
             let strategy = AdaptivePriorityStrategy {
                 circuit: app_state.circuit,
             };
+            let before = *provider_state.circuit.read().await;
             strategy
                 .feedback_entry(
                     provider_state,
@@ -1762,10 +1794,12 @@ fn stream_upstream_body(
                     None,
                 )
                 .await;
+            let after = *provider_state.circuit.read().await;
             telemetry.emit(TelemetryEvent::UpdateStatus {
                 provider: provider_name.clone(),
                 status: circuit_status(provider_state).await,
             });
+            maybe_emit_transition(before, after, &provider_name, &model_name, &telemetry);
 
             if stream_success {
                 provider_state
@@ -1876,6 +1910,39 @@ async fn circuit_status(provider: &ProviderState) -> u64 {
                 1 // Cooldown expired, about to probe
             }
         },
+    }
+}
+
+/// Compares circuit state before and after `feedback_entry` and emits
+/// `RecordCircuitTransition` only when the state actually changed.
+fn maybe_emit_transition(
+    before: CircuitState,
+    after: CircuitState,
+    provider_name: &str,
+    model: &str,
+    telemetry: &TelemetryClient,
+) {
+    let opened = match (before, after) {
+        (CircuitState::Closed | CircuitState::HalfOpen, CircuitState::Open { .. }) => Some(true),
+        (CircuitState::Open { .. }, CircuitState::Closed | CircuitState::HalfOpen) => Some(false),
+        _ => None,
+    };
+    if let Some(did_open) = opened {
+        let cooldown_secs = if did_open {
+            if let CircuitState::Open { until } = after {
+                Some(until.saturating_duration_since(Instant::now()).as_secs())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        telemetry.emit(TelemetryEvent::RecordCircuitTransition {
+            provider: provider_name.to_string(),
+            model: model.to_string(),
+            opened: did_open,
+            cooldown_secs,
+        });
     }
 }
 
@@ -2786,7 +2853,8 @@ mod tests {
             Usage {
                 input: 130,
                 output: 5,
-                cached: 100
+                cached: 100,
+                cache_creation: 20,
             }
         );
     }
