@@ -11,7 +11,7 @@ Built to operate entirely in memory with zero local disk persistence, `oxllm` is
 
 ---
 
-## ⚡ Quick Start
+## ⚡ At a Glance
 
 ```bash
 brew install planetf1/tap/oxllm          # or: cargo install oxllm
@@ -34,7 +34,7 @@ curl -X POST http://127.0.0.1:8080/v1/messages \
 oxllm status
 ```
 
-See [Quick Start](#-quick-start) for the full setup walkthrough.
+See [Quick Start](#-quick-start) for the full setup walkthrough including provider config.
 
 ---
 
