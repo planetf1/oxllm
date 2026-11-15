@@ -478,43 +478,56 @@ fn build_app_state(config: Config, previous: Option<&AppState>) -> Result<AppSta
         let mut builder = reqwest::Client::builder()
             .pool_idle_timeout(Duration::from_secs(90));
 
-        // DNS fallback: for each unique provider hostname, attempt system DNS
-        // first. If that fails, query the LAN default gateway directly over UDP
-        // (same approach as vpnroute). Only populate .resolve() when the
-        // fallback is actually needed — normal DNS path is completely unchanged.
+        // DNS pre-resolution: for each provider hostname, query our resolver
+        // list directly via raw UDP before reqwest ever needs to resolve it.
+        // This avoids mDNSResponder's serialised VPN-DNS timeout path, which
+        // can block for 30 s+ when the VPN nameserver is unreachable but the
+        // LAN gateway resolves the name fine.
+        //
+        // Strategy: try each resolver in order (LAN gateway first, then
+        // 1.1.1.1); use the first set of IPs that comes back. Only skip a
+        // hostname if no resolver answers at all — in that case reqwest falls
+        // through to its own OS resolver as before, so the behaviour is the
+        // same as it was when this path didn't exist.
         let hostnames: std::collections::HashSet<String> = providers
             .iter()
             .filter_map(|p| Url::parse(p.base_url.as_str()).ok())
             .filter_map(|u| u.host_str().map(str::to_owned))
-            .filter(|h| !h.parse::<std::net::IpAddr>().is_ok()) // skip bare IPs
+            .filter(|h| h.parse::<std::net::IpAddr>().is_err()) // skip bare IPs
             .collect();
 
-        // Build fallback resolver list: configured nameservers then 1.1.1.1.
-        let mut fallback_resolvers = system_nameservers();
+        let mut resolvers = system_nameservers();
         let public_fallback = "1.1.1.1".to_owned();
-        if !fallback_resolvers.contains(&public_fallback) {
-            fallback_resolvers.push(public_fallback);
+        if !resolvers.contains(&public_fallback) {
+            resolvers.push(public_fallback);
         }
 
         for hostname in &hostnames {
-            // Only activate the fallback when system DNS actually fails.
-            if std::net::ToSocketAddrs::to_socket_addrs(&(hostname.as_str(), 443u16)).is_ok() {
-                continue;
-            }
-            // Try each fallback resolver in order; stop at the first that answers.
             let mut resolved = vec![];
-            for resolver in &fallback_resolvers {
-                resolved = udp_dns_lookup(hostname, resolver, Duration::from_secs(3));
+            for resolver in &resolvers {
+                resolved = udp_dns_lookup(hostname, resolver, Duration::from_secs(2));
                 if !resolved.is_empty() {
-                    warn!(
-                        "system DNS failed for {hostname}; using fallback IPs via {resolver}: {}",
-                        resolved.iter().map(|a| a.ip().to_string()).collect::<Vec<_>>().join(", ")
-                    );
                     break;
                 }
             }
             if resolved.is_empty() {
-                warn!("system DNS failed for {hostname} and all fallback resolvers also failed");
+                // All UDP resolvers failed; leave this hostname to the OS.
+                warn!("UDP DNS pre-resolution failed for {hostname} on all resolvers — leaving to OS resolver");
+                continue;
+            }
+            // Log only when the result differs from what a successful OS
+            // lookup would give (i.e. VPN DNS can't see this name).
+            let os_ok = std::net::ToSocketAddrs::to_socket_addrs(&(hostname.as_str(), 443u16))
+                .map(|mut it| it.next().map(|a| a.ip().to_string()))
+                .ok()
+                .flatten();
+            let udp_ips: Vec<String> = resolved.iter().map(|a| a.ip().to_string()).collect();
+            if os_ok.as_deref().map(|ip| !udp_ips.contains(&ip.to_owned())).unwrap_or(true) {
+                info!(
+                    "DNS pre-resolved {hostname} → {} (OS resolver {})",
+                    udp_ips.join(", "),
+                    os_ok.as_deref().unwrap_or("failed"),
+                );
             }
             for addr in resolved {
                 builder = builder.resolve(hostname, addr);

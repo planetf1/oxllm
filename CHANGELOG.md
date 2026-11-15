@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.31] - 2026-11-15
+
+### Added
+- **DNS pre-resolution at startup**: all provider hostnames are now resolved
+  via direct UDP queries to system nameservers (LAN gateway first, then
+  1.1.1.1) before the reqwest client is built. This avoids mDNSResponder's
+  serialised VPN-DNS timeout path, which could block startup for 30 s+ when
+  the VPN nameserver is unreachable but the LAN gateway resolves the name
+  correctly. If all UDP resolvers fail, reqwest falls back to the OS resolver
+  as before — behaviour is unchanged when DNS is healthy.
+- **OTel cache token metrics**: `gen_ai.usage.cache_read.input_tokens` and
+  `gen_ai.usage.cache_creation.input_tokens` span attributes emitted when
+  non-zero (Anthropic SSE). The `llm_proxy.tokens.consumed` counter now also
+  records `cache_read` and `cache_creation` type tags.
+- **OTel `gen_ai.response.finish_reasons`**: set to `["stop"]` on successful
+  completions, matching the GenAI semantic conventions.
+- **OTel `error.type`**: set to the failure reason on failed requests,
+  matching the GenAI semantic conventions. Enables error-rate dashboards and
+  `Status: !` in otelite.
+
 ## [0.1.30] - 2026-11-15
 
 ### Changed
