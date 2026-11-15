@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **DNS fallback for provider hostnames**: when system DNS fails to resolve a
+  provider hostname at startup (e.g. VPN DNS unreachable), oxllm now queries
+  configured nameservers directly over UDP, then `1.1.1.1` as a last resort.
+  The fallback only activates when `ToSocketAddrs` fails, leaving the normal
+  DNS path completely unchanged. Resolved IPs are injected into the reqwest
+  client via `.resolve()` so TLS SNI still uses the correct hostname. A warning
+  is logged when the fallback is used; on the next reload, if DNS has recovered,
+  the override entries are gone. macOS only (`scutil --dns`).
+- **Broader request header forwarding**: the Anthropic path now forwards all
+  `anthropic-*` request headers to the upstream (previously only
+  `anthropic-beta` was forwarded). Both paths also forward `accept`,
+  `tracestate`, and `x-*` headers (excluding `x-api-key`, which is replaced by
+  the configured provider credential).
+
 ## [0.1.28] - 2026-11-09
 
 ### Added
