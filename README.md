@@ -671,7 +671,26 @@ All admin endpoints (`/health`, `/status`, `/reload`, `/admin/*`) are restricted
 
 ## 📊 Telemetry
 
-oxllm exports OpenTelemetry (OTel) traces and metrics via OTLP/HTTP JSON to a collector like [otelite](https://github.com/planetf1/otelite).
+oxllm exports OpenTelemetry (OTel) traces and metrics via OTLP/HTTP JSON.
+
+### Recommended collector: otelite
+
+[**otelite**](https://github.com/planetf1/otelite) is a lightweight, single-binary
+OTel collector and viewer built to pair with tools like oxllm. It stores traces
+and metrics locally (no Jaeger, no Prometheus, no Docker required) and exposes a
+CLI for querying them:
+
+```bash
+brew install planetf1/tap/otelite
+otelite serve &          # listens on http://127.0.0.1:4318
+
+otelite traces list --since 1h
+otelite traces list --status ERROR
+otelite metrics list
+```
+
+Any standard OTLP/HTTP collector works (Jaeger, Grafana Alloy, OpenTelemetry
+Collector) — otelite is just the simplest option for a local developer setup.
 
 ### Configuration
 
@@ -700,6 +719,7 @@ Every request produces one `oxllm.transaction` span with GenAI semantic conventi
 | `proxy.route` | `pool-docs` | Virtual model the client asked for |
 | `proxy.attempts_required` | `2` | Pool entries tried |
 | `proxy.initial_failure_reason` | `all_providers_failed` | Set on a failed request (`all_providers_failed`, `no_available_provider`, `stream_failed`) |
+| `gen_ai.client.ttft_ms` | `320` | Time to first token (ms); for streaming: time to first upstream headers; for non-streaming: total latency. Absent on failed requests |
 | `proxy.request_id` | `oxllm-3dc0...` | Matches the `x-request-id` response header |
 
 A request that fails after every entry (or whose stream breaks) gets span status `ERROR`, so `otelite traces list --status ERROR` finds it. Spans link to an incoming W3C `traceparent` when present. Find them by service: `otelite traces list --since 1h` and look for service `oxllm`.
@@ -709,8 +729,9 @@ A request that fails after every entry (or whose stream breaks) gets span status
 | Metric | Type | Description |
 |---|---|---|
 | `llm_proxy.provider.status` | Gauge | `0` = healthy, `1` = rate-limited, `2` = circuit tripped (per provider) |
-| `llm_proxy.request.duration` | Histogram | Request lifecycle (ms), buckets from 5 ms to 10 min so slow LLM calls are not lost in an overflow bucket |
-| `llm_proxy.tokens.consumed` | Counter | Cumulative tokens by provider, model and type |
+| `llm_proxy.request.duration` | Histogram | Total request lifecycle (ms), buckets 5 ms – 10 min |
+| `llm_proxy.ttft` | Histogram | Time to first token (ms), buckets 50 ms – 60 s |
+| `llm_proxy.tokens.consumed` | Counter | Cumulative tokens by provider, model, and type |
 
 Metrics are exported every 60 s by default. `otel_endpoint` is the collector's base URL; oxllm appends `/v1/traces` and `/v1/metrics` itself.
 
