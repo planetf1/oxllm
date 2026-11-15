@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.29] - 2026-11-15
+
 ### Added
 - **DNS fallback for provider hostnames**: when system DNS fails to resolve a
   provider hostname at startup (e.g. VPN DNS unreachable), oxllm now queries
