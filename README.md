@@ -424,7 +424,27 @@ oxllm status
 
 ### Provider Definition
 
-Each provider requires `name`, `enabled`, `base_url` (with trailing `/v1/`), `api_key` (or `${VAR}` env reference), and `models` list. Optional per-provider keys: `upstream_timeout_secs` (overrides `server.upstream_timeout_secs`, so a fast-failing local provider can fail over sooner than a slow global timeout) and `cost_per_mtok` (cost weight used by the `cheapest` policy). Per-provider circuit tuning: `circuit_failure_threshold` and `circuit_base_cooldown_secs` override the server-wide values for that provider. `first_byte_timeout_secs` applies to streaming requests only: a provider that sends no response headers in that time is abandoned and its circuit opens at once, so a hung endpoint costs one short wait instead of the full `upstream_timeout_secs`. Non-streaming requests ignore it, because their headers only arrive after the whole generation. `auth_header` (OpenAI-format providers only) sends `api_key` raw in the named header instead of `Authorization: Bearer`, for gateways that expect their own key header, e.g. `auth_header = "X-Api-Key"`.
+**Required fields:**
+
+| Field | Description |
+|---|---|
+| `name` | Unique identifier used in virtual model entries |
+| `enabled` | `true`/`false` — excluded from routing when false |
+| `base_url` | Provider endpoint, trailing `/v1/` required |
+| `api_key` | Credential; `${VAR}` env references supported |
+| `models` | List of model names this provider accepts |
+| `api` | `"openai"` (default) or `"anthropic"` — determines which routes this provider handles |
+
+**Optional fields:**
+
+| Field | Description |
+|---|---|
+| `upstream_timeout_secs` | Per-provider timeout override; lets a local provider fail over sooner than the server-wide default |
+| `cost_per_mtok` | Cost weight for the `cheapest` routing policy |
+| `first_byte_timeout_secs` | Streaming only: abandon the provider if no response headers arrive within this many seconds, opening its circuit immediately. Non-streaming ignores it (headers only arrive after the full generation) |
+| `auth_header` | OpenAI-format providers only: send `api_key` raw in this header instead of `Authorization: Bearer`, e.g. `auth_header = "X-Api-Key"` |
+| `circuit_failure_threshold` | Override the server-wide failure count before a circuit opens |
+| `circuit_base_cooldown_secs` | Override the server-wide base cooldown before a half-open probe |
 
 ### Virtual Models (Fallback Chains)
 
