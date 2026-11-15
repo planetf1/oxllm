@@ -20,6 +20,10 @@ pub enum TelemetryEvent {
         input_tokens: u64,
         output_tokens: u64,
         duration: Duration,
+        /// Time to first token in milliseconds. For streaming responses this is
+        /// the time to first upstream response headers; for non-streaming it
+        /// equals `duration`. None when the request failed before any response.
+        ttft_ms: Option<u64>,
         attempts: u32,
         failure_reason: Option<String>,
         trace_id: Option<String>,       // Extracted from W3C traceparent
@@ -61,6 +65,7 @@ pub struct TelemetryWorker {
     rx: mpsc::Receiver<TelemetryEvent>,
     provider_status_gauge: Gauge<u64>,
     request_duration_histogram: Histogram<f64>,
+    ttft_histogram: Histogram<f64>,
     tokens_consumed_counter: Counter<u64>,
 }
 
@@ -134,6 +139,17 @@ impl TelemetryWorker {
                         10_000.0, 30_000.0, 60_000.0, 120_000.0, 300_000.0, 600_000.0,
                     ])
                     .build();
+                let ttft_histogram = meter
+                    .f64_histogram("llm_proxy.ttft")
+                    .with_description("Time to first token (streaming: first headers; non-streaming: total latency)")
+                    .with_unit("ms")
+                    // TTFT buckets are tighter than total duration — most LLM
+                    // first tokens land under 5 s; extend to 60 s for cold starts.
+                    .with_boundaries(vec![
+                        50.0, 100.0, 250.0, 500.0, 1_000.0, 2_000.0, 3_000.0,
+                        5_000.0, 10_000.0, 20_000.0, 60_000.0,
+                    ])
+                    .build();
                 let tokens_consumed_counter = meter
                     .u64_counter("llm_proxy.tokens.consumed")
                     .with_description("Cumulative count of tokens processed")
@@ -143,6 +159,7 @@ impl TelemetryWorker {
                     rx,
                     provider_status_gauge,
                     request_duration_histogram,
+                    ttft_histogram,
                     tokens_consumed_counter,
                 };
                 Ok(tokio::spawn(async move {
@@ -193,6 +210,7 @@ impl TelemetryWorker {
                     input_tokens,
                     output_tokens,
                     duration,
+                    ttft_ms,
                     attempts,
                     failure_reason,
                     trace_id,
@@ -209,6 +227,10 @@ impl TelemetryWorker {
                     let duration_ms = duration.as_secs_f64() * 1000.0;
                     self.request_duration_histogram
                         .record(duration_ms, &common_attributes);
+                    if let Some(ttft) = ttft_ms {
+                        self.ttft_histogram
+                            .record(ttft as f64, &common_attributes);
+                    }
 
                     if input_tokens > 0 {
                         let mut input_attrs = common_attributes.clone();
@@ -260,6 +282,9 @@ impl TelemetryWorker {
                         output_tokens as i64,
                     ));
                     attributes.push(KeyValue::new("proxy.attempts_required", attempts as i64));
+                    if let Some(ttft) = ttft_ms {
+                        attributes.push(KeyValue::new("gen_ai.client.ttft_ms", ttft as i64));
+                    }
 
                     let terminal_failure = matches!(
                         failure_reason.as_deref(),

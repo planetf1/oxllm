@@ -11,6 +11,81 @@ Built to operate entirely in memory with zero local disk persistence, `oxllm` is
 
 ---
 
+## ⚡ Quick Start
+
+```bash
+brew install planetf1/tap/oxllm          # or: cargo install oxllm
+oxllm serve --config config.toml         # starts on http://127.0.0.1:8080
+```
+
+```bash
+# OpenAI-compatible chat (works with any OpenAI SDK)
+curl -X POST http://127.0.0.1:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "smart", "messages": [{"role": "user", "content": "Hello"}]}'
+
+# Anthropic SDK / Claude Code
+curl -X POST http://127.0.0.1:8080/v1/messages \
+  -H "anthropic-version: 2023-06-01" \
+  -H "content-type: application/json" \
+  -d '{"model": "claude", "max_tokens": 256, "messages": [{"role": "user", "content": "Hello"}]}'
+
+# Live dashboard — no collector needed
+curl http://127.0.0.1:8080/status
+```
+
+See [Quick Start](#-quick-start) for the full setup walkthrough.
+
+---
+
+## 🗺️ API Surface
+
+oxllm proxies three API families. Each route applies the same circuit breaking,
+failover, and session affinity regardless of which family it belongs to.
+
+| Route | Method(s) | API family | Notes |
+|---|---|---|---|
+| `/v1/chat/completions` | POST | OpenAI | Streaming (SSE) and non-streaming |
+| `/v1/completions` | POST | OpenAI | Fill-in-the-middle / editor autocomplete |
+| `/v1/embeddings` | POST | OpenAI | |
+| `/v1/models` | GET | OpenAI + Anthropic | Returns combined shape; works with both SDKs |
+| `/v1/messages` | POST | Anthropic | SSE streaming; Anthropic SDK, `pi`, Claude Code |
+| `/v1/messages/count_tokens` | POST | Anthropic | |
+| `/v1/responses` | POST | OpenAI stateful | SSE streaming |
+| `/v1/responses/{id}` | GET, DELETE | OpenAI stateful | Provider-pinned by id |
+| `/v1/responses/{id}/{action}` | GET, POST | OpenAI stateful | e.g. `/cancel`, `/input_items` |
+| `/v1/responses/compact` | POST | OpenAI stateful | |
+| `/v1/responses/input_tokens` | POST | OpenAI stateful | |
+| `/v1/conversations` | POST | OpenAI stateful | |
+| `/v1/conversations/{id}` | GET, POST, DELETE | OpenAI stateful | Provider-pinned by id |
+| `/v1/conversations/{id}/items` | GET, POST | OpenAI stateful | |
+| `/v1/conversations/{id}/items/{item_id}` | GET, DELETE | OpenAI stateful | |
+| `/v1/systemone` | POST | llama.cpp decisions | Typed choice/score questions |
+| `/status` | GET | Admin (localhost) | JSON + table; also `oxllm status` CLI |
+| `/admin/tail` | GET | Admin (localhost) | SSE stream of recent requests |
+| `/reload` | POST | Admin (localhost) | Hot-reload config; also `SIGHUP` |
+
+**Provider routing**: a virtual model entry's `api` field (`"openai"` default, `"anthropic"`) determines which routes it handles. A request only reaches providers whose `api` matches; mismatched entries in a pool are skipped automatically.
+
+### 📨 Header Forwarding
+
+oxllm strips auth headers and rewrites `model`, then forwards the following
+client headers upstream on **every route**:
+
+| Header(s) | Forwarded | Notes |
+|---|---|---|
+| `traceparent` | ✓ both paths | W3C trace context — links upstream spans to the caller's trace |
+| `tracestate` | ✓ both paths | W3C vendor trace state |
+| `accept` | ✓ both paths | Tells the upstream whether the client expects SSE or JSON |
+| `x-*` (all) | ✓ both paths | Client tracing, debugging, and SDK correlation headers; `x-api-key` is excluded (per-provider auth is substituted instead) |
+| `anthropic-version` | ✓ Anthropic path | Forwarded from client; defaults to `2023-06-01` if absent |
+| `anthropic-*` (all others) | ✓ Anthropic path | Covers `anthropic-beta`, extended thinking, prompt caching, and any future beta headers without code changes |
+
+Headers **not** forwarded upstream: `authorization`, `x-api-key` (replaced with
+per-provider credentials), `content-length` (reqwest recomputes), `host`.
+
+---
+
 ## 🚀 Key Features
 
 * **Zero-Disk Dependency**: No SQLite, local caching, or file write operations during routing. State is strictly in memory.
@@ -28,6 +103,8 @@ Built to operate entirely in memory with zero local disk persistence, `oxllm` is
 * **Local Stats Dashboard**: Every provider tracks request count, success count, token volumes, and last request time via lock-free atomics. Query via `oxllm status` or `curl /status` — no external collector needed.
 * **Traffic Visibility**: a bounded in-memory ring of recent request records (metadata only) plus `oxllm tail` for a live stream — route, provider, attempts, status, latency, TTFT per request, no collector needed.
 * **OOM-Proof Telemetry**: Bounded OTel event channel (1024 cap) with non-blocking `try_send` drops. If `otelite` is offline, telemetry degrades gracefully and the proxy keeps running.
+* **DNS Fallback at Startup**: when system DNS fails to resolve a provider hostname (e.g. VPN DNS unreachable on a split-tunnel connection), oxllm queries configured nameservers directly over UDP, then `1.1.1.1` as a last resort. The fallback only activates when normal resolution fails; TLS SNI still uses the correct hostname. A warning is logged; the override clears on the next reload once DNS recovers. macOS only.
+* **Broad Request Header Forwarding**: `traceparent`, `tracestate`, `accept`, and all `x-*` headers forwarded on every route; the Anthropic path additionally propagates `anthropic-version` and all `anthropic-*` headers, keeping prompt caching, extended thinking, and future beta features working without code changes. See [Header Forwarding](#-header-forwarding).
 * **W3C Trace Context Propagation**: Extracts and injects `traceparent` headers for continuous trace spans.
 * **Dual-Stack IPv4/IPv6**: Configurable via `bind_family`: `"ipv4"` (default), `"ipv6"`, or `"dual"` for both.
 * **Unix-Style Environment Expansion**: Shell-style `${VAR}` replacement in TOML config values.
@@ -113,9 +190,7 @@ msg = client.messages.create(
 
 Behaviour specific to this route:
 
-* **Upstream auth**: `x-api-key: <provider api_key>`. `anthropic-version` is
-  forwarded from the client (default `2023-06-01`); `anthropic-beta` is forwarded
-  when present.
+* **Upstream auth**: `x-api-key: <provider api_key>`. See [Header Forwarding](#-header-forwarding) for the full table of which client headers are propagated upstream; the Anthropic path additionally forwards `anthropic-version` and all `anthropic-*` headers.
 * **Inbound auth**: with `server.api_keys` set, `/v1/messages*` accepts the key
   as `x-api-key` or `Authorization: Bearer` (constant-time compare). The OpenAI
   routes still take Bearer only.

@@ -1228,6 +1228,7 @@ async fn proxy_request(
                 }
 
                 // Push Telemetry Metrics
+                let elapsed_ttft_ms = start_time.elapsed().as_millis() as u64;
                 telemetry.emit(TelemetryEvent::RecordTransaction {
                     operation: spec.operation.to_string(),
                     route: route_name.clone(),
@@ -1236,6 +1237,8 @@ async fn proxy_request(
                     input_tokens,
                     output_tokens,
                     duration: start_time.elapsed(),
+                    // Non-streaming: whole response = first byte.
+                    ttft_ms: Some(elapsed_ttft_ms),
                     attempts,
                     failure_reason: None,
                     trace_id: trace_id.clone(),
@@ -1427,6 +1430,7 @@ async fn proxy_request(
         input_tokens: 0,
         output_tokens: 0,
         duration: start_time.elapsed(),
+        ttft_ms: None,
         attempts,
         failure_reason: Some(if attempts == 0 {
             "no_available_provider".to_string()
@@ -1763,6 +1767,9 @@ fn stream_upstream_body(
             input_tokens: usage_scan.usage.input,
             output_tokens: usage_scan.usage.output,
             duration,
+            // For streaming, `duration` is the time captured before the spawn
+            // (time to first upstream response headers), which is the true TTFT.
+            ttft_ms: Some(duration.as_millis() as u64),
             attempts,
             failure_reason: if stream_success {
                 None

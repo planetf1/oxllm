@@ -23,6 +23,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `anthropic-beta` was forwarded). Both paths also forward `accept`,
   `tracestate`, and `x-*` headers (excluding `x-api-key`, which is replaced by
   the configured provider credential).
+- **TTFT OTel metric and span attribute**: time-to-first-token is now exported
+  as the `llm_proxy.ttft` histogram metric (ms, with LLM-appropriate bucket
+  boundaries) and as the `gen_ai.client.ttft_ms` span attribute on every
+  `oxllm.transaction` span. For streaming responses TTFT is the time to first
+  upstream response headers; for non-streaming it equals total latency.
+- **README API surface table**: new `🗺️ API Surface` section near the top
+  lists every route with methods, API family, and notes. Includes a `📨 Header
+  Forwarding` reference table covering both paths. Quick Start sample moved to
+  the top for immediate discoverability.
 
 ## [0.1.28] - 2026-11-09
 
