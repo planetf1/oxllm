@@ -676,24 +676,27 @@ oxllm exports [OpenTelemetry](https://opentelemetry.io/) traces and metrics via
 the [OpenTelemetry GenAI semantic conventions](https://github.com/open-telemetry/semantic-conventions-genai)
 ([client inference](https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/client-inference.md)).
 
-### Recommended collector: otelite
+### Collector options
 
-[**otelite**](https://github.com/planetf1/otelite) is a lightweight, single-binary
-OTel collector and viewer built to pair with tools like oxllm. It stores traces
-and metrics locally (no Jaeger, no Prometheus, no Docker required) and exposes a
-CLI for querying them:
+Any OTLP/HTTP-compatible collector works: [Jaeger](https://www.jaegertracing.io/),
+[Grafana Alloy](https://grafana.com/oss/alloy-opentelemetry-collector/), the
+[OpenTelemetry Collector](https://opentelemetry.io/docs/collector/), or anything
+else that accepts OTLP. Set `otel_endpoint` to its base URL and you're done.
+
+For a simple local setup with no extra infrastructure, [**otelite**](https://github.com/planetf1/otelite)
+is a lightweight single-binary collector and viewer that stores traces and metrics
+locally (no Docker, no Prometheus, no Jaeger required):
 
 ```bash
+# Install and start (listens on http://127.0.0.1:4318 by default)
 brew install planetf1/tap/otelite
-otelite serve &          # listens on http://127.0.0.1:4318
+otelite serve &
 
-otelite traces list --since 1h
-otelite traces list --status ERROR
-otelite metrics list
+# Example queries using otelite's CLI
+otelite traces list --since 1h      # all recent traces
+otelite traces list --status ERROR  # failed requests
+otelite metrics list                # metric names and latest values
 ```
-
-Any standard OTLP/HTTP collector works (Jaeger, Grafana Alloy, OpenTelemetry
-Collector) — otelite is just the simplest option for a local developer setup.
 
 ### Configuration
 
