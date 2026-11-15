@@ -1494,6 +1494,41 @@ pub async fn create_embeddings(
     .await
 }
 
+const DECISIONS_SPEC: EndpointSpec = EndpointSpec {
+    path: "decisions",
+    operation: "decisions",
+    failure_noun: "decisions",
+    streaming: false,
+    api: ApiFormat::Openai,
+    stateful: false,
+    model: ModelField::Required,
+};
+
+/// POST /v1/decisions
+///
+/// OpenAI Decisions API (generative scoring via first-token logprobs):
+/// predicate, choice, and score question types. Supported by vLLM 0.33+
+/// and the OpenAI `gpt-6-luna` model. The request body is passed through
+/// verbatim after model rewriting; the response is not streamed.
+/// Not supported by llama.cpp or most LiteLLM-proxied upstreams — use a
+/// dedicated virtual model listing only capable providers.
+pub async fn create_decisions(
+    State((app_state, telemetry)): State<(Arc<AppState>, TelemetryClient)>,
+    Extension(request_id): Extension<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    proxy_request(
+        &DECISIONS_SPEC,
+        app_state,
+        telemetry,
+        request_id,
+        headers,
+        body,
+    )
+    .await
+}
+
 const SYSTEMONE_SPEC: EndpointSpec = EndpointSpec {
     path: "systemone",
     operation: "systemone",

@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.32] - 2026-11-15
+
+### Added
+- **`/v1/decisions` route**: proxies the OpenAI Decisions API (predicate,
+  choice, and score question types). Supported by vLLM 0.33+ deployments and
+  the OpenAI `gpt-6-luna` model. Request body is passed through verbatim after
+  model rewriting; response is non-streaming. Not supported by llama.cpp or
+  pre-0.33 vLLM — use a dedicated virtual model listing only capable providers.
+
+### Changed
+- **DNS pre-resolution is now parallel**: all provider hostnames are resolved
+  concurrently via scoped threads. Startup latency is now bounded by the
+  slowest single hostname rather than the sum across all providers.
+
 ## [0.1.31] - 2026-11-15
 
 ### Added

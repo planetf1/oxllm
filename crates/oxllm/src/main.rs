@@ -478,40 +478,54 @@ fn build_app_state(config: Config, previous: Option<&AppState>) -> Result<AppSta
         let mut builder = reqwest::Client::builder()
             .pool_idle_timeout(Duration::from_secs(90));
 
-        // DNS pre-resolution: for each provider hostname, query our resolver
-        // list directly via raw UDP before reqwest ever needs to resolve it.
-        // This avoids mDNSResponder's serialised VPN-DNS timeout path, which
-        // can block for 30 s+ when the VPN nameserver is unreachable but the
-        // LAN gateway resolves the name fine.
-        //
-        // Strategy: try each resolver in order (LAN gateway first, then
-        // 1.1.1.1); use the first set of IPs that comes back. Only skip a
-        // hostname if no resolver answers at all — in that case reqwest falls
-        // through to its own OS resolver as before, so the behaviour is the
-        // same as it was when this path didn't exist.
-        let hostnames: std::collections::HashSet<String> = providers
-            .iter()
-            .filter_map(|p| Url::parse(p.base_url.as_str()).ok())
-            .filter_map(|u| u.host_str().map(str::to_owned))
-            .filter(|h| h.parse::<std::net::IpAddr>().is_err()) // skip bare IPs
-            .collect();
+        // DNS pre-resolution: query all provider hostnames in parallel via
+        // direct UDP, bypassing mDNSResponder's serialised VPN-DNS timeout
+        // path (30 s+ when VPN nameserver is unreachable). All hostnames are
+        // resolved concurrently using scoped threads; total latency is bounded
+        // by the slowest single hostname, not the sum. Each hostname tries
+        // resolvers in order (LAN gateway first, then 1.1.1.1); the first
+        // that answers wins. If all resolvers fail, reqwest falls through to
+        // the OS resolver as before.
+        let hostnames: Vec<String> = {
+            let mut h: std::collections::HashSet<String> = providers
+                .iter()
+                .filter_map(|p| Url::parse(p.base_url.as_str()).ok())
+                .filter_map(|u| u.host_str().map(str::to_owned))
+                .filter(|h| h.parse::<std::net::IpAddr>().is_err()) // skip bare IPs
+                .collect();
+            h.drain().collect()
+        };
 
         let mut resolvers = system_nameservers();
         let public_fallback = "1.1.1.1".to_owned();
         if !resolvers.contains(&public_fallback) {
             resolvers.push(public_fallback);
         }
+        let resolvers = std::sync::Arc::new(resolvers);
 
-        for hostname in &hostnames {
-            let mut resolved = vec![];
-            for resolver in &resolvers {
-                resolved = udp_dns_lookup(hostname, resolver, Duration::from_secs(2));
-                if !resolved.is_empty() {
-                    break;
-                }
-            }
+        // Resolve all hostnames in parallel, collect (hostname, addrs) pairs.
+        let resolved_map: Vec<(String, Vec<SocketAddr>)> = std::thread::scope(|s| {
+            let handles: Vec<_> = hostnames
+                .iter()
+                .map(|hostname| {
+                    let resolvers = resolvers.clone();
+                    s.spawn(move || {
+                        let mut addrs = vec![];
+                        for resolver in resolvers.as_ref() {
+                            addrs = udp_dns_lookup(hostname, resolver, Duration::from_secs(2));
+                            if !addrs.is_empty() {
+                                break;
+                            }
+                        }
+                        (hostname.clone(), addrs)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap_or_default()).collect()
+        });
+
+        for (hostname, resolved) in resolved_map {
             if resolved.is_empty() {
-                // All UDP resolvers failed; leave this hostname to the OS.
                 warn!("UDP DNS pre-resolution failed for {hostname} on all resolvers — leaving to OS resolver");
                 continue;
             }
@@ -530,7 +544,7 @@ fn build_app_state(config: Config, previous: Option<&AppState>) -> Result<AppSta
                 );
             }
             for addr in resolved {
-                builder = builder.resolve(hostname, addr);
+                builder = builder.resolve(&hostname, addr);
             }
         }
 
@@ -1152,6 +1166,13 @@ async fn run_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         .route(
             "/v1/embeddings",
             post(routes::create_embeddings).layer(middleware::from_fn_with_state(
+                state_for_middleware.clone(),
+                require_api_key,
+            )),
+        )
+        .route(
+            "/v1/decisions",
+            post(routes::create_decisions).layer(middleware::from_fn_with_state(
                 state_for_middleware.clone(),
                 require_api_key,
             )),

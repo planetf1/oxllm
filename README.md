@@ -60,7 +60,8 @@ failover, and session affinity regardless of which family it belongs to.
 | `/v1/conversations/{id}` | GET, POST, DELETE | OpenAI stateful | Provider-pinned by id |
 | `/v1/conversations/{id}/items` | GET, POST | OpenAI stateful | |
 | `/v1/conversations/{id}/items/{item_id}` | GET, DELETE | OpenAI stateful | |
-| `/v1/systemone` | POST | llama.cpp decisions | Typed choice/score questions |
+| `/v1/decisions` | POST | OpenAI Decisions API | Predicate/choice/score questions; vLLM 0.33+ and OpenAI `gpt-6-luna` |
+| `/v1/systemone` | POST | llama.cpp decisions | Typed choice/score questions (llama.cpp only) |
 | `/status` | GET | Admin (localhost) | JSON + table; also `oxllm status` CLI |
 | `/admin/tail` | GET | Admin (localhost) | SSE stream of recent requests |
 | `/reload` | POST | Admin (localhost) | Hot-reload config; also `SIGHUP` |
@@ -492,11 +493,12 @@ Clients ask for `general-med`; the runtime behind each model is a leaf detail yo
 ### Endpoint Capability Mismatches
 
 Some endpoints are only supported by specific backends — `/v1/completions` FIM
-requires a model with fill-in-the-middle training; `/v1/decisions` (vLLM 0.33+)
-is not available on llama.cpp or most LiteLLM-proxied upstreams. When a virtual
-model pool mixes compatible and incompatible providers, an incompatible provider
-returns a 4xx that counts as a failure, opens its circuit, and causes a failover
-to the next — which may also not support the endpoint.
+requires a model with fill-in-the-middle training; `/v1/systemone` is a
+llama.cpp-specific decisions API not available on hosted LiteLLM gateways or
+cloud providers. When a virtual model pool mixes compatible and incompatible
+providers, an incompatible provider returns a 4xx that counts as a failure,
+opens its circuit, and causes a failover to the next — which may also not
+support the endpoint.
 
 The fix is to use a **dedicated virtual model** that lists only capable
 providers for such endpoints, rather than routing via a general pool:
@@ -506,15 +508,15 @@ providers for such endpoints, rather than routing via a general pool:
 # FIM completions: only the provider whose checkpoint has FIM training.
 "granite-fim" = [{ provider = "llamacpp-local", model = "granite-4.1-3b-fim" }]
 
-# /v1/decisions: only vLLM backends — llama.cpp and LiteLLM proxies do not support it.
-"decisions-model" = [{ provider = "bv-vllm", model = "ibm-granite/granite-4.1-8b" }]
+# /v1/systemone: only llama.cpp backends.
+"decisions-model" = [{ provider = "llamacpp-local", model = "granite-4.1-8b" }]
 ```
 
 If you accidentally route an unsupported endpoint to a provider, the circuit
 breaker will open it after `circuit_failure_threshold` failures (default 3),
 so it will stop receiving traffic — but those first few requests will return
-errors to callers. Avoid mixing in `oxllm validate` by ensuring the virtual
-model's listed providers all support the endpoint you intend to call.
+errors to callers. Avoid this by ensuring every virtual model's listed providers
+all support the endpoint you intend to call.
 
 ### Routing Policies
 
