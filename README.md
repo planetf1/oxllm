@@ -671,7 +671,10 @@ All admin endpoints (`/health`, `/status`, `/reload`, `/admin/*`) are restricted
 
 ## 📊 Telemetry
 
-oxllm exports OpenTelemetry (OTel) traces and metrics via OTLP/HTTP JSON.
+oxllm exports [OpenTelemetry](https://opentelemetry.io/) traces and metrics via
+[OTLP/HTTP](https://opentelemetry.io/docs/specs/otlp/) JSON. Span attributes follow
+the [OpenTelemetry GenAI semantic conventions](https://github.com/open-telemetry/semantic-conventions-genai)
+([client inference](https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/client-inference.md)).
 
 ### Recommended collector: otelite
 
@@ -707,7 +710,9 @@ without a collector.
 
 ### Span Attributes (Traces)
 
-Every request produces one `oxllm.transaction` span with GenAI semantic conventions:
+Every request produces one `oxllm.transaction` span. Standard attributes follow the
+[GenAI client inference conventions](https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/client-inference.md);
+`proxy.*` and `gen_ai.client.ttft_ms` are oxllm extensions.
 
 | Attribute | Example | Description |
 |---|---|---|
