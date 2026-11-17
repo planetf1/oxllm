@@ -1,0 +1,19 @@
+[package]
+name = "oxllm-chatgpt-login"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "ChatGPT (OpenAI OAuth) 登录与 token 助手，基于 octolib"
+
+# 独立于 oxllm workspace，避免被当成成员
+[workspace]
+
+[dependencies]
+anyhow = "1"
+dirs = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# 只编译 LLM 能力，不引入 embedding / media 等重型依赖
+# 固定 rev 保证与仓库里验证过的一致（需要升级时改这里再重新构建）
+octolib = { git = "https://github.com/muvon/octolib", rev = "4b4f8554efc2c2dc37c29cc7b64b15a9043e47c5", default-features = false, features = ["llm"] }

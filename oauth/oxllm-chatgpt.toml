@@ -1,0 +1,35 @@
+# oxllm × OpenAI OAuth（ChatGPT 订阅）配置
+#
+# 与 octolib（https://github.com/muvon/octolib）的 `chatgpt` 提供方对齐：
+#   - 凭据：OAuth2 + PKCE 登录后拿到的 access_token（Bearer），无 api key
+#   - 端点：https://api.openai.com/v1/responses（流式 SSE）
+#   - 约定：请求体必须带 "store": false；模型名用你套餐里的 slug
+#
+# 启动：./target/release/oxllm serve -c oauth/oxllm-chatgpt.toml
+# token 由 oauth/sync-token.sh 写入下面的 api_key（不要提交真实 token）
+
+[server]
+host = "127.0.0.1"
+port = 8080
+# 必填；不需要 OTEL 采集时留空字符串即可
+otel_endpoint = ""
+# Responses 长文本生成较慢，放宽上游超时
+upstream_timeout_secs = 180
+# 配置变化即热重载，sync-token.sh 写入新 token 后无需重启
+watch_config = true
+
+[[providers]]
+name = "chatgpt-oauth"
+enabled = true
+api = "openai"
+base_url = "https://api.openai.com/v1/"
+# 由 oauth/sync-token.sh 替换；占位符保持原样表示还没同步过 token
+api_key = "OAUTH_TOKEN_PLACEHOLDER"
+# 改成 `oxllm-chatgpt-login models` 列出的 slug（示例值）
+models = ["gpt-5.2-codex"]
+upstream_timeout_secs = 180
+first_byte_timeout_secs = 60
+
+[virtual_models]
+# 客户端把 model 写成 "gpt" 即可，oxllm 映射到上面的 provider + 上游模型
+"gpt" = [{ provider = "chatgpt-oauth", model = "gpt-5.2-codex" }]
