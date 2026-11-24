@@ -2,7 +2,7 @@
 //! when an upstream hangs a request hostage, and `oxllm status` must exit
 //! non-zero when no daemon is running.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -45,6 +45,97 @@ fn spawn_silent_upstream() -> u16 {
         }
     });
     port
+}
+
+/// An upstream that answers every request with a minimal chat-completion
+/// JSON, so the proxy's full request path (body buffering, routing,
+/// forwarding) runs to completion.
+fn spawn_echo_upstream() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 8192];
+                let mut head = Vec::new();
+                // Read until end of headers.
+                loop {
+                    let Ok(n) = stream.read(&mut buf) else { return };
+                    if n == 0 {
+                        return;
+                    }
+                    head.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = find_header_end(&head) {
+                        // Drain whatever remains of the declared body.
+                        let headers = String::from_utf8_lossy(&head[..pos]).to_string();
+                        let len: usize = headers
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                k.trim()
+                                    .eq_ignore_ascii_case("content-length")
+                                    .then(|| v.trim().parse().ok())?
+                            })
+                            .unwrap_or(0);
+                        let body_start = pos + 4;
+                        let mut have = head.len() - body_start;
+                        while have < len {
+                            let Ok(n) = stream.read(&mut buf) else { break };
+                            if n == 0 {
+                                break;
+                            }
+                            have += n;
+                        }
+                        break;
+                    }
+                }
+                let body = r#"{"id":"x","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+            });
+        }
+    });
+    port
+}
+
+fn find_header_end(bytes: &[u8]) -> Option<usize> {
+    bytes.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+/// Reads one full HTTP response (headers plus Content-Length body).
+fn read_response(stream: &mut std::net::TcpStream) -> String {
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 8192];
+    let header_end = loop {
+        let n = stream.read(&mut buf).expect("read response");
+        assert!(n > 0, "connection closed before response headers");
+        raw.extend_from_slice(&buf[..n]);
+        if let Some(pos) = find_header_end(&raw) {
+            break pos;
+        }
+    };
+    let headers = String::from_utf8_lossy(&raw[..header_end]).to_string();
+    let len: usize = headers
+        .lines()
+        .find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| v.trim().parse().ok())?
+        })
+        .unwrap_or(0);
+    let body_start = header_end + 4;
+    while raw.len() < body_start + len {
+        let n = stream.read(&mut buf).expect("read response body");
+        assert!(n > 0, "connection closed mid-body");
+        raw.extend_from_slice(&buf[..n]);
+    }
+    String::from_utf8_lossy(&raw).to_string()
 }
 
 /// `oxllm status` must exit non-zero when no daemon is on the port.
@@ -319,4 +410,141 @@ vm = [{{ provider = "hung", model = "m" }}]
 
     let _ = std::fs::remove_file(&config_path);
     let _ = std::fs::remove_dir(&dir);
+}
+
+/// Shared harness: start a daemon against `spawn_echo_upstream` with the
+/// given extra `[server]` lines, wait for it to listen, and return the port
+/// plus the child. Mirrors the config shape of the tests above.
+fn start_daemon_with(extra_server: &str) -> (u16, std::process::Child, std::path::PathBuf) {
+    let upstream_port = spawn_echo_upstream();
+    let daemon_port = free_port();
+
+    let dir = std::env::temp_dir().join(format!(
+        "oxllm-body-limit-test-{}-{}",
+        std::process::id(),
+        daemon_port
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config_path = dir.join("daemon.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+[server]
+host = "127.0.0.1"
+port = {daemon_port}
+otel_endpoint = "http://127.0.0.1:4318"
+{extra_server}
+
+[[providers]]
+name = "echo"
+enabled = true
+base_url = "http://127.0.0.1:{upstream_port}/v1/"
+api_key = "key"
+models = ["m"]
+
+[virtual_models]
+vm = [{{ provider = "echo", model = "m" }}]
+"#
+        ),
+    )
+    .unwrap();
+
+    let child = oxllm()
+        .args(["serve", "--config", config_path.to_str().unwrap()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(Instant::now() < deadline, "daemon never started listening");
+        if TcpListener::bind(("127.0.0.1", daemon_port)).is_err() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    (daemon_port, child, config_path)
+}
+
+fn post_chat_body(daemon_port: u16, body: &str) -> String {
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", daemon_port)).unwrap();
+    write!(
+        stream,
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    )
+    .unwrap();
+    stream.flush().unwrap();
+    read_response(&mut stream)
+}
+
+fn stop_daemon(child: std::process::Child, config_path: std::path::PathBuf) {
+    let mut child = child;
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&config_path);
+    if let Some(dir) = config_path.parent() {
+        let _ = std::fs::remove_dir(dir);
+    }
+}
+
+/// A body past `server.max_body_bytes` must be rejected with 413 before
+/// routing, while a body under the limit still proxies normally. Regression
+/// test for the axum default (2 MiB) silently rejecting large-context
+/// requests with `Failed to buffer the request body: length limit exceeded`.
+#[test]
+fn oversized_body_rejected_with_413() {
+    let (daemon_port, child, config_path) = start_daemon_with("max_body_bytes = 2048");
+
+    let small = r#"{"model":"vm","messages":[{"role":"user","content":"hi"}]}"#;
+    let resp = post_chat_body(daemon_port, small);
+    assert!(
+        resp.starts_with("HTTP/1.1 200"),
+        "small body rejected: {}",
+        resp
+    );
+
+    let big = format!(
+        r#"{{"model":"vm","messages":[{{"role":"user","content":"{}"}}]}}"#,
+        "x".repeat(4096)
+    );
+    let resp = post_chat_body(daemon_port, &big);
+    assert!(
+        resp.starts_with("HTTP/1.1 413"),
+        "oversized body not rejected: {}",
+        resp.split_once("\r\n").unwrap_or((&resp, "")).0
+    );
+    assert!(
+        resp.contains("Failed to buffer the request body"),
+        "413 must carry axum's body-limit reason so callers can diagnose it: {}",
+        resp
+    );
+
+    stop_daemon(child, config_path);
+}
+
+/// With the default config (no `max_body_bytes`), a multi-MiB body — one
+/// whole-session agent prompt — must reach the upstream, not die at the old
+/// 2 MiB axum default.
+#[test]
+fn large_context_body_passes_default_limit() {
+    let (daemon_port, child, config_path) = start_daemon_with("");
+
+    // 3 MiB of content: past axum's 2 MiB default, comfortably under the
+    // 64 MiB configured default.
+    let big = format!(
+        r#"{{"model":"vm","messages":[{{"role":"user","content":"{}"}}]}}"#,
+        "x".repeat(3 * 1024 * 1024)
+    );
+    let resp = post_chat_body(daemon_port, &big);
+    assert!(
+        resp.starts_with("HTTP/1.1 200"),
+        "3 MiB body must pass the default limit: {}",
+        resp.split_once("\r\n").unwrap_or((&resp, "")).0
+    );
+
+    stop_daemon(child, config_path);
 }

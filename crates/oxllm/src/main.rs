@@ -966,6 +966,12 @@ fn server_config_restart_warnings(old: &ServerConfig, new: &ServerConfig) -> Vec
         new.shutdown_timeout_secs.to_string(),
     );
     note(
+        old.max_body_bytes != new.max_body_bytes,
+        "max_body_bytes",
+        old.max_body_bytes.to_string(),
+        new.max_body_bytes.to_string(),
+    );
+    note(
         old.watch_config != new.watch_config,
         "watch_config",
         old.watch_config.to_string(),
@@ -1187,6 +1193,22 @@ async fn run_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     // an owned copy per layer, and each request reads through it without
     // locking the routing pool.
     let state_for_middleware = reloadable_state.clone();
+    // Applied at the router level: axum's own default is 2 MiB, which a
+    // single large-context agent prompt blows past. `0` opts out entirely.
+    let max_body_bytes = config.server.max_body_bytes;
+    if max_body_bytes == 0 {
+        info!("Request body limit disabled (server.max_body_bytes = 0)");
+    } else {
+        info!(
+            "Request body limit: {} MiB (server.max_body_bytes)",
+            max_body_bytes / (1024 * 1024)
+        );
+    }
+    let body_limit = if max_body_bytes == 0 {
+        axum::extract::DefaultBodyLimit::disable()
+    } else {
+        axum::extract::DefaultBodyLimit::max(max_body_bytes)
+    };
     let app = axum::Router::new()
         .route(
             "/v1/models",
@@ -1347,6 +1369,7 @@ async fn run_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
             get(routes::tail_requests).layer(middleware::from_fn(localhost_only)),
         )
         .layer(middleware::from_fn(add_request_id))
+        .layer(body_limit)
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
@@ -5317,6 +5340,7 @@ mod integration_tests {
             circuit_base_cooldown_secs: 60,
             rate_limit_fallback_secs: 30,
             shutdown_timeout_secs: 30,
+            max_body_bytes: 64 * 1024 * 1024,
             watch_config: true,
             request_log_capacity: 256,
             default_model: None,

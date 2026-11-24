@@ -416,6 +416,7 @@ oxllm status
 | `upstream_timeout_secs` | `5` | Upstream request timeout in seconds |
 | `bind_family` | `"ipv4"` | Address family: `"ipv4"`, `"ipv6"`, or `"dual"` (both) |
 | `shutdown_timeout_secs` | `30` | Graceful-shutdown deadline after SIGTERM/SIGINT: in-flight requests drain until it expires, then the process exits anyway. `0` waits indefinitely. |
+| `max_body_bytes` | `67108864` | Maximum accepted HTTP request body size. Large-context agent prompts exceed axum's 2 MiB default and were rejected with `413 Failed to buffer the request body` before routing. `0` disables the limit. Applies at startup. |
 | `watch_config` | `true` | Watch the config file and hot-reload on change. Disable on flash-storage edge targets, or to make reloads strictly manual. |
 | `request_log_capacity` | `256` | Recent request records kept in memory for `oxllm status` / `oxllm tail` (metadata only). `0` disables. Applies at startup. |
 | `circuit_failure_threshold` | `3` | Consecutive failures before a provider's circuit opens. Lower it for twitchy free-tier upstreams. |
@@ -561,7 +562,7 @@ rate-limit windows, request/token counters, admin offline overrides, and
 session-affinity pins. Editing the config mid-incident no longer re-enables a
 provider you took offline or resets failover history. Server-level fields
 that cannot be hot-swapped (`port`, `host`, `bind_family`, `otel_endpoint`,
-affinity TTL/capacity, `shutdown_timeout_secs`, `watch_config`) produce an
+affinity TTL/capacity, `shutdown_timeout_secs`, `max_body_bytes`, `watch_config`) produce an
 explicit "restart required" warning in the reload response and logs.
 
 ### Session Affinity
