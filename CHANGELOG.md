@@ -15,6 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   disables) bounds the accepted body size; edits are reported as
   restart-required on reload.
 
+## [0.1.34] - 2026-11-24
+
+### Fixed
+- **RUSTSEC-2026-0592** (stack overflow in `Url::origin()` on nested
+  `blob:` URLs): `url` bumped 2.5.8 → 2.5.9, clearing the failing
+  `cargo audit` CI checks on `main`.
+
 ## [0.1.33] - 2026-11-15
 
 ### Added
