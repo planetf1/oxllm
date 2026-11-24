@@ -700,6 +700,15 @@ impl ModelStats {
 /// preserve the historical behaviour: trip after 3 consecutive failures,
 /// 60s base cooldown doubling per failure beyond the threshold, 30s
 /// rate-limit cooldown when a 429 carries no Retry-After.
+///
+/// Counting is strictly consecutive: any success resets the count to zero.
+/// That is deliberate and keeps a single blip from ejecting a healthy
+/// provider, but it also means a provider failing a fraction of requests
+/// (measured 2026-11-16: 24 gateway 503s in a morning, never 3 in a row, so
+/// the circuit never opened) is never ejected at all. Sustained partial
+/// failure is handled by the route-level retry pass in `routes.rs` instead;
+/// a failure *ratio* breaker would be the alternative if that proves not to be
+/// enough. Do not read this threshold as "three failures and it is out".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CircuitConfig {
     /// Consecutive failures before the circuit opens.
