@@ -178,7 +178,7 @@ Three triggers share one reload path (parse, validate, swap):
 * **POSIX Signal Handling:** The application listens for a `SIGHUP` signal.
 * **HTTP Reload Endpoint:** A `POST /reload` endpoint (localhost-restricted) triggers the same logic and returns a 400 with the reason when the new config is rejected.
 * **Action:** Upon any trigger, the configuration file is re-parsed. New keys or target providers are mapped into a fresh `Vec<ProviderState>`, and the pointer is safely updated using a `tokio::sync::watch` channel, maintaining current uptime for connected clients.
-* **State preservation:** providers that keep their name carry their circuit-breaker position, failure/rate-limit windows, counters, admin offline flag, and session-affinity pins across the swap — a config edit no longer resets failover state. Server fields that only apply at startup (`port`, `host`, `bind_family`, `otel_endpoint`, affinity TTL/capacity, `shutdown_timeout_secs`, `watch_config`) are diffed and reported as "restart required" warnings in the reload response and logs.
+* **State preservation:** providers that keep their name carry their circuit-breaker position, failure/rate-limit windows, counters, admin offline flag, and session-affinity pins across the swap — a config edit no longer resets failover state. Server fields that only apply at startup (`port`, `host`, `bind_family`, `otel_endpoint`, affinity TTL/capacity, `shutdown_timeout_secs`, `max_body_bytes`, `watch_config`) are diffed and reported as "restart required" warnings in the reload response and logs.
 
 ---
 
