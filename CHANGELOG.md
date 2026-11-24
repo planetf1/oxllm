@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.36] - 2026-11-24
+
 ### Added
 - **TTL-aware refreshing DNS resolver**: provider addresses are re-resolved
   as their DNS TTLs expire (clamped to 30–300 s) instead of being pinned at
