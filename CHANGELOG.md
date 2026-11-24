@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **TTL-aware refreshing DNS resolver**: provider addresses are re-resolved
+  as their DNS TTLs expire (clamped to 30–300 s) instead of being pinned at
+  startup, covering A and AAAA records, with the last good answer served for
+  up to 1 h while re-resolution fails. A bounded 10 s connect timeout fails
+  over from blackholed addresses in seconds instead of waiting out the
+  upstream timeout.
+- **One route-level retry pass**: when every pool entry fails transiently
+  (5xx), the whole route is retried once after a 750 ms pause. Sustained
+  partial gateway failure (bursty 503s that never trip the consecutive-failure
+  circuit) no longer surfaces to the caller as a 502.
+
 ## [0.1.33] - 2026-11-15
 
 ### Added

@@ -48,10 +48,30 @@ fn system_nameservers() -> Vec<String> {
     seen
 }
 
-/// Minimal UDP DNS A-record query sent directly to `resolver_ip:53`.
-/// Returns resolved `SocketAddr`s (port 443) or an empty vec on any failure.
-/// Never panics.
-fn udp_dns_lookup(hostname: &str, resolver_ip: &str, timeout: Duration) -> Vec<SocketAddr> {
+/// One answer from a DNS response: the address and the TTL the server set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DnsAnswer {
+    ip: IpAddr,
+    ttl: u32,
+}
+
+/// Bounds on how long a resolved answer is reused. The floor stops a 0-TTL
+/// answer turning every request into a lookup; the ceiling stops a long TTL
+/// outliving a load-balancer change.
+const DNS_MIN_TTL_SECS: u32 = 30;
+const DNS_MAX_TTL_SECS: u32 = 300;
+
+/// How long the last good answer keeps being served while re-resolution fails.
+const DNS_MAX_STALE_SECS: u64 = 3600;
+
+/// Minimal UDP DNS query for one record type, sent directly to
+/// `resolver_ip:53`. Returns every answer of that type. Never panics.
+fn udp_dns_query(
+    hostname: &str,
+    resolver_ip: &str,
+    qtype: u16,
+    timeout: Duration,
+) -> Vec<DnsAnswer> {
     use std::net::UdpSocket;
 
     // Build a minimal DNS A-record query packet.
@@ -70,7 +90,7 @@ fn udp_dns_lookup(hostname: &str, resolver_ip: &str, timeout: Duration) -> Vec<S
         packet.extend_from_slice(b);
     }
     packet.push(0u8); // root label
-    packet.extend_from_slice(&1u16.to_be_bytes()); // QTYPE A
+    packet.extend_from_slice(&qtype.to_be_bytes()); // QTYPE
     packet.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
 
     let Ok(sock) = UdpSocket::bind("0.0.0.0:0") else {
@@ -86,8 +106,13 @@ fn udp_dns_lookup(hostname: &str, resolver_ip: &str, timeout: Duration) -> Vec<S
     let Ok((len, _)) = sock.recv_from(&mut buf) else {
         return vec![];
     };
-    let data = &buf[..len];
+    parse_dns_answers(&buf[..len])
+}
 
+/// Parses the answer section of a DNS response, returning every A and AAAA
+/// record with its TTL. Never panics; malformed input yields what was parsed so
+/// far.
+fn parse_dns_answers(data: &[u8]) -> Vec<DnsAnswer> {
     if data.len() < 12 {
         return vec![];
     }
@@ -138,19 +163,218 @@ fn udp_dns_lookup(hostname: &str, resolver_ip: &str, timeout: Duration) -> Vec<S
         }
         let rtype = u16::from_be_bytes([data[pos], data[pos + 1]]);
         let rclass = u16::from_be_bytes([data[pos + 2], data[pos + 3]]);
+        let ttl = u32::from_be_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]]);
         let rdlen = u16::from_be_bytes([data[pos + 8], data[pos + 9]]) as usize;
         pos += 10;
         if pos + rdlen > data.len() {
             break;
         }
-        if rtype == 1 && rclass == 1 && rdlen == 4 {
-            let ip =
-                std::net::Ipv4Addr::new(data[pos], data[pos + 1], data[pos + 2], data[pos + 3]);
-            addrs.push(SocketAddr::from((IpAddr::V4(ip), 443u16)));
+        if rclass == 1 {
+            if rtype == 1 && rdlen == 4 {
+                let ip =
+                    std::net::Ipv4Addr::new(data[pos], data[pos + 1], data[pos + 2], data[pos + 3]);
+                addrs.push(DnsAnswer {
+                    ip: IpAddr::V4(ip),
+                    ttl,
+                });
+            } else if rtype == 28 && rdlen == 16 {
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&data[pos..pos + 16]);
+                addrs.push(DnsAnswer {
+                    ip: IpAddr::V6(std::net::Ipv6Addr::from(octets)),
+                    ttl,
+                });
+            }
         }
         pos += rdlen;
     }
     addrs
+}
+
+/// Resolves a hostname to every address a single resolver will give us.
+///
+/// Returns the addresses with IPv4 first and the TTL to cache them for. The
+/// resolver that answered the A query also answers the AAAA query, so a
+/// split-horizon view is never mixed between resolvers. IPv4 first is
+/// deliberate: hyper picks its preferred family from the first address it is
+/// handed, so a v4-first list keeps IPv6 as the happy-eyeballs fallback rather
+/// than making it the default on a host whose IPv6 path is only link-local.
+fn lookup_host(hostname: &str, resolvers: &[String], timeout: Duration) -> (Vec<IpAddr>, u32) {
+    for resolver in resolvers {
+        let v4 = udp_dns_query(hostname, resolver, 1, timeout);
+        if v4.is_empty() {
+            continue;
+        }
+        let v6 = udp_dns_query(hostname, resolver, 28, timeout);
+        let ttl = v4
+            .iter()
+            .chain(v6.iter())
+            .map(|a| a.ttl)
+            .min()
+            .unwrap_or(DNS_MIN_TTL_SECS)
+            .clamp(DNS_MIN_TTL_SECS, DNS_MAX_TTL_SECS);
+        let addrs = v4.into_iter().chain(v6).map(|a| a.ip).collect::<Vec<_>>();
+        return (addrs, ttl);
+    }
+    (Vec::new(), 0)
+}
+
+/// Cached answer for one hostname.
+struct DnsCacheEntry {
+    addrs: Vec<IpAddr>,
+    ttl: u32,
+    resolved_at: Instant,
+}
+
+struct DnsInner {
+    resolvers: Vec<String>,
+    timeout: Duration,
+    cache: std::sync::RwLock<std::collections::HashMap<String, DnsCacheEntry>>,
+}
+
+impl DnsInner {
+    /// The cached answer, if it is still within its TTL.
+    fn fresh(&self, host: &str) -> Option<Vec<IpAddr>> {
+        let cache = self.cache.read().ok()?;
+        let entry = cache.get(host)?;
+        if entry.resolved_at.elapsed() < Duration::from_secs(u64::from(entry.ttl)) {
+            return Some(entry.addrs.clone());
+        }
+        None
+    }
+
+    /// The cached answer, however old, while it is inside the stale window.
+    fn stale(&self, host: &str) -> Option<Vec<IpAddr>> {
+        let cache = self.cache.read().ok()?;
+        let entry = cache.get(host)?;
+        if entry.resolved_at.elapsed() < Duration::from_secs(DNS_MAX_STALE_SECS) {
+            return Some(entry.addrs.clone());
+        }
+        None
+    }
+
+    /// Re-resolves `host` and stores the answer. Returns `None` on failure,
+    /// leaving any previous answer in place for `stale` to serve.
+    fn refresh(&self, host: &str) -> Option<Vec<IpAddr>> {
+        let (addrs, ttl) = lookup_host(host, &self.resolvers, self.timeout);
+        if addrs.is_empty() {
+            return None;
+        }
+        if let Ok(mut cache) = self.cache.write() {
+            cache.insert(
+                host.to_owned(),
+                DnsCacheEntry {
+                    addrs: addrs.clone(),
+                    ttl,
+                    resolved_at: Instant::now(),
+                },
+            );
+        }
+        Some(addrs)
+    }
+}
+
+/// reqwest resolver that queries the configured nameservers directly and
+/// re-resolves on TTL expiry.
+///
+/// Two things this buys over the OS resolver. mDNSResponder serialises VPN-DNS
+/// lookups and can block for 30 s+ when a VPN nameserver is unreachable, which
+/// no timeout on our side can interrupt. And a start-up pin never notices a
+/// load-balancer change, so a retired address stays pinned until a restart;
+/// here the answer expires on its record TTL and the last good answer keeps
+/// being served if re-resolution fails.
+struct RefreshingResolver {
+    inner: Arc<DnsInner>,
+}
+
+impl RefreshingResolver {
+    fn new(resolvers: Vec<String>, timeout: Duration) -> Self {
+        Self {
+            inner: Arc::new(DnsInner {
+                resolvers,
+                timeout,
+                cache: std::sync::RwLock::new(std::collections::HashMap::new()),
+            }),
+        }
+    }
+
+    /// Resolves every hostname up front, in parallel, so the first request pays
+    /// no lookup. Logs only where the direct answer differs from the OS
+    /// resolver's, which is the case worth knowing about (VPN DNS cannot see the
+    /// name).
+    fn warm(&self, hostnames: &[String]) {
+        std::thread::scope(|s| {
+            let handles: Vec<_> = hostnames
+                .iter()
+                .map(|hostname| {
+                    let inner = Arc::clone(&self.inner);
+                    s.spawn(move || {
+                        let resolved = inner.refresh(hostname);
+                        // The OS lookup can block for 30 s+ on a broken VPN DNS
+                        // path, so it runs inside this thread, not before it.
+                        let os_ip =
+                            std::net::ToSocketAddrs::to_socket_addrs(&(hostname.as_str(), 443u16))
+                                .ok()
+                                .and_then(|mut it| it.next())
+                                .map(|a| a.ip());
+                        (hostname.clone(), resolved, os_ip)
+                    })
+                })
+                .collect();
+            for handle in handles {
+                match handle.join() {
+                    Ok((hostname, Some(addrs), os_ip)) => {
+                        let ours: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
+                        if os_ip.map(|ip| !addrs.contains(&ip)).unwrap_or(true) {
+                            info!(
+                                "DNS pre-resolved {hostname} → {} (OS resolver {})",
+                                ours.join(", "),
+                                os_ip
+                                    .map(|ip| ip.to_string())
+                                    .unwrap_or_else(|| "failed".to_owned()),
+                            );
+                        }
+                    },
+                    Ok((hostname, None, _)) => {
+                        warn!(
+                            "UDP DNS pre-resolution failed for {hostname} on all resolvers — leaving to the OS resolver"
+                        );
+                    },
+                    Err(_) => warn!("DNS pre-resolution thread panicked"),
+                }
+            }
+        });
+    }
+}
+
+impl reqwest::dns::Resolve for RefreshingResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_owned();
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move {
+            if let Some(addrs) = inner.fresh(&host) {
+                return Ok(socket_addrs(addrs));
+            }
+            let refresh_host = host.clone();
+            let refresh_inner = Arc::clone(&inner);
+            let refreshed =
+                tokio::task::spawn_blocking(move || refresh_inner.refresh(&refresh_host)).await;
+            if let Ok(Some(addrs)) = refreshed {
+                return Ok(socket_addrs(addrs));
+            }
+            if let Some(addrs) = inner.stale(&host) {
+                warn!("DNS re-resolution failed for {host}; serving the last good answer");
+                return Ok(socket_addrs(addrs));
+            }
+            Err(Box::new(std::io::Error::other(format!(
+                "DNS lookup failed for {host} on every configured resolver"
+            ))) as Box<dyn std::error::Error + Send + Sync>)
+        })
+    }
+}
+
+fn socket_addrs(addrs: Vec<IpAddr>) -> reqwest::dns::Addrs {
+    Box::new(addrs.into_iter().map(|ip| SocketAddr::new(ip, 443)))
 }
 
 /// Resolves the config file path using XDG base directory conventions.
@@ -499,16 +723,8 @@ fn build_app_state(config: Config, previous: Option<&AppState>) -> Result<AppSta
     }
 
     let http_client = {
-        let mut builder = reqwest::Client::builder().pool_idle_timeout(Duration::from_secs(90));
-
-        // DNS pre-resolution: query all provider hostnames in parallel via
-        // direct UDP, bypassing mDNSResponder's serialised VPN-DNS timeout
-        // path (30 s+ when VPN nameserver is unreachable). All hostnames are
-        // resolved concurrently using scoped threads; total latency is bounded
-        // by the slowest single hostname, not the sum. Each hostname tries
-        // resolvers in order (LAN gateway first, then 1.1.1.1); the first
-        // that answers wins. If all resolvers fail, reqwest falls through to
-        // the OS resolver as before.
+        // Every provider hostname, resolved once up front and refreshed on its
+        // record TTL; see RefreshingResolver for why the OS resolver is not used.
         let hostnames: Vec<String> = {
             let mut h: std::collections::HashSet<String> = providers
                 .iter()
@@ -524,61 +740,21 @@ fn build_app_state(config: Config, previous: Option<&AppState>) -> Result<AppSta
         if !resolvers.contains(&public_fallback) {
             resolvers.push(public_fallback);
         }
-        let resolvers = std::sync::Arc::new(resolvers);
 
-        // Resolve all hostnames in parallel, collect (hostname, addrs) pairs.
-        let resolved_map: Vec<(String, Vec<SocketAddr>)> = std::thread::scope(|s| {
-            let handles: Vec<_> = hostnames
-                .iter()
-                .map(|hostname| {
-                    let resolvers = resolvers.clone();
-                    s.spawn(move || {
-                        let mut addrs = vec![];
-                        for resolver in resolvers.as_ref() {
-                            addrs = udp_dns_lookup(hostname, resolver, Duration::from_secs(2));
-                            if !addrs.is_empty() {
-                                break;
-                            }
-                        }
-                        (hostname.clone(), addrs)
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().unwrap_or_default())
-                .collect()
-        });
+        // Hand reqwest a resolver that queries our nameservers directly and
+        // refreshes on TTL expiry, rather than pinning addresses at start-up.
+        let resolver = RefreshingResolver::new(resolvers, Duration::from_secs(2));
+        resolver.warm(&hostnames);
 
-        for (hostname, resolved) in resolved_map {
-            if resolved.is_empty() {
-                warn!("UDP DNS pre-resolution failed for {hostname} on all resolvers — leaving to OS resolver");
-                continue;
-            }
-            // Log only when the result differs from what a successful OS
-            // lookup would give (i.e. VPN DNS can't see this name).
-            let os_ok = std::net::ToSocketAddrs::to_socket_addrs(&(hostname.as_str(), 443u16))
-                .map(|mut it| it.next().map(|a| a.ip().to_string()))
-                .ok()
-                .flatten();
-            let udp_ips: Vec<String> = resolved.iter().map(|a| a.ip().to_string()).collect();
-            if os_ok
-                .as_deref()
-                .map(|ip| !udp_ips.contains(&ip.to_owned()))
-                .unwrap_or(true)
-            {
-                info!(
-                    "DNS pre-resolved {hostname} → {} (OS resolver {})",
-                    udp_ips.join(", "),
-                    os_ok.as_deref().unwrap_or("failed"),
-                );
-            }
-            for addr in resolved {
-                builder = builder.resolve(&hostname, addr);
-            }
-        }
-
-        builder
+        reqwest::Client::builder()
+            .pool_idle_timeout(Duration::from_secs(90))
+            // Bounded so a provider whose address is blackholed (SYN goes
+            // nowhere, e.g. behind a VPN whose split tunnel dropped the route)
+            // fails over
+            // in seconds instead of holding the request until the provider's
+            // 300 s upstream timeout. Healthy connects measure well under 1 s.
+            .connect_timeout(Duration::from_secs(10))
+            .dns_resolver(Arc::new(resolver))
             .build()
             .map_err(|e| format!("Failed to build HTTP client: {}", e))?
     };
@@ -2811,6 +2987,80 @@ mod integration_tests {
     use serde_json::Value;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    /// A response with one A and one AAAA answer for example.com, TTLs 120 and 45.
+    fn dns_response_with_a_and_aaaa() -> Vec<u8> {
+        let mut msg = vec![
+            0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
+        ];
+        msg.extend_from_slice(&[
+            7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
+        ]);
+        msg.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+        // A 1.2.3.4, TTL 120, name pointer to the question at offset 12.
+        msg.extend_from_slice(&[0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 120, 0x00, 0x04]);
+        msg.extend_from_slice(&[1, 2, 3, 4]);
+        // AAAA 2001:db8::1, TTL 45.
+        msg.extend_from_slice(&[0xC0, 0x0C, 0x00, 0x1C, 0x00, 0x01, 0, 0, 0, 45, 0x00, 0x10]);
+        msg.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        msg
+    }
+
+    #[test]
+    fn test_parse_dns_answers_reads_a_and_aaaa_with_ttl() {
+        let answers = parse_dns_answers(&dns_response_with_a_and_aaaa());
+        assert_eq!(answers.len(), 2);
+        assert_eq!(answers[0].ip, "1.2.3.4".parse::<IpAddr>().unwrap());
+        assert_eq!(answers[0].ttl, 120);
+        assert_eq!(answers[1].ip, "2001:db8::1".parse::<IpAddr>().unwrap());
+        assert_eq!(answers[1].ttl, 45);
+    }
+
+    #[test]
+    fn test_parse_dns_answers_tolerates_truncated_and_empty_input() {
+        let full = dns_response_with_a_and_aaaa();
+        assert!(parse_dns_answers(&[]).is_empty());
+        // Truncated mid-answer: keeps the records it finished, never panics.
+        let cut = &full[..full.len() - 20];
+        assert_eq!(parse_dns_answers(cut).len(), 1);
+        // Empty answer section.
+        let header_only = vec![
+            0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        assert!(parse_dns_answers(&header_only).is_empty());
+    }
+
+    #[test]
+    fn test_dns_cache_serves_fresh_only_inside_ttl() {
+        let inner = DnsInner {
+            resolvers: vec![],
+            timeout: Duration::from_millis(1),
+            cache: std::sync::RwLock::new(std::collections::HashMap::new()),
+        };
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        inner.cache.write().unwrap().insert(
+            "example.com".to_owned(),
+            DnsCacheEntry {
+                addrs: vec![ip],
+                ttl: 30,
+                resolved_at: Instant::now(),
+            },
+        );
+        assert_eq!(inner.fresh("example.com"), Some(vec![ip]));
+        assert_eq!(inner.fresh("other.example"), None);
+
+        // Age the entry past its TTL: no longer fresh, but still servable stale.
+        inner.cache.write().unwrap().insert(
+            "example.com".to_owned(),
+            DnsCacheEntry {
+                addrs: vec![ip],
+                ttl: 30,
+                resolved_at: Instant::now() - Duration::from_secs(31),
+            },
+        );
+        assert_eq!(inner.fresh("example.com"), None);
+        assert_eq!(inner.stale("example.com"), Some(vec![ip]));
+    }
 
     async fn spawn_mock_upstream(responses: Vec<String>) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -7465,6 +7715,75 @@ vm = [
             "got: {}",
             seen[1]
         );
+    }
+
+    /// A transient 5xx on the only entry is retried once after the backoff
+    /// instead of being handed to the caller, because gateway 503s arrive in
+    /// bursts and the next attempt usually succeeds.
+    #[tokio::test]
+    async fn test_transient_503_is_retried_once_and_then_succeeds() {
+        let rec = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let openai_ok = r#"{"choices":[{"message":{"role":"assistant","content":"x"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
+        let addr = spawn_raw_recording_upstream(
+            vec![
+                http_json("503 Service Unavailable", "{}"),
+                http_json("200 OK", openai_ok),
+            ],
+            rec.clone(),
+        )
+        .await;
+        let (proxy, _s) = spawn_proxy_with_targets(
+            vec![test_provider("p", addr, ApiFormat::Openai)],
+            vec![target("p", "model-a")],
+            vec![],
+        )
+        .await;
+        let res = reqwest::Client::new()
+            .post(format!("http://{}/v1/chat/completions", proxy))
+            .json(&serde_json::json!({"model":"vm","messages":[{"role":"user","content":"x"}]}))
+            .send()
+            .await
+            .unwrap();
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        assert_eq!(status, 200, "the retry pass should have rescued it: {text}");
+        let calls = rec.lock().await.len();
+        assert_eq!(
+            calls, 2,
+            "one initial attempt plus exactly one retry, got {calls}"
+        );
+    }
+
+    /// A client error is never retried: the caller has to see it, and another
+    /// attempt cannot fix it.
+    #[tokio::test]
+    async fn test_transient_retry_does_not_fire_for_client_errors() {
+        let rec = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let addr = spawn_raw_recording_upstream(
+            vec![http_json(
+                "400 Bad Request",
+                "{\"error\":{\"message\":\"bad\"}}",
+            )],
+            rec.clone(),
+        )
+        .await;
+        let (proxy, _s) = spawn_proxy_with_targets(
+            vec![test_provider("p", addr, ApiFormat::Openai)],
+            vec![target("p", "model-a")],
+            vec![],
+        )
+        .await;
+        let res = reqwest::Client::new()
+            .post(format!("http://{}/v1/chat/completions", proxy))
+            .json(&serde_json::json!({"model":"vm","messages":[{"role":"user","content":"x"}]}))
+            .send()
+            .await
+            .unwrap();
+        // The OpenAI route does not pass 4xx through (only the Anthropic and
+        // stateful routes do), so this ends as a 502. What matters here is that
+        // the client error did not earn a retry pass.
+        assert!(!res.status().is_success(), "got {}", res.status());
+        assert_eq!(rec.lock().await.len(), 1, "a 400 must not be retried");
     }
 
     /// An upstream that accepts the connection and never answers.

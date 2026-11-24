@@ -28,6 +28,15 @@ use oxllm_core::telemetry::{TelemetryClient, TelemetryEvent};
 /// provider demoted by a transient blip is still re-sampled.
 const LATENCY_EXPLORE_EVERY: u64 = 20;
 
+/// How many extra times the whole candidate list is re-tried after every entry
+/// failed transiently (5xx, refused connection, timeout). One pass absorbs the
+/// bursty gateway 503s that motivated it without letting a genuinely dead
+/// provider hold a request for long.
+const MAX_RETRY_PASSES: u8 = 1;
+
+/// Pause before that retry pass, long enough for a burst to clear.
+const RETRY_BACKOFF: Duration = Duration::from_millis(750);
+
 #[derive(Serialize)]
 struct ModelObject {
     id: String,
@@ -944,10 +953,28 @@ async fn proxy_request(
         .requests
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    // Each pool entry (provider + model) is tried at most once per request,
-    // so a provider listed twice with different models gets its second entry
-    // as a genuine fallback instead of re-hitting the first.
+    // Each pool entry (provider + model) is tried at most once per pass, so a
+    // provider listed twice with different models gets its second entry as a
+    // genuine fallback instead of re-hitting the first.
     let mut tried = vec![false; candidates.len()];
+    // Transient failures earn one extra pass over the whole route. What this
+    // exists for: a gateway that rejects a fraction of requests with 503.
+    // Those arrive in bursts, so failing straight through hands the caller a
+    // 502 for a provider that answers correctly a second later, and the client
+    // (Claude Code retries up to 10 times) pays for our pessimism.
+    //
+    // Deliberate limits, so this cannot turn into an unbounded retry storm:
+    //   * only a 5xx counts. A 4xx is the caller's problem and is passed
+    //     through before reaching here; a 429 carries its own cooldown; and a
+    //     refused connection or a timeout is structural, not a burst, so
+    //     retrying it would only double the wait for a provider that is down.
+    //   * one extra pass only (MAX_RETRY_PASSES), so a flapping provider costs
+    //     at most two attempts per request.
+    //   * a pause first, because an immediate retry lands inside the same burst.
+    //   * a streaming success returns before this is reached, so a partly
+    //     forwarded response is never retried.
+    let mut retry_passes = 0u8;
+    let mut transient_failure = false;
     loop {
         let remaining: Vec<usize> = (0..candidates.len()).filter(|i| !tried[*i]).collect();
         let entries: Vec<(&ProviderState, &str)> = remaining
@@ -955,6 +982,22 @@ async fn proxy_request(
             .map(|&i| (candidates[i].provider, candidates[i].model.as_str()))
             .collect();
         let Some((picked, selected)) = strategy.select_entry(&entries).await else {
+            // Everything usable has been tried. The circuit breaker will have
+            // been told about each failure, so a provider that is genuinely
+            // down stops being selected on the next request rather than being
+            // retried here.
+            if transient_failure && retry_passes < MAX_RETRY_PASSES {
+                retry_passes += 1;
+                transient_failure = false;
+                tried.iter_mut().for_each(|t| *t = false);
+                tracing::info!(
+                    request_id = %request_id,
+                    "every provider failed transiently; retrying the route once after {}ms",
+                    RETRY_BACKOFF.as_millis()
+                );
+                tokio::time::sleep(RETRY_BACKOFF).await;
+                continue;
+            }
             break;
         };
         attempts += 1;
@@ -1379,6 +1422,12 @@ async fn proxy_request(
                 } else {
                     Outcome::ModelError
                 };
+                // 5xx is the gateway failing, not the request being wrong, so
+                // it earns the retry pass. 429 keeps its own cooldown and is
+                // retried only if the pool has another entry.
+                if status_code >= 500 {
+                    transient_failure = true;
+                }
                 let before = *target_provider_state.circuit.read().await;
                 strategy
                     .feedback_entry(
@@ -1417,6 +1466,9 @@ async fn proxy_request(
                 } else {
                     Outcome::Unreachable
                 };
+                // No retry pass for this: a refused connection or a timeout is
+                // the provider being absent, and a second attempt would only
+                // repeat the wait. The breaker counts it instead.
                 let before = *target_provider_state.circuit.read().await;
                 strategy
                     .feedback_entry(target_provider_state, &target_model, held, outcome, None)
