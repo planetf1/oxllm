@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.35] - 2026-11-24
+
 ### Fixed
 - **Request body limit raised past axum's 2 MiB default**: large-context
   agent prompts (multi-MiB session payloads) were rejected with a confusing
