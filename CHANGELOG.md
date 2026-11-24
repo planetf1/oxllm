@@ -19,6 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   partial gateway failure (bursty 503s that never trip the consecutive-failure
   circuit) no longer surfaces to the caller as a 502.
 
+### Fixed
+- **Request body limit raised past axum's 2 MiB default**: large-context
+  agent prompts (multi-MiB session payloads) were rejected with a confusing
+  `413 Failed to buffer the request body: length limit exceeded` before
+  routing ever saw them. New `server.max_body_bytes` (default 64 MiB, `0`
+  disables) bounds the accepted body size; edits are reported as
+  restart-required on reload.
+
 ## [0.1.34] - 2026-11-24
 
 ### Fixed

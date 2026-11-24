@@ -1064,6 +1064,7 @@ mod affinity_tests {
                 circuit_base_cooldown_secs: 60,
                 rate_limit_fallback_secs: 30,
                 shutdown_timeout_secs: 30,
+                max_body_bytes: 64 * 1024 * 1024,
                 watch_config: false,
                 request_log_capacity: 0,
                 default_model: None,

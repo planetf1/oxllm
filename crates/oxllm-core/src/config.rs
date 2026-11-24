@@ -55,6 +55,13 @@ pub struct ServerConfig {
     /// exits anyway. `0` waits indefinitely.
     #[serde(default = "default_shutdown_timeout_secs")]
     pub shutdown_timeout_secs: u64,
+    /// Maximum accepted HTTP request body size in bytes. Large LLM
+    /// contexts (whole-session agent prompts, base64 attachments) are
+    /// routinely many MiB, past axum's 2 MiB default, which rejected them
+    /// with `413 Failed to buffer the request body` before routing ever
+    /// saw the request. `0` disables the limit. Applies at startup.
+    #[serde(default = "default_max_body_bytes")]
+    pub max_body_bytes: usize,
     /// Whether the daemon watches the config file and hot-reloads on
     /// change. Disable on flash-storage edge targets or to make reloads
     /// strictly manual (SIGHUP / POST /reload).
@@ -525,6 +532,10 @@ fn default_shutdown_timeout_secs() -> u64 {
     30
 }
 
+fn default_max_body_bytes() -> usize {
+    64 * 1024 * 1024
+}
+
 fn default_watch_config() -> bool {
     true
 }
@@ -705,6 +716,7 @@ vm = [{ provider = "p", model = "m" }]
         let config = minimal_config();
         let server = config.server;
         assert_eq!(server.shutdown_timeout_secs, 30);
+        assert_eq!(server.max_body_bytes, 64 * 1024 * 1024);
         assert!(server.watch_config);
         assert_eq!(server.circuit_failure_threshold, 3);
         assert_eq!(server.circuit_base_cooldown_secs, 60);
